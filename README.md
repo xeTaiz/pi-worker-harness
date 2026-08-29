@@ -62,6 +62,12 @@ Inspect workers, jobs, tunnels, data paths, and Pi sessions.
 - `pi_sessions` (worker_id?)
 - `pi_delegation` (delegation_id)
 
+`list_data` is a shallow directory-to-worker catalog. Paths below
+`/data/shared/<name>` identify the same deploy-managed network collection on
+every advertising worker; `/data/local/<name>` is worker-specific; `/code`
+contains repositories from the worker's configured code roots. Empty
+collections and nested descendants are not indexed.
+
 ### `wh_dispatch` (RW)
 Mutations: job exec/stop, tunnels, file transfer, git access, Pi child delegation, worker prune, data copy.
 - `data_copy` (src_worker, src_path, dst_worker, dst_path, ttl_seconds?)

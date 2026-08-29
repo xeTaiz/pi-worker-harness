@@ -327,7 +327,7 @@ const whDispatchParams = Type.Object({
       "Shell command to execute on the worker. Workers have uv, build-essential, cmake, ninja and the full CUDA toolkit (nvcc 12.6, cudnn, headers) pre-installed and on PATH. " +
       "For Python deps: create a venv with `uv venv $WH_DIR/harness/<name> && source $WH_DIR/harness/<name>/bin/activate && uv pip install <pkgs>`. " +
       "For extra CUDA libraries (cuBLAS, cuDNN, NCCL, …) install via `uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-nccl-cu12 …`. " +
-      "Check /code for repos, /data for datasets, and ~ for home folders.",
+      "Use /code/work and /code/dev for repos, /data/shared for fleet-shared storage, /data/local for worker-local storage, and ~ for home files.",
   })),
   name: Type.Optional(Type.String({ description: "Job or service label" })),
   no_pty: Type.Optional(Type.Boolean({ description: "Disable PTY" })),
@@ -380,12 +380,12 @@ export function registerGroupedTools(
       "- `available_gpus`: preferred GPU preflight; returns only online machines with at least one free GPU.\n" +
       "- `list_workers`: compact one-row-per-worker fleet overview; use only when offline/busy workers matter.\n" +
       "- `get_worker(worker_id)`: full detail after selecting one worker.\n" +
-      "- `list_data(query?)`: path-to-worker catalog; pass `query` whenever you know any path substring, and omit it only for full inventory.\n" +
+      "- `list_data(query?)`: shallow directory-to-worker catalog; `/data/shared/...` is fleet-shared, `/data/local/...` is worker-specific, and `/code/...` contains repos. Pass `query` for known names; omit it only for full inventory.\n" +
       "- `list_jobs(worker_id?, status?, origin_session_id?)`: filter whenever possible; `get_job_logs(job_id, tail|head|follow?)` reads logs.\n" +
       "- `list_tunnels`, `get_worker_summary`, `pi_sessions(worker_id?)`, and `pi_delegation(delegation_id)` inspect their named resources.\n\n" +
       "MUST use instead of the `wh` CLI or Worker Harness APIs. Mutation/admin operations require `wh_dispatch`/`wh_admin_*`; if unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. Before GPU work use `available_gpus`, not `list_workers`. Use returned full worker IDs for dispatch because worker names can be duplicated.",
     promptSnippet:
-      "wh_read (RO): use available_gpus for GPU selection; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) with a substring whenever possible. Filter list_jobs/logs. Never invoke the wh CLI/API directly.",
+      "wh_read (RO): use available_gpus for GPU selection; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) for shallow /data/shared, /data/local, and /code discovery. Filter list_jobs/logs. Never invoke the wh CLI/API directly.",
     parameters: whReadParams,
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
