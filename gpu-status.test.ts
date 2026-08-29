@@ -27,7 +27,7 @@ function worker(patch: Partial<Worker>): Worker {
   };
 }
 
-test("groups reported busy GPUs by model", () => {
+test("aggregates reported busy GPUs from online workers only", () => {
   const workers = [
     worker({
       gpu_count: 2,
@@ -52,7 +52,6 @@ test("groups reported busy GPUs by model", () => {
   ]);
   expect(aggregateGpuStatus(workers)).toEqual([
     { model: "RTX 6000 Ada", busy: 1, total: 2 },
-    { model: "V100", busy: 1, total: 1 },
   ]);
   expect(gpuAvailability({ model: "RTX 6000 Ada", busy: 0, total: 2 })).toBe("free");
   expect(gpuAvailability({ model: "RTX 6000 Ada", busy: 1, total: 2 })).toBe("partial");

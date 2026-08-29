@@ -56,6 +56,7 @@ export function workerGpuStatus(worker: Worker): GpuModelStatus[] {
 export function aggregateGpuStatus(workers: Worker[]): GpuModelStatus[] {
   const byModel = new Map<string, GpuModelStatus>();
   for (const worker of workers) {
+    if (worker.status !== "online") continue;
     for (const workerStatus of workerGpuStatus(worker)) {
       let status = byModel.get(workerStatus.model);
       if (!status) {
