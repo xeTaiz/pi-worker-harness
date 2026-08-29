@@ -1,3 +1,4 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { events } from "../events.ts";
 import { ApiError, getWorker, startJob } from "../api.ts";
@@ -260,7 +261,7 @@ async function startDeployTransfer(params: {
 }
 
 export function registerAdminTools(
-  pi: typeof import("@mariozechner/pi-coding-agent").default,
+  pi: ExtensionAPI,
 ) {
   pi.registerTool({
     name: "wh_admin_deploy_image",

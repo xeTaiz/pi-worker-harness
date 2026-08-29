@@ -1,4 +1,4 @@
-import { Container, Text } from "@mariozechner/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { events } from "./events.ts";
 import type { Worker, Job } from "./types.ts";
 import { aggregateGpuStatus } from "./gpu-status.ts";

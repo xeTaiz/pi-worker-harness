@@ -1,4 +1,4 @@
-import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { events } from "../events.ts";
 import {
   addTunnel,

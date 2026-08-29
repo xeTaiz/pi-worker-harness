@@ -17,8 +17,8 @@
  *   wh_admin_*  — image deploy / worker restart (not subagent-eligible)
  */
 import { Type, type Static } from "typebox";
-import { Text } from "@mariozechner/pi-tui";
-import type { Theme } from "@mariozechner/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "../utils.ts";
 import { events } from "../events.ts";
 import { gpuAvailability, workerGpuStatus } from "../gpu-status.ts";
@@ -369,7 +369,7 @@ const essentialToolPresentation = { loadMode: "essential" as const };
 
 
 export function registerGroupedTools(
-  pi: typeof import("@mariozechner/pi-coding-agent").default,
+  pi: ExtensionAPI,
 ) {
   pi.registerTool({
     name: "wh_read",
