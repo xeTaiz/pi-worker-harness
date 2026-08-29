@@ -1,6 +1,6 @@
 {
   "name": "pi-worker-harness",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "repository": {
@@ -8,10 +8,6 @@
     "url": "git+https://github.com/xeTaiz/pi-worker-harness.git"
   },
   "dependencies": {},
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.70.0",
-    "@mariozechner/pi-tui": "^0.70.0"
-  },
   "omp": {
     "extensions": ["./index.ts"]
   },
