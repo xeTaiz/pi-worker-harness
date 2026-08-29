@@ -1,0 +1,294 @@
+import type {
+  AddTunnelRequest,
+  ApiErrorBody,
+  DataCopyResult,
+  DataPaths,
+  FileTransferResult,
+  Job,
+  PiDelegation,
+  PiDelegationCreateResult,
+  PiSession,
+  JobLogsResult,
+  RemoveTunnelResponse,
+  StartJobRequest,
+  StopJobResult,
+  Tunnel,
+  Worker,
+  WorkerDetail,
+  WorkersPruneResult,
+  WorkersSummary,
+} from "./types.ts";
+
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    message: string,
+    public readonly detail: unknown,
+  ) {
+    // NOTE: `message` is passed to super() and must NOT be redeclared as a
+    // class field (e.g. `public readonly message`), because doing so creates an
+    // own property equal to the bare argument and shadows the prefixed message
+    // set here — collapsing "[404] HTTP_ERROR: Not Found" back to "Not Found".
+    super("[" + status + "] " + code + ": " + message);
+    this.name = "ApiError";
+  }
+}
+
+// The privileged control API is deliberately separate from worker registration.
+// This is a personal Tailnet extension: a fresh dotfiles checkout should find
+// the durable orchestrator without requiring a machine-local config file first.
+let orchestratorUrl = process.env.WH_ORCHESTRATOR_URL?.trim()
+  || "http://orchestrator.hs.d0me.xyz:12889";
+
+/** Bound a stalled HTTP connection. Server-side lanes prevent worker-level
+ * starvation; this protects the agent from a dead/unreachable server itself. */
+const DEFAULT_API_TIMEOUT_MS = 30_000;
+const inFlightJobLists = new Map<string, Promise<Job[]>>();
+
+export function getOrchestratorUrl(): string {
+  return orchestratorUrl;
+}
+
+export function setOrchestratorUrl(url: string): void {
+  orchestratorUrl = url.replace(/\/+$/, "");
+}
+
+async function parseErrorBody(res: Response): Promise<ApiErrorBody | null> {
+  try {
+    return (await res.json()) as ApiErrorBody;
+  } catch (_err) {
+    return null;
+  }
+}
+
+/**
+ * Workaround for a double-encoding bug in the @earendil-works/pi-coding-agent
+ * fork: tool-call string arguments (e.g. `worker_id`) arrive at the extension
+ * as the JSON string literal — i.e. the 38-char value `"<uuid>"` (with literal
+ * surrounding double-quotes) instead of the bare 36-char `<uuid>`. This walks
+ * the value and unwraps any string that is a JSON-encoded string.
+ */
+function unwrapDoubleStringified(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  if (value.length < 2 || value[0] !== '"' || value[value.length - 1] !== '"') return value;
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    return value;
+  }
+}
+
+function normalizeStringArgs<T>(value: T): T {
+  if (value == null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(normalizeStringArgs) as unknown as T;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = typeof v === "string" ? (unwrapDoubleStringified(v) as string) : normalizeStringArgs(v);
+  }
+  return out as T;
+}
+
+async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const baseUrl = getOrchestratorUrl();
+
+  // Normalize any double-stringified string values in a JSON body before sending.
+  let normalizedBody = options?.body;
+  if (typeof normalizedBody === "string") {
+    try {
+      const parsed = JSON.parse(normalizedBody);
+      normalizedBody = JSON.stringify(normalizeStringArgs(parsed));
+    } catch {
+      /* not JSON (or malformed) — leave as-is */
+    }
+  }
+
+  const timeoutSignal = AbortSignal.timeout(DEFAULT_API_TIMEOUT_MS);
+  const signal = options?.signal
+    ? AbortSignal.any([options.signal, timeoutSignal])
+    : timeoutSignal;
+  const agentName = process.env.PI_AGENT_NAME || "pi";
+
+  let res: Response;
+  try {
+    res = await fetch(baseUrl + path, {
+      ...options,
+      signal,
+      body: normalizedBody,
+      // Force the real Pi child identity after caller-provided headers so one
+      // agent cannot evade its own token bucket by spoofing another agent.
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        "X-Agent-Name": agentName,
+      },
+    });
+  } catch (err) {
+    if (timeoutSignal.aborted) {
+      throw new ApiError(504, "UPSTREAM_TIMEOUT", `Worker-harness did not respond within ${DEFAULT_API_TIMEOUT_MS / 1000}s`, null);
+    }
+    throw err;
+  }
+
+  if (!res.ok) {
+    const body = await parseErrorBody(res);
+    // FastAPI's HTTPException returns {"detail": "..."} (no nested "error"
+    // object), so fall back to body.detail for both message and detail.
+    const errCode = body?.error?.code ?? "HTTP_ERROR";
+    const errMsg =
+      body?.error?.message ??
+      (typeof body?.detail === "string" ? body.detail : res.statusText);
+    const errDetail = body?.error?.detail ?? body?.detail ?? null;
+    throw new ApiError(res.status, errCode, errMsg, errDetail);
+  }
+
+  return res.json() as Promise<T>;
+}
+
+export async function listPiSessions(workerId?: string): Promise<PiSession[]> {
+  const qs = workerId ? "?worker_id=" + encodeURIComponent(workerId) : "";
+  return apiFetch<PiSession[]>("/api/v1/pi/sessions" + qs);
+}
+
+export async function createDelegation(params: {
+  task: string;
+  worker_id?: string;
+  parent_session_id?: string;
+  cwd?: string;
+  timeout_seconds?: number;
+  sync?: boolean;
+}): Promise<PiDelegationCreateResult> {
+  return apiFetch<PiDelegationCreateResult>("/api/v1/pi/delegations", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export async function getDelegation(id: string): Promise<PiDelegation> {
+  return apiFetch<PiDelegation>("/api/v1/pi/delegations/" + encodeURIComponent(id));
+}
+
+export async function listWorkers(): Promise<Worker[]> {
+  return apiFetch<Worker[]>("/api/v1/workers");
+}
+
+export async function getWorker(id: string): Promise<WorkerDetail> {
+  const cleanId = unwrapDoubleStringified(id) as string;
+  return apiFetch<WorkerDetail>("/api/v1/workers/" + encodeURIComponent(cleanId));
+}
+
+export async function pruneWorkers(minutes?: number): Promise<WorkersPruneResult> {
+  const qs = minutes !== undefined ? `?minutes=${encodeURIComponent(String(minutes))}` : "";
+  return apiFetch<WorkersPruneResult>(`/api/v1/workers/prune${qs}`, { method: "DELETE" });
+}
+
+export async function getWorkerSummary(): Promise<WorkersSummary> {
+  return apiFetch<WorkersSummary>("/api/v1/workers/summary");
+}
+
+export async function listDataPaths(): Promise<DataPaths> {
+  return apiFetch<DataPaths>("/api/v1/data");
+}
+
+export async function copyData(params: {
+  src_worker: string;
+  src_path: string;
+  dst_worker: string;
+  dst_path: string;
+  ttl_seconds?: number;
+}): Promise<DataCopyResult> {
+  return apiFetch<DataCopyResult>("/api/v1/data/copy", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export async function startJob(params: StartJobRequest): Promise<Job> {
+  const body: Record<string, unknown> = {
+    worker_id: params.worker_id,
+    command: params.command,
+    no_pty: params.no_pty ?? false,
+  };
+  if (params.name) body.name = params.name;
+  if (params.sync) body.sync = true;
+  if (params.sync_timeout) body.sync_timeout = params.sync_timeout;
+  return apiFetch<Job>("/api/v1/jobs", { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function listJobs(filters?: {
+  worker_id?: string;
+  status?: string;
+  origin_session_id?: string;
+}): Promise<Job[]> {
+  const params = new URLSearchParams();
+  if (filters?.worker_id) params.set("worker_id", filters.worker_id);
+  if (filters?.status) params.set("status", filters.status);
+  if (filters?.origin_session_id) params.set("origin_session_id", filters.origin_session_id);
+  const qs = params.toString() ? "?" + params.toString() : "";
+  const path = "/api/v1/jobs" + qs;
+  const key = getOrchestratorUrl() + "\n" + path;
+  const existing = inFlightJobLists.get(key);
+  if (existing) return existing;
+
+  const request = apiFetch<Job[]>(path);
+  inFlightJobLists.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (inFlightJobLists.get(key) === request) {
+      inFlightJobLists.delete(key);
+    }
+  }
+}
+
+export async function getJobLogs(id: string, opts?: { tail?: number; head?: number }): Promise<JobLogsResult> {
+  const cleanId = unwrapDoubleStringified(id) as string;
+  const params = new URLSearchParams();
+  if (opts?.tail !== undefined) params.set("tail", String(opts.tail));
+  if (opts?.head !== undefined) params.set("head", String(opts.head));
+  const qs = params.toString() ? "?" + params.toString() : "";
+  return apiFetch<JobLogsResult>("/api/v1/jobs/" + encodeURIComponent(cleanId) + "/logs" + qs);
+}
+
+export async function stopJob(id: string): Promise<StopJobResult> {
+  const cleanId = unwrapDoubleStringified(id) as string;
+  return apiFetch<StopJobResult>("/api/v1/jobs/" + encodeURIComponent(cleanId), { method: "DELETE" });
+}
+
+export async function addTunnel(params: AddTunnelRequest): Promise<Tunnel> {
+  return apiFetch<Tunnel>("/api/v1/tunnels", { method: "POST", body: JSON.stringify(params) });
+}
+
+export async function listTunnels(): Promise<Tunnel[]> {
+  return apiFetch<Tunnel[]>("/api/v1/tunnels");
+}
+
+export async function removeTunnel(id: string): Promise<RemoveTunnelResponse> {
+  return apiFetch<RemoveTunnelResponse>("/api/v1/tunnels/" + encodeURIComponent(id), { method: "DELETE" });
+}
+
+export async function uploadFile(
+  workerId: string,
+  path: string,
+  contentB64: string,
+): Promise<FileTransferResult> {
+  const cleanId = unwrapDoubleStringified(workerId) as string;
+  return apiFetch<FileTransferResult>(
+    "/api/v1/workers/" + encodeURIComponent(cleanId) + "/files",
+    { method: "POST", body: JSON.stringify({ path, content_b64: contentB64 }) },
+  );
+}
+
+export async function downloadFile(
+  workerId: string,
+  path: string,
+  maxBytes?: number,
+): Promise<FileTransferResult> {
+  const cleanId = unwrapDoubleStringified(workerId) as string;
+  const params = new URLSearchParams({ path });
+  if (maxBytes !== undefined) params.set("max_bytes", String(maxBytes));
+  return apiFetch<FileTransferResult>(
+    "/api/v1/workers/" + encodeURIComponent(cleanId) + "/files?" + params.toString(),
+  );
+}
