@@ -327,7 +327,7 @@ const whDispatchParams = Type.Object({
       "Shell command to execute on the worker. Workers have uv, build-essential, cmake, ninja and the full CUDA toolkit (nvcc 12.6, cudnn, headers) pre-installed and on PATH. " +
       "For Python deps: create a venv with `uv venv $WH_DIR/harness/<name> && source $WH_DIR/harness/<name>/bin/activate && uv pip install <pkgs>`. " +
       "For extra CUDA libraries (cuBLAS, cuDNN, NCCL, …) install via `uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-nccl-cu12 …`. " +
-      "Use /code/work and /code/dev for repos, /data/shared for fleet-shared storage, /data/local for worker-local storage, and ~ for home files.",
+      "Use /code for repos, /data/shared for fleet-shared storage, /data/local for worker-local storage, and ~ for home files.",
   })),
   name: Type.Optional(Type.String({ description: "Job or service label" })),
   no_pty: Type.Optional(Type.Boolean({ description: "Disable PTY" })),
