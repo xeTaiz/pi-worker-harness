@@ -5,11 +5,14 @@ import type {
   DataPaths,
   FileTransferResult,
   Job,
+  MarimoCreateRequest,
+  MarimoSession,
   PiDelegation,
   PiDelegationCreateResult,
   PiSession,
   JobLogsResult,
   RemoveTunnelResponse,
+  RemoveMarimoResponse,
   StartJobRequest,
   StopJobResult,
   Tunnel,
@@ -149,6 +152,30 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
 export async function listPiSessions(workerId?: string): Promise<PiSession[]> {
   const qs = workerId ? "?worker_id=" + encodeURIComponent(workerId) : "";
   return apiFetch<PiSession[]>("/api/v1/pi/sessions" + qs);
+}
+
+export async function createMarimo(params: MarimoCreateRequest): Promise<MarimoSession> {
+  return apiFetch<MarimoSession>("/api/v1/marimo", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export async function listMarimo(workerId?: string): Promise<MarimoSession[]> {
+  const qs = workerId ? "?worker_id=" + encodeURIComponent(workerId) : "";
+  return apiFetch<MarimoSession[]>("/api/v1/marimo" + qs);
+}
+
+export async function getMarimo(id: string): Promise<MarimoSession> {
+  const cleanId = unwrapDoubleStringified(id) as string;
+  return apiFetch<MarimoSession>("/api/v1/marimo/" + encodeURIComponent(cleanId));
+}
+
+export async function removeMarimo(id: string): Promise<RemoveMarimoResponse> {
+  const cleanId = unwrapDoubleStringified(id) as string;
+  return apiFetch<RemoveMarimoResponse>("/api/v1/marimo/" + encodeURIComponent(cleanId), {
+    method: "DELETE",
+  });
 }
 
 export async function createDelegation(params: {

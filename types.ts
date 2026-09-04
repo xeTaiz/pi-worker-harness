@@ -113,6 +113,49 @@ export interface RemoveTunnelResponse {
   tunnel_id: string;
 }
 
+export interface MarimoSession {
+  id: string;
+  worker_id: string;
+  worker_name?: string | null;
+  notebook_path: string;
+  environment: string;
+  job_id: string;
+  tunnel_id: string;
+  local_port: number;
+  remote_port: number;
+  bind_host: string;
+  url: string;
+  status: "ready" | "stopped";
+  created_at: number;
+}
+
+export interface MarimoCreateRequest {
+  worker_id: string;
+  notebook_path: string;
+  environment: string;
+  ready_timeout?: number;
+}
+
+export interface RemoveMarimoResponse {
+  session_id: string;
+  removed: boolean;
+}
+
+export interface MarimoKernelSession {
+  path?: string;
+  filename?: string;
+  [key: string]: unknown;
+}
+
+export interface MarimoExecutionResult {
+  marimo_session_id: string;
+  kernel_session_id: string;
+  success: boolean;
+  stdout: string;
+  stderr: string;
+  output: unknown;
+}
+
 export type DataPaths = Record<string, Array<{ worker_id: string; worker_name: string }>>;
 
 export interface DataCopyResult {

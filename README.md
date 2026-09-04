@@ -5,7 +5,7 @@
 ## Requirements
 
 - Pi v0.70+ or OMP
-- worker-harness server reachable at `http://localhost:12888` (default)
+- worker-harness server reachable at `http://orchestrator.hs.d0me.xyz:12889` (default)
 
 ## Installation
 
@@ -29,7 +29,7 @@ after installation or update so the extension module is initialized.
 
 The extension uses HTTP endpoints (not CLI subprocesses).
 
-- Default base URL: `http://localhost:12888`
+- Default base URL: `http://orchestrator.hs.d0me.xyz:12889`
 - Persisted config file:
   - Pi: `~/.pi/worker-harness/config.json`
   - OMP: `~/.omp/worker-harness/config.json`
@@ -62,14 +62,18 @@ Inspect workers, jobs, tunnels, data paths, and Pi sessions.
 - `pi_sessions` (worker_id?)
 - `pi_delegation` (delegation_id)
 
+`wh_read` intentionally exposes no Marimo action. Marimo list/get responses
+contain a Tailnet URL for an unauthenticated notebook server capable of
+arbitrary Python execution, so those operations require `wh_dispatch`.
+
 `list_data` is a shallow directory-to-worker catalog. Paths below
 `/data/shared/<name>` identify the same deploy-managed network collection on
 every advertising worker; `/data/local/<name>` is worker-specific; `/code`
 contains repositories from the worker's configured code roots. Empty
 collections and nested descendants are not indexed.
 
-### `wh_dispatch` (RW)
-Mutations: job exec/stop, tunnels, file transfer, git access, Pi child delegation, worker prune, data copy.
+### `wh_dispatch` (RW and capability-bearing)
+Mutations plus managed Marimo lifecycle and execution.
 - `data_copy` (src_worker, src_path, dst_worker, dst_path, ttl_seconds?)
 - `exec` (worker_id, command, name?, no_pty?, sync?, sync_timeout?)
 - `stop_job` (job_id)
@@ -80,6 +84,21 @@ Mutations: job exec/stop, tunnels, file transfer, git access, Pi child delegatio
 - `download_file` (worker_id, path, max_bytes?)
 - `delegate` (task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)
 - `grant_git_access` (worker_id, repo?)
+- `list_marimo` (worker_id?)
+- `get_marimo` (marimo_session_id)
+- `start_marimo` (worker_id, notebook_path, environment, ready_timeout?)
+- `stop_marimo` (marimo_session_id)
+- `execute_marimo` (marimo_session_id, code)
+
+Managed Marimo startup returns a direct `100.64.0.0/10` Tailnet URL. The user
+must open that URL before execution because server readiness does not create a
+browser kernel. `execute_marimo` resolves the browser's ephemeral kernel ID on
+every call and reaches `/api/sessions` and `/api/kernel/execute` directly at the
+returned URL; it does not use an orchestrator execution proxy.
+
+Marimo operations are operator-side only and are not exposed to delegated
+agents. The launcher intentionally uses `--no-token`; Tailnet reachability and
+Headscale ACLs are the access boundary.
 
 ### Admin (individual, not subagent-eligible)
 Image deployment and worker restart are exposed as their own tools and are not
@@ -110,7 +129,7 @@ Key bindings:
 
 ## Notes from validation
 
-Integration was validated against `http://localhost:12888` for:
+Integration was validated against `http://orchestrator.hs.d0me.xyz:12889` for:
 - health
 - workers list
 - jobs list

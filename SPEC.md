@@ -14,7 +14,7 @@ This spec intentionally reflects the current HTTP-based architecture (not CLI su
 
 ## Runtime assumptions
 
-- Orchestrator is reachable at a base URL (default: `http://localhost:12888`)
+- Orchestrator is reachable at a base URL (default: `http://orchestrator.hs.d0me.xyz:12889`)
 - API routes are under `/api/v1/*`
 - Extension can read and write tool/widget/panel state inside pi session memory
 
@@ -26,10 +26,9 @@ No worker-harness CLI invocation is required by this extension.
 
 ```
 pi session
-├── API client (api.ts)
-│   ├── GET/POST/DELETE /api/v1/workers*
-│   ├── GET/POST/DELETE /api/v1/jobs*
-│   └── GET/POST/DELETE /api/v1/tunnels*
+├── API clients
+│   ├── api.ts: orchestrator `/api/v1/*` lifecycle requests
+│   └── marimo.ts: direct Tailnet `/api/sessions` and `/api/kernel/execute`
 │
 ├── Tools (tools/*.ts)
 │   ├── wh_read (RO, action-based)
@@ -42,7 +41,7 @@ pi session
 │   │   ├── list_tunnels
 │   │   ├── pi_sessions
 │   │   └── pi_delegation
-│   ├── wh_dispatch (RW, action-based)
+│   ├── wh_dispatch (RW and capability-bearing, action-based)
 │   │   ├── data_copy
 │   │   ├── exec
 │   │   ├── stop_job
@@ -52,7 +51,12 @@ pi session
 │   │   ├── upload_file
 │   │   ├── download_file
 │   │   ├── delegate
-│   │   └── grant_git_access
+│   │   ├── grant_git_access
+│   │   ├── list_marimo
+│   │   ├── get_marimo
+│   │   ├── start_marimo
+│   │   ├── stop_marimo
+│   │   └── execute_marimo
 │   └── wh_admin_* (admin, individual tools, not subagent-eligible)
 │       ├── wh_admin_deploy_image
 │       ├── wh_admin_deploy_status
@@ -96,6 +100,18 @@ Base URL is configured in `api.ts` (`getOrchestratorUrl` / `setOrchestratorUrl`)
 - `GET /api/v1/tunnels` → `Tunnel[]`
 - `DELETE /api/v1/tunnels/:id` → `RemoveTunnelResponse`
 
+### Marimo lifecycle
+- `POST /api/v1/marimo` with `{ worker_id, notebook_path, environment, ready_timeout? }` → `MarimoSession`
+- `GET /api/v1/marimo` (optional `worker_id`) → `MarimoSession[]`
+- `GET /api/v1/marimo/:id` → `MarimoSession`
+- `DELETE /api/v1/marimo/:id` → `RemoveMarimoResponse`
+
+Kernel execution does not use the orchestrator API. `marimo.ts` fetches
+`/api/sessions` and posts to `/api/kernel/execute` at the lifecycle resource's
+returned Tailnet URL. The user must open the URL before a browser kernel exists.
+The launcher uses `--no-token`; Tailnet reachability and Headscale ACLs are the
+access boundary.
+
 ---
 
 ## Tools
@@ -107,10 +123,16 @@ all worker-harness operations, plus the `wh_admin_*` individual tools for image
 deployment and worker restart. Subagent configs can grant a full tier with one
 name (`tools: ["wh_read"]` / `tools: ["wh_dispatch"]`).
 
+`wh_read` exposes no Marimo action. Even lifecycle list/get reveal a direct URL
+to an unauthenticated notebook server capable of arbitrary Python execution, so
+all five Marimo actions stay on `wh_dispatch`. Marimo is operator-side only and
+is not available to delegated agents.
+
 ### Required tool behaviors
-- All mutating actions on `wh_dispatch` emit `worker-harness:refresh`
+- Successful Marimo start/stop emits `worker-harness:refresh`; list/get/execute does not
+- `execute_marimo` refreshes `/api/sessions` on each call, forwards aborts and output updates, and never accepts an ephemeral kernel-session ID
 - Errors return structured tool errors from API errors (`status`, `code`, `message`, `detail`)
-- `wh_dispatch exec` (sync mode) and `wh_dispatch add_tunnel` responses include created resource metadata in tool result details
+- `wh_dispatch exec` (sync mode), `wh_dispatch add_tunnel`, and Marimo actions include resource/result metadata in tool result details
 - All grouped tools render their call header via `renderCall` so the action and key args appear in the TUI without expanding the JSON args block
 
 ---
@@ -186,7 +208,7 @@ Widget should gracefully handle:
 ## Configuration
 
 ### Runtime base URL
-- Default: `http://localhost:12888`
+- Default: `http://orchestrator.hs.d0me.xyz:12889`
 - Runtime command: `/worker-harness-url <http(s)://host:port>`
 
 ### Validation rules

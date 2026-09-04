@@ -12,8 +12,9 @@
  * registered tools (see tools/admin.ts: image deploy + worker restart).
  *
  *   wh_read     — RO inspection of workers, jobs, tunnels, and Pi sessions
- *   wh_dispatch — mutations: job exec, tunnels, file transfer, git access,
- *                 Pi child delegation, worker prune, data copy
+ *   wh_dispatch — mutations and capability-bearing Marimo lifecycle/execution:
+ *                 jobs, tunnels, file transfer, git access, Pi delegation,
+ *                 worker prune, data copy, and managed Marimo servers
  *   wh_admin_*  — image deploy / worker restart (not subagent-eligible)
  */
 import { Type, type Static } from "typebox";
@@ -37,24 +38,29 @@ import {
   addTunnel,
   copyData,
   createDelegation,
+  createMarimo,
   downloadFile,
   getDelegation,
+  getMarimo,
   getJobLogs,
   getOrchestratorUrl,
   getWorker,
   getWorkerSummary,
   listDataPaths,
   listJobs,
+  listMarimo,
   listPiSessions,
   listTunnels,
   listWorkers,
   pruneWorkers,
   removeTunnel,
+  removeMarimo,
   startJob,
   stopJob,
   uploadFile,
 } from "../api.ts";
 import { subscribeJobLogs } from "../sse.ts";
+import { executeMarimoCode } from "../marimo.ts";
 
 // ── shared helpers ─────────────────────────────────────
 
@@ -165,6 +171,14 @@ function dispatchCallSummary(args: Static<typeof whDispatchParams>): string {
       return `${args.worker_id} :${args.remote_port}→localhost:${args.local_port}${args.name ? ` (${args.name})` : ""}`;
     case "remove_tunnel":
       return args.tunnel_id ?? "";
+    case "list_marimo":
+      return args.worker_id ?? "";
+    case "get_marimo":
+    case "stop_marimo":
+    case "execute_marimo":
+      return args.marimo_session_id ?? "";
+    case "start_marimo":
+      return `${args.worker_id}:${truncate(args.notebook_path ?? "", 60)}`;
     case "workers_prune":
       return args.minutes !== undefined ? `${args.minutes}m` : "";
     case "upload_file":
@@ -313,6 +327,11 @@ const whDispatchParams = Type.Object({
     "download_file",
     "delegate",
     "grant_git_access",
+    "list_marimo",
+    "get_marimo",
+    "start_marimo",
+    "stop_marimo",
+    "execute_marimo",
   ]),
   // data_copy
   src_worker: Type.Optional(Type.String({ description: "Source worker ID or name for data_copy" })),
@@ -360,6 +379,16 @@ const whDispatchParams = Type.Object({
   repo: Type.Optional(Type.String({
     description: 'GitHub repo in "owner/repo" format. If omitted, detected from the current directory\'s git remote.',
   })),
+  // managed Marimo lifecycle and direct kernel execution
+  marimo_session_id: Type.Optional(Type.String({ description: "Managed Marimo session ID" })),
+  notebook_path: Type.Optional(Type.String({ description: "Absolute notebook path on the worker" })),
+  environment: Type.Optional(Type.String({ description: "Absolute Python environment path on the worker" })),
+  ready_timeout: Type.Optional(Type.Number({
+    minimum: 1,
+    maximum: 300,
+    description: "Marimo server readiness timeout in seconds (1–300)",
+  })),
+  code: Type.Optional(Type.String({ description: "Python code to execute in the active browser kernel" })),
 });
 
 // ── registration ───────────────────────────────────────
@@ -562,19 +591,19 @@ export function registerGroupedTools(
     label: "Worker Harness Dispatch",
     ...essentialToolPresentation,
     description:
-      "Mutating Worker Harness operations: job execution/stopping, tunnels, file transfer, git access, Pi delegation, pruning, and worker-to-worker data copy. MUST use instead of the `wh` CLI or Worker Harness APIs. Inspection requires `wh_read`; image deployment/restart requires `wh_admin_*`. If a required tool is unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. `tools: [\"wh_dispatch\"]` grants a child the full mutation surface.\n\n" +
-      "Preferred over local Bash for long-running jobs, experiments, GPU work, and remote compute. Before GPU work call `wh_read(action=\"available_gpus\")` once and dispatch with the returned full worker ID; do not fetch the full fleet or repeatedly preflight unchanged state. If `wh_read` is unavailable and the assignment does not identify an available worker/GPU, report the missing preflight instead of launching. On workers, create project-local `uv` environments for dependencies as needed.\n\n" +
-      "Action-specific fields: `data_copy(src_worker, src_path, dst_worker, dst_path, ttl_seconds?)`; `exec(worker_id, command, name?, no_pty?, sync?, sync_timeout?)`; `stop_job(job_id)`; `add_tunnel(worker_id, local_port, remote_port, name?)`; `remove_tunnel(tunnel_id)`; `workers_prune(minutes?)`; `upload_file(worker_id, path, content_b64)`; `download_file(worker_id, path, max_bytes?)`; `delegate(task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)`; `grant_git_access(worker_id, repo?)`.\n\n" +
-      "`exec` defaults asynchronous and returns a job ID; `sync: true` blocks and returns output. For versioned project files prefer git plus `grant_git_access`; use upload/download for ad-hoc files. Before `data_copy`, use `wh_read(action=\"list_data\", query=\"known-substring\")`; omit `query` only when a complete data inventory is actually needed.",
+      "Mutating and capability-bearing Worker Harness operations: job execution/stopping, tunnels, file transfer, git access, Pi delegation, pruning, worker-to-worker data copy, and managed Marimo lifecycle/execution. Marimo list/get remain on `wh_dispatch` because their Tailnet URLs provide access to arbitrary Python execution. MUST use instead of the `wh` CLI or Worker Harness APIs. Inspection requires `wh_read`; image deployment/restart requires `wh_admin_*`. If a required tool is unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. `tools: [\"wh_dispatch\"]` grants a child the full mutation and Marimo capability surface.\n\n" +
+      "Preferred over local Bash for long-running jobs, experiments, GPU work, remote compute, and every Marimo operation. Before GPU work call `wh_read(action=\"available_gpus\")` once and dispatch with the returned full worker ID; do not fetch the full fleet or repeatedly preflight unchanged state. If `wh_read` is unavailable and the assignment does not identify an available worker/GPU, report the missing preflight instead of launching. On workers, create project-local `uv` environments for dependencies as needed.\n\n" +
+      "Action-specific fields: `data_copy(src_worker, src_path, dst_worker, dst_path, ttl_seconds?)`; `exec(worker_id, command, name?, no_pty?, sync?, sync_timeout?)`; `stop_job(job_id)`; `add_tunnel(worker_id, local_port, remote_port, name?)`; `remove_tunnel(tunnel_id)`; `workers_prune(minutes?)`; `upload_file(worker_id, path, content_b64)`; `download_file(worker_id, path, max_bytes?)`; `delegate(task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)`; `grant_git_access(worker_id, repo?)`; `list_marimo(worker_id?)`; `get_marimo(marimo_session_id)`; `start_marimo(worker_id, notebook_path, environment, ready_timeout?)`; `stop_marimo(marimo_session_id)`; `execute_marimo(marimo_session_id, code)`.\n\n" +
+      "`exec` defaults asynchronous and returns a job ID; `sync: true` blocks and returns output. Marimo execution requires the returned URL to be open in a browser and resolves the browser kernel afresh on every call. For versioned project files prefer git plus `grant_git_access`; use upload/download for ad-hoc files. Before `data_copy`, use `wh_read(action=\"list_data\", query=\"known-substring\")`; omit `query` only when a complete data inventory is actually needed.",
     promptSnippet:
-      "wh_dispatch (RW): before GPU work call wh_read available_gpus once and use its full worker ID; before data_copy call wh_read list_data with a known query. Exec defaults async. Never invoke the wh CLI/API directly.",
+      "wh_dispatch (RW/capability): before GPU work call wh_read available_gpus once and use its full worker ID; before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; open the returned URL before execution. Exec defaults async. Never invoke the wh CLI/API directly.",
     parameters: whDispatchParams,
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       text.setText(buildDispatchHeader(args, theme));
       return text;
     },
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal, onUpdate) {
       const {
         action,
         worker_id,
@@ -601,6 +630,11 @@ export function registerGroupedTools(
         cwd,
         timeout_seconds,
         repo,
+        marimo_session_id,
+        notebook_path,
+        environment,
+        ready_timeout,
+        code,
       } = params;
 
       try {
@@ -730,6 +764,73 @@ export function registerGroupedTools(
                     : `Failed to remove tunnel: ${resolvedTunnelId}`,
                 },
               ],
+              details: result,
+            };
+          }
+          case "list_marimo": {
+            const sessions = await listMarimo(worker_id);
+            return {
+              content: [{ type: "text", text: JSON.stringify(sessions, null, 2) }],
+              details: { sessions },
+            };
+          }
+          case "get_marimo": {
+            const session = await getMarimo(requireField(marimo_session_id, "marimo_session_id"));
+            return {
+              content: [{ type: "text", text: JSON.stringify(session, null, 2) }],
+              details: { session },
+            };
+          }
+          case "start_marimo": {
+            const session = await createMarimo({
+              worker_id: requireField(worker_id, "worker_id"),
+              notebook_path: requireField(notebook_path, "notebook_path"),
+              environment: requireField(environment, "environment"),
+              ...(ready_timeout === undefined ? {} : { ready_timeout }),
+            });
+            events.emit("worker-harness:refresh", undefined);
+            return {
+              content: [{ type: "text", text: JSON.stringify(session, null, 2) }],
+              details: { session },
+            };
+          }
+          case "stop_marimo": {
+            const result = await removeMarimo(requireField(marimo_session_id, "marimo_session_id"));
+            events.emit("worker-harness:refresh", undefined);
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+              details: result,
+            };
+          }
+          case "execute_marimo": {
+            const sessionId = requireField(marimo_session_id, "marimo_session_id");
+            const session = await getMarimo(sessionId);
+            const result = await executeMarimoCode(
+              session,
+              requireField(code, "code"),
+              {
+                signal,
+                onStdout: (text) => onUpdate?.({ content: [{ type: "text", text }] }),
+                onStderr: (text) => onUpdate?.({
+                  content: [{ type: "text", text: `[stderr] ${text}` }],
+                }),
+              },
+            );
+            const sections: string[] = [];
+            if (result.stdout) sections.push(result.stdout);
+            if (result.stderr) sections.push(`[stderr]\n${result.stderr}`);
+            if (result.output !== undefined) {
+              sections.push(
+                `Output:\n${typeof result.output === "string"
+                  ? result.output
+                  : JSON.stringify(result.output, null, 2)}`,
+              );
+            }
+            return {
+              content: [{
+                type: "text",
+                text: sections.length > 0 ? sections.join("\n") : "Marimo execution completed successfully.",
+              }],
               details: result,
             };
           }

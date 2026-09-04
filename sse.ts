@@ -12,7 +12,7 @@ export interface JobLogSubscription {
   done: Promise<void>;
 }
 
-async function streamTextLines(
+export async function streamTextLines(
   response: Response,
   onLine: (line: string) => void,
 ): Promise<void> {
