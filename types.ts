@@ -1,7 +1,7 @@
 // Shared types for worker-harness extension
 
 export type WorkerStatus = "online" | "offline" | "draining";
-export type JobStatus = "pending" | "running" | "done" | "failed";
+export type JobStatus = "pending" | "starting" | "running" | "done" | "failed";
 
 export interface Worker {
   id: string;
@@ -40,16 +40,21 @@ export interface WorkerDetail extends Worker {
 export interface Job {
   id: string;
   worker_id: string | null;
-  worker_name?: string;
+  worker_name?: string | null;
+  name: string;
   tmux_session: string;
   command: string;
-  name?: string;
   status: JobStatus;
+  queue_managed: boolean;
   exit_code: number | null;
   pty_enabled: boolean;
   kind: "ssh" | "delegated";
   origin_session_id: string | null;
   report_revision: number;
+  expected_seconds: number;
+  gpu_count: number;
+  gpu_indices: number[];
+  queue_order: number;
   started_at: number;
   finished_at: number | null;
   stdout?: string; // only present in sync mode
@@ -85,6 +90,27 @@ export interface StartJobRequest {
   no_pty?: boolean;
   sync?: boolean;
   sync_timeout?: number;
+}
+
+export interface QueuedJob extends Job {
+  position: number;
+}
+
+export interface EnqueueJobRequest {
+  worker_id: string;
+  command: string;
+  name: string;
+  expected_seconds: number;
+  gpu_count?: number;
+  no_pty?: boolean;
+}
+
+export interface UpdateQueuedJobRequest {
+  worker_id?: string;
+  position?: number;
+  name?: string;
+  expected_seconds?: number;
+  gpu_count?: number;
 }
 
 export interface JobLogsResult {

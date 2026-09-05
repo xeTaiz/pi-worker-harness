@@ -1,5 +1,5 @@
 import { workerGpuStatus } from "./gpu-status.ts";
-import type { DataPaths, Worker } from "./types.ts";
+import type { DataPaths, QueuedJob, Worker } from "./types.ts";
 
 export interface DataCatalogWorker {
   id: string;
@@ -43,6 +43,70 @@ export function availableGpuWorkers(workers: Worker[]): Worker[] {
     worker.status === "online"
     && workerGpuStatus(worker).some(({ busy, total }) => busy < total)
   );
+}
+
+export function formatQueueOverview(
+  workers: Worker[],
+  jobs: QueuedJob[],
+  nowSeconds: number,
+): string {
+  const workersById = new Map(workers.map((worker) => [worker.id, worker]));
+  const jobsByWorker = new Map<string, QueuedJob[]>();
+  const orderedWorkerIds: string[] = [];
+  const seen = new Set<string>();
+  for (const worker of workers) {
+    if (worker.status === "online") {
+      orderedWorkerIds.push(worker.id);
+      seen.add(worker.id);
+    }
+  }
+  for (const job of jobs) {
+    const workerId = job.worker_id ?? "(unassigned)";
+    const workerJobs = jobsByWorker.get(workerId);
+    if (workerJobs) workerJobs.push(job);
+    else jobsByWorker.set(workerId, [job]);
+    if (!seen.has(workerId)) {
+      orderedWorkerIds.push(workerId);
+      seen.add(workerId);
+    }
+  }
+
+  if (orderedWorkerIds.length === 0) return "No online workers or active queued jobs.";
+
+  const lines: string[] = [];
+  for (const workerId of orderedWorkerIds) {
+    const worker = workersById.get(workerId);
+    const workerJobs = jobsByWorker.get(workerId) ?? [];
+    const workerName = worker?.name ?? workerJobs[0]?.worker_name ?? "unknown";
+    const workerStatus = worker?.status ?? "absent";
+    const gpuSummary = worker
+      ? workerGpuStatus(worker)
+        .map((gpu) => `${gpu.model} ${gpu.busy}/${gpu.total}`)
+        .join(", ") || "none"
+      : "unknown";
+    lines.push(`${workerId} | ${workerName} | ${workerStatus} | GPUs ${gpuSummary}`);
+
+    if (workerJobs.length === 0) {
+      lines.push("  (queue empty)");
+      continue;
+    }
+    for (const job of workerJobs) {
+      if (job.status === "pending") {
+        lines.push(
+          `  pending #${job.position} | ${job.id} | ${job.name}`
+          + ` | GPUs ${job.gpu_count} | expected ${job.expected_seconds}s`,
+        );
+      } else {
+        const elapsed = Math.max(0, nowSeconds - job.started_at);
+        lines.push(
+          `  ${job.status} | ${job.id} | ${job.name}`
+          + ` | GPU indices [${job.gpu_indices.join(",")}]`
+          + ` | elapsed ${elapsed}s / expected ${job.expected_seconds}s`,
+        );
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 export function formatAvailableGpus(workers: Worker[]): string {

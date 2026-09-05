@@ -59,7 +59,7 @@ export default async function (pi: ExtensionAPI) {
     const { trackedJob } = widgetHandle.state;
     if (trackedJob) {
       const job = jobs.find((j) => j.id === trackedJob);
-      if (job && job.status !== "running") {
+      if (job && !["pending", "starting", "running"].includes(job.status)) {
         widgetHandle.updateState({ following: false });
       }
     }

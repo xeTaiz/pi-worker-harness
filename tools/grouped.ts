@@ -24,12 +24,13 @@ import { StringEnum } from "../utils.ts";
 import { events } from "../events.ts";
 import { gpuAvailability, workerGpuStatus } from "../gpu-status.ts";
 import type { GpuModelStatus } from "../gpu-status.ts";
-import type { Worker } from "../types.ts";
+import type { QueuedJob, Worker } from "../types.ts";
 import {
   availableGpuWorkers,
   buildDataCatalog,
   formatDataCatalog,
   formatAvailableGpus,
+  formatQueueOverview,
   formatWorkerOverview,
 } from "../agent-output.ts";
 import type { DataCatalog } from "../agent-output.ts";
@@ -39,6 +40,7 @@ import {
   copyData,
   createDelegation,
   createMarimo,
+  enqueueJob,
   downloadFile,
   getDelegation,
   getMarimo,
@@ -49,6 +51,7 @@ import {
   listDataPaths,
   listJobs,
   listMarimo,
+  listQueue,
   listPiSessions,
   listTunnels,
   listWorkers,
@@ -57,6 +60,7 @@ import {
   removeMarimo,
   startJob,
   stopJob,
+  updateQueuedJob,
   uploadFile,
 } from "../api.ts";
 import { subscribeJobLogs } from "../sse.ts";
@@ -125,6 +129,8 @@ function readCallSummary(args: Static<typeof whReadParams>): string {
     case "list_tunnels":
     case "get_worker_summary":
       return "";
+    case "list_queue":
+      return args.worker_id ? `worker=${args.worker_id}` : "";
     case "list_data":
       return args.query ? `query=${truncate(args.query, 60)}` : "";
     case "get_worker":
@@ -165,6 +171,22 @@ function dispatchCallSummary(args: Static<typeof whDispatchParams>): string {
       parts.push(`$ ${truncate(args.command ?? "", 60)}`);
       return parts.filter(Boolean).join(" ");
     }
+    case "enqueue":
+      return [
+        args.worker_id ?? "",
+        args.name ? `name=${args.name}` : "",
+        args.gpu_count !== undefined ? `gpus=${args.gpu_count}` : "gpus=1",
+        args.expected_seconds !== undefined ? `expected=${args.expected_seconds}s` : "",
+      ].filter(Boolean).join(" ");
+    case "update_queued_job":
+      return [
+        args.job_id ?? "",
+        args.worker_id ? `worker=${args.worker_id}` : "",
+        args.position !== undefined ? `position=${args.position}` : "",
+        args.name ? `name=${args.name}` : "",
+        args.gpu_count !== undefined ? `gpus=${args.gpu_count}` : "",
+        args.expected_seconds !== undefined ? `expected=${args.expected_seconds}s` : "",
+      ].filter(Boolean).join(" ");
     case "stop_job":
       return args.job_id ?? "";
     case "add_tunnel":
@@ -287,6 +309,7 @@ const whReadParams = Type.Object({
     "get_worker_summary",
     "list_data",
     "list_jobs",
+    "list_queue",
     "get_job_logs",
     "list_tunnels",
     "pi_sessions",
@@ -301,7 +324,7 @@ const whReadParams = Type.Object({
   origin_session_id: Type.Optional(
     Type.String({ description: "Delegated Pi child session ID that originated the job" }),
   ),
-  status: Type.Optional(StringEnum(["pending", "running", "done", "failed"])),
+  status: Type.Optional(StringEnum(["pending", "starting", "running", "done", "failed"])),
   tail: Type.Optional(Type.Number({ description: "Last N log lines. Default 10" })),
   head: Type.Optional(
     Type.Number({ description: "First N log lines. Mutually exclusive with tail" }),
@@ -320,6 +343,8 @@ const whDispatchParams = Type.Object({
     "data_copy",
     "exec",
     "stop_job",
+    "enqueue",
+    "update_queued_job",
     "add_tunnel",
     "remove_tunnel",
     "workers_prune",
@@ -354,6 +379,18 @@ const whDispatchParams = Type.Object({
     description: "Block until command finishes, return stdout (exec action). Default: false",
   })),
   sync_timeout: Type.Optional(Type.Number({ description: "Timeout in seconds for sync mode (default 120)" })),
+  expected_seconds: Type.Optional(Type.Number({
+    minimum: 1,
+    description: "Expected duration in seconds; scheduling information only",
+  })),
+  gpu_count: Type.Optional(Type.Number({
+    minimum: 1,
+    description: "Number of GPUs requested (default 1 for enqueue)",
+  })),
+  position: Type.Optional(Type.Number({
+    minimum: 1,
+    description: "One-based pending queue position",
+  })),
   // stop_job / remove_tunnel / get_job_logs / pi_delegation
   job_id: Type.Optional(Type.String({ description: "Job ID" })),
   tunnel_id: Type.Optional(Type.String({ description: "Tunnel ID" })),
@@ -406,15 +443,16 @@ export function registerGroupedTools(
     ...essentialToolPresentation,
     description:
       "Token-efficient read-only Worker Harness inspection. Choose the narrowest action:\n" +
-      "- `available_gpus`: preferred GPU preflight; returns only online machines with at least one free GPU.\n" +
+      "- `list_queue(worker_id?)`: shared GPU schedule; inspect it before scheduling a GPU experiment.\n" +
+      "- `available_gpus`: online machines with at least one telemetry-free GPU.\n" +
       "- `list_workers`: compact one-row-per-worker fleet overview; use only when offline/busy workers matter.\n" +
       "- `get_worker(worker_id)`: full detail after selecting one worker.\n" +
       "- `list_data(query?)`: shallow directory-to-worker catalog; `/data/shared/...` is fleet-shared, `/data/local/...` is worker-specific, and `/code/...` contains repos. Pass `query` for known names; omit it only for full inventory.\n" +
-      "- `list_jobs(worker_id?, status?, origin_session_id?)`: filter whenever possible; `get_job_logs(job_id, tail|head|follow?)` reads logs.\n" +
+      "- `list_jobs(worker_id?, status?, origin_session_id?)`: job history; `get_job_logs(job_id, tail|head|follow?)` reads logs.\n" +
       "- `list_tunnels`, `get_worker_summary`, `pi_sessions(worker_id?)`, and `pi_delegation(delegation_id)` inspect their named resources.\n\n" +
-      "MUST use instead of the `wh` CLI or Worker Harness APIs. Mutation/admin operations require `wh_dispatch`/`wh_admin_*`; if unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. Before GPU work use `available_gpus`, not `list_workers`. Use returned full worker IDs for dispatch because worker names can be duplicated.",
+      "MUST use instead of the `wh` CLI or Worker Harness APIs. Mutation/admin operations require `wh_dispatch`/`wh_admin_*`; if unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. Use returned full worker IDs for dispatch because worker names can be duplicated.",
     promptSnippet:
-      "wh_read (RO): use available_gpus for GPU selection; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) for shallow /data/shared, /data/local, and /code discovery. Filter list_jobs/logs. Never invoke the wh CLI/API directly.",
+      "wh_read (RO): inspect list_queue before scheduling GPU work; use available_gpus for telemetry availability; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) for shallow /data/shared, /data/local, and /code discovery. Filter list_jobs/logs. Never invoke the wh CLI/API directly.",
     parameters: whReadParams,
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
@@ -424,8 +462,17 @@ export function registerGroupedTools(
     renderResult(result, _options, theme) {
       const details = result.details as {
         workers?: Worker[];
+        jobs?: QueuedJob[];
+        queue?: boolean;
         data?: DataCatalog;
       } | undefined;
+      if (details?.queue && Array.isArray(details.workers) && Array.isArray(details.jobs)) {
+        return new Text(
+          formatQueueOverview(details.workers, details.jobs, Math.floor(Date.now() / 1000)),
+          0,
+          0,
+        );
+      }
       if (Array.isArray(details?.workers)) {
         return new Text(buildWorkerList(details.workers, theme), 0, 0);
       }
@@ -490,6 +537,19 @@ export function registerGroupedTools(
             return {
               content: [{ type: "text", text: JSON.stringify(jobs, null, 2) }],
               details: { jobs },
+            };
+          }
+          case "list_queue": {
+            const [workers, jobs] = await Promise.all([
+              listWorkers(),
+              listQueue(worker_id),
+            ]);
+            return {
+              content: [{
+                type: "text",
+                text: formatQueueOverview(workers, jobs, Math.floor(Date.now() / 1000)),
+              }],
+              details: { workers, jobs, queue: true },
             };
           }
           case "get_job_logs": {
@@ -591,12 +651,12 @@ export function registerGroupedTools(
     label: "Worker Harness Dispatch",
     ...essentialToolPresentation,
     description:
-      "Mutating and capability-bearing Worker Harness operations: job execution/stopping, tunnels, file transfer, git access, Pi delegation, pruning, worker-to-worker data copy, and managed Marimo lifecycle/execution. Marimo list/get remain on `wh_dispatch` because their Tailnet URLs provide access to arbitrary Python execution. MUST use instead of the `wh` CLI or Worker Harness APIs. Inspection requires `wh_read`; image deployment/restart requires `wh_admin_*`. If a required tool is unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. `tools: [\"wh_dispatch\"]` grants a child the full mutation and Marimo capability surface.\n\n" +
-      "Preferred over local Bash for long-running jobs, experiments, GPU work, remote compute, and every Marimo operation. Before GPU work call `wh_read(action=\"available_gpus\")` once and dispatch with the returned full worker ID; do not fetch the full fleet or repeatedly preflight unchanged state. If `wh_read` is unavailable and the assignment does not identify an available worker/GPU, report the missing preflight instead of launching. On workers, create project-local `uv` environments for dependencies as needed.\n\n" +
-      "Action-specific fields: `data_copy(src_worker, src_path, dst_worker, dst_path, ttl_seconds?)`; `exec(worker_id, command, name?, no_pty?, sync?, sync_timeout?)`; `stop_job(job_id)`; `add_tunnel(worker_id, local_port, remote_port, name?)`; `remove_tunnel(tunnel_id)`; `workers_prune(minutes?)`; `upload_file(worker_id, path, content_b64)`; `download_file(worker_id, path, max_bytes?)`; `delegate(task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)`; `grant_git_access(worker_id, repo?)`; `list_marimo(worker_id?)`; `get_marimo(marimo_session_id)`; `start_marimo(worker_id, notebook_path, environment, ready_timeout?)`; `stop_marimo(marimo_session_id)`; `execute_marimo(marimo_session_id, code)`.\n\n" +
-      "`exec` defaults asynchronous and returns a job ID; `sync: true` blocks and returns output. Marimo execution requires the returned URL to be open in a browser and resolves the browser kernel afresh on every call. For versioned project files prefer git plus `grant_git_access`; use upload/download for ad-hoc files. Before `data_copy`, use `wh_read(action=\"list_data\", query=\"known-substring\")`; omit `query` only when a complete data inventory is actually needed.",
+      "Mutating and capability-bearing Worker Harness operations: scheduled and immediate jobs, tunnels, file transfer, git access, Pi delegation, pruning, worker-to-worker data copy, and managed Marimo lifecycle/execution. Marimo list/get remain on `wh_dispatch` because their Tailnet URLs provide access to arbitrary Python execution. MUST use instead of the `wh` CLI or Worker Harness APIs. Inspection requires `wh_read`; image deployment/restart requires `wh_admin_*`. If a required tool is unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. `tools: [\"wh_dispatch\"]` grants a child the full mutation and Marimo capability surface.\n\n" +
+      "Inspect `wh_read(action=\"list_queue\")` before scheduling a GPU experiment. Use `enqueue(worker_id, command, name, expected_seconds, gpu_count?, no_pty?)` for scheduled GPU work. `exec` is an immediate queue bypass reserved for short setup, diagnosis, and non-GPU commands. Any agent can update or stop any job, but MUST NOT move, reorder, or edit another queued job or stop running work unless the user explicitly asks to schedule something ASAP, reorganize the queue, cancel work, or kill a running job. Preferred over local Bash for long-running jobs, experiments, GPU work, remote compute, and every Marimo operation. On workers, create project-local `uv` environments for dependencies as needed.\n\n" +
+      "Action-specific fields: `data_copy(src_worker, src_path, dst_worker, dst_path, ttl_seconds?)`; `enqueue(worker_id, command, name, expected_seconds, gpu_count?, no_pty?)`; `update_queued_job(job_id, worker_id?, position?, name?, expected_seconds?, gpu_count?)`; `exec(worker_id, command, name?, no_pty?, sync?, sync_timeout?)`; `stop_job(job_id)`; `add_tunnel(worker_id, local_port, remote_port, name?)`; `remove_tunnel(tunnel_id)`; `workers_prune(minutes?)`; `upload_file(worker_id, path, content_b64)`; `download_file(worker_id, path, max_bytes?)`; `delegate(task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)`; `grant_git_access(worker_id, repo?)`; `list_marimo(worker_id?)`; `get_marimo(marimo_session_id)`; `start_marimo(worker_id, notebook_path, environment, ready_timeout?)`; `stop_marimo(marimo_session_id)`; `execute_marimo(marimo_session_id, code)`.\n\n" +
+      "`enqueue` has no synchronous mode. `exec` defaults asynchronous and returns a job ID; `sync: true` blocks and returns output. Marimo execution requires the returned URL to be open in a browser and resolves the browser kernel afresh on every call. For versioned project files prefer git plus `grant_git_access`; use upload/download for ad-hoc files. Before `data_copy`, use `wh_read(action=\"list_data\", query=\"known-substring\")`; omit `query` only when a complete data inventory is actually needed.",
     promptSnippet:
-      "wh_dispatch (RW/capability): before GPU work call wh_read available_gpus once and use its full worker ID; before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; open the returned URL before execution. Exec defaults async. Never invoke the wh CLI/API directly.",
+      "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled GPU work; exec bypasses the queue only for short setup, diagnosis, or non-GPU commands. Do not alter another agent's job without explicit user direction. Before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; open the returned URL before execution. Never invoke the wh CLI/API directly.",
     parameters: whDispatchParams,
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
@@ -625,6 +685,9 @@ export function registerGroupedTools(
         max_bytes,
         sync,
         sync_timeout,
+        expected_seconds,
+        gpu_count,
+        position,
         task,
         parent_session_id,
         cwd,
@@ -700,6 +763,51 @@ export function registerGroupedTools(
                   text: `Job started: ${job.id} on ${workerLabel}\nSession: ${job.tmux_session}`,
                 },
               ],
+              details: { job },
+            };
+          }
+          case "enqueue": {
+            const job = await enqueueJob({
+              worker_id: requireField(worker_id, "worker_id"),
+              command: requireField(command, "command"),
+              name: requireField(name, "name"),
+              expected_seconds: requireField(expected_seconds, "expected_seconds"),
+              gpu_count: gpu_count ?? 1,
+              no_pty,
+            });
+            events.emit("worker-harness:refresh", undefined);
+            return {
+              content: [{
+                type: "text",
+                text: `Job queued: ${job.id} (${job.name}) on ${job.worker_id} [${job.status}]`,
+              }],
+              details: { job },
+            };
+          }
+          case "update_queued_job": {
+            const resolvedJobId = requireField(job_id, "job_id");
+            if (
+              worker_id === undefined
+              && position === undefined
+              && name === undefined
+              && expected_seconds === undefined
+              && gpu_count === undefined
+            ) {
+              throw new Error("update_queued_job requires at least one queue field");
+            }
+            const job = await updateQueuedJob(resolvedJobId, {
+              worker_id,
+              position,
+              name,
+              expected_seconds,
+              gpu_count,
+            });
+            events.emit("worker-harness:refresh", undefined);
+            return {
+              content: [{
+                type: "text",
+                text: `Queued job updated: ${job.id} (${job.name}) on ${job.worker_id} [${job.status}]`,
+              }],
               details: { job },
             };
           }

@@ -37,6 +37,7 @@ pi session
 │   │   ├── get_worker_summary
 │   │   ├── list_data
 │   │   ├── list_jobs
+│   │   ├── list_queue
 │   │   ├── get_job_logs
 │   │   ├── list_tunnels
 │   │   ├── pi_sessions
@@ -44,6 +45,8 @@ pi session
 │   ├── wh_dispatch (RW and capability-bearing, action-based)
 │   │   ├── data_copy
 │   │   ├── exec
+│   │   ├── enqueue
+│   │   ├── update_queued_job
 │   │   ├── stop_job
 │   │   ├── add_tunnel
 │   │   ├── remove_tunnel
@@ -91,6 +94,9 @@ Base URL is configured in `api.ts` (`getOrchestratorUrl` / `setOrchestratorUrl`)
 ### Jobs
 - `POST /api/v1/jobs` with `{ worker_id, command, name? }` → `Job`
 - `GET /api/v1/jobs` (optional `worker_id`, `status`) → `Job[]`
+- `GET /api/v1/jobs/queue?worker_id=:id` → active `QueuedJob[]` in authoritative queue order
+- `POST /api/v1/jobs/queue` with `{ worker_id, command, name, expected_seconds, gpu_count?, no_pty? }` → `Job`
+- `PATCH /api/v1/jobs/:id/queue` with at least one mutable queue field → `QueuedJob`
 - `GET /api/v1/jobs/:id/logs?tail=&head=` → `JobLogsResult`
 - `GET /api/v1/jobs/:id/logs/stream?tail=&poll_seconds=` (text stream) → live log lines
 - `DELETE /api/v1/jobs/:id` → `StopJobResult`
@@ -134,6 +140,16 @@ is not available to delegated agents.
 - Errors return structured tool errors from API errors (`status`, `code`, `message`, `detail`)
 - `wh_dispatch exec` (sync mode), `wh_dispatch add_tunnel`, and Marimo actions include resource/result metadata in tool result details
 - All grouped tools render their call header via `renderCall` so the action and key args appear in the TUI without expanding the JSON args block
+
+### Queueing contract
+
+- One strict FIFO queue exists per worker. The submitting agent selects the worker.
+- Consecutive queue heads may run concurrently when their GPU requests fit. A multi-GPU head blocks all later work when it cannot fit; no backfill, priority, reservation, preemption, retry, deadline, or timeout policy exists.
+- `expected_seconds` is required positive scheduling information only. The harness assigns physical GPU indices and exports them through `CUDA_VISIBLE_DEVICES`.
+- `wh_read list_queue` is the shared scheduling board and must be inspected before scheduling a GPU experiment.
+- `wh_dispatch enqueue` schedules GPU work. `wh_dispatch exec` remains an immediate bypass for short setup, diagnosis, and non-GPU commands.
+- Any agent can move, reorder, edit, cancel, or stop any job. Tools must warn agents not to change another queued job or stop running work unless the user explicitly asks for faster scheduling, queue reorganization, cancellation, or termination.
+- Queue mutations emit `worker-harness:refresh`. The panel and above-editor widget do not expose queue controls; their existing new-job actions continue to use immediate `POST /api/v1/jobs`.
 
 ---
 

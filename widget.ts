@@ -34,11 +34,11 @@ function truncate(input: string, max: number): string {
 export function buildStatusLine(state: WidgetState): string {
   if (!state.trackedWorker) {
     const online = state.workers.filter((w) => w.status === "online").length;
-    const running = state.jobs.filter((j) => j.status === "running").length;
+    const active = state.jobs.filter((j) => j.status === "starting" || j.status === "running").length;
     const gpuSummary = aggregateGpuStatus(state.workers)
       .map(({ model, busy, total }) => `${model}: ${busy}/${total}`)
       .join(" · ");
-    return `▸ Workers: ${online}/${state.workers.length} online · Jobs: ${running} running · GPUs: ${gpuSummary || "—"}`;
+    return `▸ Workers: ${online}/${state.workers.length} online · Jobs: ${active} active · GPUs: ${gpuSummary || "—"}`;
   }
 
   const worker = state.workers.find((w) => w.name === state.trackedWorker);

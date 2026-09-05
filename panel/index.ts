@@ -62,6 +62,7 @@ function statusColor(status: string): string {
 
 function jobStatusIcon(status: string): string {
   switch (status) {
+    case "starting":
     case "running":
       return "●";
     case "done":
@@ -75,6 +76,7 @@ function jobStatusIcon(status: string): string {
 
 function jobStatusColor(status: string): string {
   switch (status) {
+    case "starting":
     case "running":
       return "yellow";
     case "done":
@@ -121,10 +123,11 @@ function formatTimestamp(ts: number): string {
 function sortJobs(jobs: Job[]): Job[] {
   return [...jobs].sort((a, b) => {
     const order: Record<string, number> = {
-      running: 0,
-      pending: 1,
-      done: 2,
-      failed: 3,
+      starting: 0,
+      running: 1,
+      pending: 2,
+      done: 3,
+      failed: 4,
     };
     return (order[a.status] ?? 4) - (order[b.status] ?? 4);
   });
@@ -202,7 +205,7 @@ function buildPanel(
   const border = fg("border", "─".repeat(Math.max(1, width)));
   lines.push(border);
   const online = state.workers.filter((w) => w.status === "online").length;
-  const running = state.jobs.filter((j) => j.status === "running").length;
+  const running = state.jobs.filter((j) => j.status === "starting" || j.status === "running").length;
   lines.push(
     fg("accent", bold(" Worker Harness ")) +
       " " +
@@ -888,7 +891,7 @@ class SimplePanel {
     }));
     this.tui?.requestRender();
 
-    if (job.status === "running" || job.status === "pending") {
+    if (job.status === "starting" || job.status === "running" || job.status === "pending") {
       await this.followLogs(job, { tail: 200, keepLogFocus: true });
     } else {
       await this.loadJobLogs(job, { tail: 2000, keepLogFocus: true });
@@ -1389,7 +1392,7 @@ class SimplePanel {
 
   private async stopSelectedJob() {
     const job = this.selectedJob();
-    if (!job || job.status !== "running") return;
+    if (!job || (job.status !== "starting" && job.status !== "running")) return;
 
     await stopJob(job.id);
     events.emit("worker-harness:refresh", undefined);

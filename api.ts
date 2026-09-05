@@ -4,9 +4,11 @@ import type {
   DataCopyResult,
   DataPaths,
   FileTransferResult,
+  EnqueueJobRequest,
   Job,
   MarimoCreateRequest,
   MarimoSession,
+  QueuedJob,
   PiDelegation,
   PiDelegationCreateResult,
   PiSession,
@@ -15,6 +17,7 @@ import type {
   RemoveMarimoResponse,
   StartJobRequest,
   StopJobResult,
+  UpdateQueuedJobRequest,
   Tunnel,
   Worker,
   WorkerDetail,
@@ -241,6 +244,47 @@ export async function startJob(params: StartJobRequest): Promise<Job> {
   if (params.sync) body.sync = true;
   if (params.sync_timeout) body.sync_timeout = params.sync_timeout;
   return apiFetch<Job>("/api/v1/jobs", { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function listQueue(workerId?: string): Promise<QueuedJob[]> {
+  const cleanWorkerId = workerId === undefined
+    ? undefined
+    : unwrapDoubleStringified(workerId) as string;
+  const query = cleanWorkerId
+    ? "?worker_id=" + encodeURIComponent(cleanWorkerId)
+    : "";
+  return apiFetch<QueuedJob[]>("/api/v1/jobs/queue" + query);
+}
+
+export async function enqueueJob(params: EnqueueJobRequest): Promise<Job> {
+  return apiFetch<Job>("/api/v1/jobs/queue", {
+    method: "POST",
+    body: JSON.stringify({
+      worker_id: params.worker_id,
+      command: params.command,
+      name: params.name,
+      expected_seconds: params.expected_seconds,
+      gpu_count: params.gpu_count ?? 1,
+      no_pty: params.no_pty ?? false,
+    }),
+  });
+}
+
+export async function updateQueuedJob(
+  id: string,
+  params: UpdateQueuedJobRequest,
+): Promise<QueuedJob> {
+  const cleanId = unwrapDoubleStringified(id) as string;
+  const body: Record<string, unknown> = {};
+  if (params.worker_id !== undefined) body.worker_id = params.worker_id;
+  if (params.position !== undefined) body.position = params.position;
+  if (params.name !== undefined) body.name = params.name;
+  if (params.expected_seconds !== undefined) body.expected_seconds = params.expected_seconds;
+  if (params.gpu_count !== undefined) body.gpu_count = params.gpu_count;
+  return apiFetch<QueuedJob>(
+    "/api/v1/jobs/" + encodeURIComponent(cleanId) + "/queue",
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 }
 
 export async function listJobs(filters?: {
