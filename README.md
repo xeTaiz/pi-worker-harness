@@ -90,11 +90,19 @@ Mutations plus managed Marimo lifecycle and execution.
 - `stop_marimo` (marimo_session_id)
 - `execute_marimo` (marimo_session_id, code)
 
-Managed Marimo startup returns a direct `100.64.0.0/10` Tailnet URL. The user
-must open that URL before execution because server readiness does not create a
-browser kernel. `execute_marimo` resolves the browser's ephemeral kernel ID on
-every call and reaches `/api/sessions` and `/api/kernel/execute` directly at the
-returned URL; it does not use an orchestrator execution proxy.
+Managed Marimo startup returns a direct `100.64.0.0/10` Tailnet URL. Marimo
+spawns a kernel only when a client attaches, so `start_marimo` attaches once
+over the SSE transport, waits for `kernel-ready`, detaches, and then runs the
+notebook's saved cells through code mode. Code therefore runs before anyone
+opens the notebook, and the first browser to open the URL resumes that same
+kernel and its state. Detaching matters: a consumer that stays attached would
+demote the user's browser to a non-editing viewer. Hydration matters too:
+`/api/kernel/execute` instantiates with `auto_run=False`, and marimo's
+`/api/kernel/instantiate` is behind skew protection that exempts only
+`/api/kernel/execute`. `execute_marimo` re-resolves the kernel on every call,
+creating one if the session has none, and reaches `/api/sessions`, `/sse`, and
+`/api/kernel/execute` directly at the returned URL; it does not use an
+orchestrator execution proxy.
 
 Marimo operations are operator-side only and are not exposed to delegated
 agents. The launcher intentionally uses `--no-token`; Tailnet reachability and

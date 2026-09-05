@@ -113,10 +113,24 @@ Base URL is configured in `api.ts` (`getOrchestratorUrl` / `setOrchestratorUrl`)
 - `DELETE /api/v1/marimo/:id` → `RemoveMarimoResponse`
 
 Kernel execution does not use the orchestrator API. `marimo.ts` fetches
-`/api/sessions` and posts to `/api/kernel/execute` at the lifecycle resource's
-returned Tailnet URL. The user must open the URL before a browser kernel exists.
-The launcher uses `--no-token`; Tailnet reachability and Headscale ACLs are the
-access boundary.
+`/api/sessions`, creates a kernel when none matches the notebook by attaching to
+`/sse?session_id=…&file=…` until `kernel-ready` and then detaching, and posts to
+`/api/kernel/execute` at the lifecycle resource's returned Tailnet URL. A
+detached session stays alive in edit mode (marimo closes it on disconnect only
+under an explicit `--session-ttl`) and is resumed by the first browser that
+opens the notebook; staying attached would make that browser a viewer instead of
+the editor. The launcher uses `--no-token`; Tailnet reachability and Headscale
+ACLs are the access boundary.
+
+A newly created kernel is empty: `/api/kernel/execute` calls
+`session.instantiate(auto_run=False)`, so saved cells enter the graph unexecuted.
+`start_marimo` therefore calls `hydrateNotebook`, which runs every saved cell
+through code mode and reports the count; code mode's context exit awaits the
+queued runs, so the call returns only after hydration finishes (verified with a
+notebook whose cell sleeps five seconds). `/api/kernel/instantiate` is not used
+because marimo's skew-protection middleware exempts only `/api/kernel/execute`,
+`/ws`, and the login form, rejecting everything else without a
+`Marimo-Server-Token`.
 
 ---
 

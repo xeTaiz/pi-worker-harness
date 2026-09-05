@@ -64,7 +64,7 @@ import {
   uploadFile,
 } from "../api.ts";
 import { subscribeJobLogs } from "../sse.ts";
-import { executeMarimoCode } from "../marimo.ts";
+import { ensureKernelSession, executeMarimoCode, hydrateNotebook } from "../marimo.ts";
 
 // ── shared helpers ─────────────────────────────────────
 
@@ -425,7 +425,7 @@ const whDispatchParams = Type.Object({
     maximum: 300,
     description: "Marimo server readiness timeout in seconds (1–300)",
   })),
-  code: Type.Optional(Type.String({ description: "Python code to execute in the active browser kernel" })),
+  code: Type.Optional(Type.String({ description: "Python code to execute in the notebook kernel" })),
 });
 
 // ── registration ───────────────────────────────────────
@@ -651,12 +651,12 @@ export function registerGroupedTools(
     label: "Worker Harness Dispatch",
     ...essentialToolPresentation,
     description:
-      "Mutating and capability-bearing Worker Harness operations: scheduled and immediate jobs, tunnels, file transfer, git access, Pi delegation, pruning, worker-to-worker data copy, and managed Marimo lifecycle/execution. Marimo list/get remain on `wh_dispatch` because their Tailnet URLs provide access to arbitrary Python execution. MUST use instead of the `wh` CLI or Worker Harness APIs. Inspection requires `wh_read`; image deployment/restart requires `wh_admin_*`. If a required tool is unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. `tools: [\"wh_dispatch\"]` grants a child the full mutation and Marimo capability surface.\n\n" +
+      "Mutating and capability-bearing Worker Harness operations: scheduled and immediate jobs, tunnels, file transfer, git access, Pi delegation, pruning, worker-to-worker data copy, and managed Marimo lifecycle/execution. MUST use instead of the `wh` CLI or Worker Harness APIs. Inspection requires `wh_read`; image deployment/restart requires `wh_admin_*`. If a required tool is unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. `tools: [\"wh_dispatch\"]` grants a child the full mutation and Marimo capability surface.\n\n" +
       "Inspect `wh_read(action=\"list_queue\")` before scheduling a GPU experiment. Use `enqueue(worker_id, command, name, expected_seconds, gpu_count?, no_pty?)` for scheduled GPU work. `exec` is an immediate queue bypass reserved for short setup, diagnosis, and non-GPU commands. Any agent can update or stop any job, but MUST NOT move, reorder, or edit another queued job or stop running work unless the user explicitly asks to schedule something ASAP, reorganize the queue, cancel work, or kill a running job. Preferred over local Bash for long-running jobs, experiments, GPU work, remote compute, and every Marimo operation. Before immediate GPU work call `wh_read(action=\"available_gpus\")` once and dispatch with the returned full worker ID; do not fetch the full fleet or repeatedly preflight unchanged state. If `wh_read` is unavailable and the assignment does not identify an available worker/GPU, report the missing preflight instead of launching. On workers, create project-local `uv` environments for dependencies as needed.\n\n" +
       "Action-specific fields: `data_copy(src_worker, src_path, dst_worker, dst_path, ttl_seconds?)`; `enqueue(worker_id, command, name, expected_seconds, gpu_count?, no_pty?)`; `update_queued_job(job_id, worker_id?, position?, name?, expected_seconds?, gpu_count?)`; `exec(worker_id, command, name?, no_pty?, sync?, sync_timeout?)`; `stop_job(job_id)`; `add_tunnel(worker_id, local_port, remote_port, name?)`; `remove_tunnel(tunnel_id)`; `workers_prune(minutes?)`; `upload_file(worker_id, path, content_b64)`; `download_file(worker_id, path, max_bytes?)`; `delegate(task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)`; `grant_git_access(worker_id, repo?)`; `list_marimo(worker_id?)`; `get_marimo(marimo_session_id)`; `start_marimo(worker_id, notebook_path, environment, ready_timeout?)`; `stop_marimo(marimo_session_id)`; `execute_marimo(marimo_session_id, code)`.\n\n" +
-      "`enqueue` has no synchronous mode. `exec` defaults asynchronous and returns a job ID; `sync: true` blocks and returns output. Marimo execution requires the returned URL to be open in a browser and resolves the browser kernel afresh on every call. For versioned project files prefer git plus `grant_git_access`; use upload/download for ad-hoc files. Before `data_copy`, use `wh_read(action=\"list_data\", query=\"known-substring\")`; omit `query` only when a complete data inventory is actually needed.",
+      "`enqueue` has no synchronous mode. `exec` defaults asynchronous and returns a job ID; `sync: true` blocks and returns output. `start_marimo` creates the notebook kernel itself, so `execute_marimo` works with no browser open; the first browser to open the returned URL resumes that same kernel and sees the work. For versioned project files prefer git plus `grant_git_access`; use upload/download for ad-hoc files. Before `data_copy`, use `wh_read(action=\"list_data\", query=\"known-substring\")`; omit `query` only when a complete data inventory is actually needed.",
     promptSnippet:
-      "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled GPU work; exec bypasses the queue only for short setup, diagnosis, or non-GPU commands, and before immediate GPU work call wh_read available_gpus once and use its full worker ID. Do not alter another agent's job without explicit user direction. Before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; open the returned URL before execution. Never invoke the wh CLI/API directly.",
+      "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled GPU work; exec bypasses the queue only for short setup, diagnosis, or non-GPU commands, and before immediate GPU work call wh_read available_gpus once and use its full worker ID. Do not alter another agent's job without explicit user direction. Before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; no browser is needed to execute. Never invoke the wh CLI/API directly.",
     parameters: whDispatchParams,
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
@@ -897,9 +897,24 @@ export function registerGroupedTools(
               ...(ready_timeout === undefined ? {} : { ready_timeout }),
             });
             events.emit("worker-harness:refresh", undefined);
+            // Create the kernel and run the saved notebook, so code executes
+            // immediately and the first browser to open the URL sees outputs.
+            let kernelSessionId: string | null = null;
+            let kernelError: string | null = null;
+            let cellsRun: number | null = null;
+            try {
+              kernelSessionId = (await ensureKernelSession(session, { signal })).id;
+              cellsRun = await hydrateNotebook(session, { signal });
+            } catch (err) {
+              kernelError = err instanceof Error ? err.message : String(err);
+            }
+            const notice = kernelError !== null
+              ? `\nKernel warm-up failed: ${kernelError}\nexecute_marimo will retry creating a kernel.`
+              : `\nKernel ready (${kernelSessionId}), ${cellsRun} saved cell(s) run. ` +
+                "execute_marimo works now, and the first browser to open the URL resumes this kernel.";
             return {
-              content: [{ type: "text", text: JSON.stringify(session, null, 2) }],
-              details: { session },
+              content: [{ type: "text", text: `${JSON.stringify(session, null, 2)}${notice}` }],
+              details: { session, kernel_session_id: kernelSessionId, cells_run: cellsRun, kernel_error: kernelError },
             };
           }
           case "stop_marimo": {
@@ -925,6 +940,11 @@ export function registerGroupedTools(
               },
             );
             const sections: string[] = [];
+            if (result.kernel_created) {
+              sections.push(
+                `Created a new kernel (${result.kernel_session_id}); its namespace started empty.`,
+              );
+            }
             if (result.stdout) sections.push(result.stdout);
             if (result.stderr) sections.push(`[stderr]\n${result.stderr}`);
             if (result.output !== undefined) {

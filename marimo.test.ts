@@ -7,7 +7,7 @@ import {
   removeMarimo,
   setOrchestratorUrl,
 } from "./api.ts";
-import { executeMarimoCode } from "./marimo.ts";
+import { executeMarimoCode, hydrateNotebook } from "./marimo.ts";
 import type { MarimoSession } from "./types.ts";
 
 const originalFetch = globalThis.fetch;
@@ -149,6 +149,7 @@ test("fragmented CRLF and LF events keep stdout, stderr, callbacks, and final ou
   expect(result).toEqual({
     marimo_session_id: "managed-1",
     kernel_session_id: "kernel",
+    kernel_created: false,
     success: true,
     stdout: "hello\n",
     stderr: "warn\n",
@@ -169,17 +170,92 @@ test.each([
   await expect(executeMarimoCode(lifecycleSession(), "1")).rejects.toThrow(message);
 });
 
-test("empty and wrong-path maps require the exact managed notebook and never execute", async () => {
-  let calls = 0;
-  globalThis.fetch = (async () => {
-    calls += 1;
-    return jsonResponse({ other: { path: "/code/other.py" } });
+test("a notebook nobody opened gets a kernel created headlessly, then executes in it", async () => {
+  const calls: string[] = [];
+  let executeSessionHeader: string | null = null;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    calls.push(url);
+    if (url.endsWith("/api/sessions")) return jsonResponse({});
+    if (url.includes("/sse?")) {
+      return streamResponse([`data: ${JSON.stringify({ op: "kernel-ready", data: {} })}\n\n`]);
+    }
+    executeSessionHeader = new Headers(init?.headers).get("Marimo-Session-Id");
+    return successfulStream("ok");
+  }) as typeof fetch;
+
+  const result = await executeMarimoCode(lifecycleSession(), "1");
+
+  const attach = new URL(calls[1]);
+  expect(attach.pathname).toBe("/sse");
+  expect(attach.searchParams.get("file")).toBe("/code/notebook.py");
+  const createdId = attach.searchParams.get("session_id")!;
+  expect(createdId).toMatch(/^s_wh[0-9a-f]{12}$/);
+  expect(calls[2]).toBe("http://100.64.0.8:18001/api/kernel/execute");
+  expect(executeSessionHeader).toBe(createdId);
+  expect(result.kernel_session_id).toBe(createdId);
+  expect(result.output).toBe("ok");
+  expect(result.kernel_created).toBe(true);
+});
+
+test("a refused attach reports the server's close reason instead of executing", async () => {
+  let executed = false;
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api/sessions")) return jsonResponse({ other: { path: "/code/other.py" } });
+    if (url.includes("/sse?")) return streamResponse(["event: close\ndata: NO_FILE_KEY\n\n"]);
+    executed = true;
+    return successfulStream();
   }) as typeof fetch;
 
   await expect(executeMarimoCode(lifecycleSession(), "1")).rejects.toThrow(
-    "No active browser kernel for /code/notebook.py; open http://100.64.0.8:18001/ in a browser first; available paths: /code/other.py",
+    "Marimo refused a kernel session for /code/notebook.py: NO_FILE_KEY",
   );
-  expect(calls).toBe(1);
+  expect(executed).toBe(false);
+});
+
+test("an attach stream that ends without kernel-ready fails instead of executing", async () => {
+  let executed = false;
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api/sessions")) return jsonResponse({});
+    if (url.includes("/sse?")) return streamResponse([": keep-alive\n\n"]);
+    executed = true;
+    return successfulStream();
+  }) as typeof fetch;
+
+  await expect(executeMarimoCode(lifecycleSession(), "1")).rejects.toThrow(
+    "Marimo did not start a kernel for /code/notebook.py; the attach stream ended early",
+  );
+  expect(executed).toBe(false);
+});
+
+test("hydration runs the saved cells and reports how many ran", async () => {
+  let submitted = "";
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/api/sessions")) return jsonResponse({ kernel: { path: "/code/notebook.py" } });
+    submitted = JSON.parse(String(init?.body)).code;
+    return streamResponse([
+      'event: stdout\ndata: {"data": "re-ran cell \'a\'\\n__wh_hydrated__ 3\\n"}\n\n',
+      `event: done\ndata: ${JSON.stringify({ success: true })}\n\n`,
+    ]);
+  }) as typeof fetch;
+
+  expect(await hydrateNotebook(lifecycleSession())).toBe(3);
+  expect(submitted).toContain("ctx.run_cell(_wh_id)");
+});
+
+test("hydration fails loudly when the kernel reports no cell count", async () => {
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api/sessions")) return jsonResponse({ kernel: { path: "/code/notebook.py" } });
+    return successfulStream();
+  }) as typeof fetch;
+
+  await expect(hydrateNotebook(lifecycleSession())).rejects.toThrow(
+    "Marimo did not report how many cells it ran",
+  );
 });
 
 test("duplicate exact notebook matches fail before execution", async () => {
@@ -193,7 +269,7 @@ test("duplicate exact notebook matches fail before execution", async () => {
   }) as typeof fetch;
 
   await expect(executeMarimoCode(lifecycleSession(), "1")).rejects.toThrow(
-    "Multiple active browser kernels match /code/notebook.py; close duplicate tabs and retry",
+    "Multiple kernel sessions match /code/notebook.py; close duplicate editors and retry",
   );
   expect(calls).toBe(1);
 });

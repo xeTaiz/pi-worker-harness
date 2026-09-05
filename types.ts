@@ -176,6 +176,8 @@ export interface MarimoKernelSession {
 export interface MarimoExecutionResult {
   marimo_session_id: string;
   kernel_session_id: string;
+  /** True when this call had to create the kernel, so its namespace starts empty. */
+  kernel_created: boolean;
   success: boolean;
   stdout: string;
   stderr: string;
