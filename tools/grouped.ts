@@ -11,11 +11,9 @@
  * Specialised operations that do not fit the RO/RW split remain as their own
  * registered tools (see tools/admin.ts: image deploy + worker restart).
  *
- *   wh_read     — RO inspection of workers, jobs, tunnels, and Pi sessions
- *   wh_dispatch — mutations and capability-bearing Marimo lifecycle/execution:
- *                 jobs, tunnels, file transfer, git access, Pi delegation,
- *                 worker prune, data copy, and managed Marimo servers
- *   wh_admin_*  — image deploy / worker restart (not subagent-eligible)
+ *   wh_read     — role-scoped read-only inspection
+ *   wh_dispatch — role-scoped mutations, Marimo, and fleet orchestration
+ *   wh_admin_*  — image deploy / worker restart for normal operator sessions
  */
 import { Type, type Static } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
@@ -37,29 +35,37 @@ import type { DataCatalog } from "../agent-output.ts";
 import {
   ApiError,
   addTunnel,
+  askPm,
   copyData,
-  createDelegation,
   createMarimo,
-  enqueueJob,
+  dispatchTask,
   downloadFile,
-  getDelegation,
-  getMarimo,
+  enqueueJob,
   getJobLogs,
+  getMarimo,
   getOrchestratorUrl,
+  getPiSession,
   getWorker,
   getWorkerSummary,
   listDataPaths,
   listJobs,
   listMarimo,
-  listQueue,
   listPiSessions,
+  listProjects,
+  listQueue,
   listTunnels,
   listWorkers,
+  notifyPm,
   pruneWorkers,
-  removeTunnel,
   removeMarimo,
+  removeTunnel,
+  sendOrchestratorMessage,
+  sendProjectMessage,
+  sendSessionMessage,
   startJob,
   stopJob,
+  submitPr,
+  teardownTask,
   updateQueuedJob,
   uploadFile,
 } from "../api.ts";
@@ -151,8 +157,9 @@ function readCallSummary(args: Static<typeof whReadParams>): string {
     }
     case "pi_sessions":
       return args.worker_id ?? "";
-    case "pi_delegation":
-      return args.delegation_id ?? "";
+    case "fleet_status":
+    case "list_projects":
+      return "";
     default:
       return "";
   }
@@ -204,16 +211,23 @@ function dispatchCallSummary(args: Static<typeof whDispatchParams>): string {
     case "workers_prune":
       return args.minutes !== undefined ? `${args.minutes}m` : "";
     case "upload_file":
-      return `${args.worker_id}:${truncate(args.path ?? "", 60)}`;
     case "download_file":
       return `${args.worker_id}:${truncate(args.path ?? "", 60)}`;
-    case "delegate": {
-      const parts: string[] = [];
-      if (args.worker_id) parts.push(`worker=${args.worker_id}`);
-      if (args.sync) parts.push("sync");
-      parts.push(`task=${truncate(args.task ?? "", 60)}`);
-      return parts.filter(Boolean).join(" ");
-    }
+    case "ask_pm":
+      return truncate(args.question ?? "", 60);
+    case "notify_pm":
+      return truncate(args.note ?? "", 60);
+    case "dispatch_task":
+      return `${args.branch ?? ""} ${truncate(args.briefing ?? "", 60)}`.trim();
+    case "answer":
+      return `${args.task_session_id ?? ""} ${truncate(args.text ?? "", 60)}`.trim();
+    case "submit_pr":
+    case "teardown_task":
+      return args.task_session_id ?? "";
+    case "escalate":
+      return truncate(args.text ?? "", 60);
+    case "pm_send":
+      return `${args.project ?? ""} ${truncate(args.message ?? "", 60)}`.trim();
     case "grant_git_access":
       return [args.worker_id, args.repo ?? ""].filter(Boolean).join(" ");
     default:
@@ -313,16 +327,16 @@ const whReadParams = Type.Object({
     "get_job_logs",
     "list_tunnels",
     "pi_sessions",
-    "pi_delegation",
+    "fleet_status",
+    "list_projects",
   ]),
   worker_id: Type.Optional(Type.String({ description: "Worker ID or name" })),
   query: Type.Optional(
     Type.String({ description: "Case-insensitive substring filter for list_data paths" }),
   ),
   job_id: Type.Optional(Type.String({ description: "Job ID" })),
-  delegation_id: Type.Optional(Type.String({ description: "Delegation ID" })),
   origin_session_id: Type.Optional(
-    Type.String({ description: "Delegated Pi child session ID that originated the job" }),
+    Type.String({ description: "Child Pi session ID that originated the job" }),
   ),
   status: Type.Optional(StringEnum(["pending", "starting", "running", "done", "failed"])),
   tail: Type.Optional(Type.Number({ description: "Last N log lines. Default 10" })),
@@ -350,13 +364,20 @@ const whDispatchParams = Type.Object({
     "workers_prune",
     "upload_file",
     "download_file",
-    "delegate",
     "grant_git_access",
     "list_marimo",
     "get_marimo",
     "start_marimo",
     "stop_marimo",
     "execute_marimo",
+    "ask_pm",
+    "notify_pm",
+    "dispatch_task",
+    "answer",
+    "submit_pr",
+    "teardown_task",
+    "escalate",
+    "pm_send",
   ]),
   // data_copy
   src_worker: Type.Optional(Type.String({ description: "Source worker ID or name for data_copy" })),
@@ -391,7 +412,7 @@ const whDispatchParams = Type.Object({
     minimum: 1,
     description: "One-based pending queue position",
   })),
-  // stop_job / remove_tunnel / get_job_logs / pi_delegation
+  // stop_job / remove_tunnel
   job_id: Type.Optional(Type.String({ description: "Job ID" })),
   tunnel_id: Type.Optional(Type.String({ description: "Tunnel ID" })),
   // add_tunnel
@@ -405,13 +426,17 @@ const whDispatchParams = Type.Object({
   path: Type.Optional(Type.String({ description: "Remote file path on worker (for file transfer)" })),
   content_b64: Type.Optional(Type.String({ description: "Base64-encoded file content (for upload_file)" })),
   max_bytes: Type.Optional(Type.Number({ description: "Max bytes to download (default 10MB)" })),
-  // delegate
-  task: Type.Optional(Type.String({ description: "Concrete task for the delegated Pi child" })),
-  parent_session_id: Type.Optional(Type.String({ description: "Optional registered parent Pi session ID" })),
-  cwd: Type.Optional(Type.String({ description: "Optional existing worker directory; defaults to worker home" })),
-  timeout_seconds: Type.Optional(Type.Number({
-    description: "Delegation timeout gate; 0 disables (default 0). Unacknowledged expiry becomes termination_unknown.",
-  })),
+  // Hierarchical agent fleet
+  question: Type.Optional(Type.String({ description: "Question for this task's project manager" })),
+  note: Type.Optional(Type.String({ description: "Non-blocking note for this task's project manager" })),
+  branch: Type.Optional(Type.String({ description: "Requested task branch name" })),
+  briefing: Type.Optional(Type.String({ description: "Complete task briefing" })),
+  task_session_id: Type.Optional(Type.String({ description: "Task session ID owned by this project manager" })),
+  text: Type.Optional(Type.String({ description: "Message text" })),
+  summary: Type.Optional(Type.String({ description: "Six-section pull request summary" })),
+  force: Type.Optional(Type.Boolean({ description: "Allow teardown before a pull request exists" })),
+  project: Type.Optional(Type.String({ description: "Configured project name" })),
+  message: Type.Optional(Type.String({ description: "Message for the project manager" })),
   // grant_git_access
   repo: Type.Optional(Type.String({
     description: 'GitHub repo in "owner/repo" format. If omitted, detected from the current directory\'s git remote.',
@@ -437,23 +462,115 @@ const essentialToolPresentation = { loadMode: "essential" as const };
 export function registerGroupedTools(
   pi: ExtensionAPI,
 ) {
+  const role = process.env.WH_SESSION_ROLE?.trim() ?? "";
+  let readActions: string[];
+  let dispatchActions: string[];
+  let readDescription: string;
+  let dispatchDescription: string;
+
+  const computeReadActions = [
+    "list_workers",
+    "available_gpus",
+    "get_worker",
+    "get_worker_summary",
+    "list_data",
+    "list_jobs",
+    "list_queue",
+    "get_job_logs",
+  ];
+  const computeDispatchActions = [
+    "data_copy",
+    "exec",
+    "stop_job",
+    "enqueue",
+    "update_queued_job",
+    "list_marimo",
+    "get_marimo",
+    "start_marimo",
+    "stop_marimo",
+    "execute_marimo",
+  ];
+
+  if (role === "orchestrator") {
+    readActions = ["fleet_status", "list_projects"];
+    dispatchActions = ["pm_send"];
+    readDescription =
+      "Inspect the hierarchical agent fleet or configured projects. The orchestrator holds no project detail and routes project work to one project manager.";
+    dispatchDescription =
+      "Send work to a project's manager; the orchestrator never edits project files or uses worker compute directly.";
+  } else if (role === "pm") {
+    readActions = [...computeReadActions, "pi_sessions"];
+    dispatchActions = [
+      ...computeDispatchActions,
+      "dispatch_task",
+      "answer",
+      "submit_pr",
+      "teardown_task",
+      "escalate",
+    ];
+    readDescription =
+      "Inspect worker compute, data, jobs, managed Marimo sessions, and fleet sessions needed to manage this project's task agents.";
+    dispatchDescription =
+      "Run compute and managed Marimo sessions or manage task agents for this project. The project manager must review the worktree diff before submit_pr, and escalates cross-project or operator decisions.";
+  } else if (role === "task") {
+    readActions = computeReadActions;
+    dispatchActions = [...computeDispatchActions, "ask_pm", "notify_pm"];
+    readDescription =
+      "Inspect worker compute, data, jobs, and the shared queue needed to complete the assigned task.";
+    dispatchDescription =
+      "Run compute or managed Marimo sessions, or contact this task's project manager. A task agent works only in its allocated worktree, never pushes, and never opens a pull request.";
+  } else if (role === "") {
+    readActions = [...computeReadActions, "list_tunnels", "pi_sessions"];
+    dispatchActions = [
+      "data_copy",
+      "exec",
+      "stop_job",
+      "enqueue",
+      "update_queued_job",
+      "add_tunnel",
+      "remove_tunnel",
+      "workers_prune",
+      "upload_file",
+      "download_file",
+      "grant_git_access",
+      "list_marimo",
+      "get_marimo",
+      "start_marimo",
+      "stop_marimo",
+      "execute_marimo",
+    ];
+    readDescription =
+      "Token-efficient read-only Worker Harness inspection. Inspect list_queue before scheduling GPU work and use the narrowest action.";
+    dispatchDescription =
+      "Mutating and capability-bearing Worker Harness operations for jobs, tunnels, file transfer, git access, pruning, data copy, and managed Marimo. Use wh_read for inspection and never invoke the Worker Harness CLI or API directly.";
+  } else {
+    console.warn(`[pi-worker-harness] Unknown WH_SESSION_ROLE ${JSON.stringify(role)}; grouped tools disabled`);
+    return;
+  }
+
+  const readPromptSnippet = role === "orchestrator"
+    ? "wh_read: inspect fleet_status or list_projects before routing work to a project manager."
+    : "wh_read (RO): inspect list_queue before scheduling GPU work; use available_gpus for telemetry availability; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) for shallow /data/shared, /data/local, and /code discovery. Filter list_jobs/logs. Never invoke the wh CLI/API directly.";
+  const dispatchPromptSnippet = role === "orchestrator"
+    ? "wh_dispatch: use pm_send to route a request to exactly one configured project's manager."
+    : "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled GPU work; exec bypasses the queue only for short setup, diagnosis, or non-GPU commands, and before immediate GPU work call wh_read available_gpus once and use its full worker ID. Do not alter another agent's job without explicit user direction. Before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; no browser is needed to execute. Never invoke the wh CLI/API directly.";
+
+  const roleReadParams = Type.Object({
+    ...whReadParams.properties,
+    action: StringEnum(readActions),
+  });
+  const roleDispatchParams = Type.Object({
+    ...whDispatchParams.properties,
+    action: StringEnum(dispatchActions),
+  });
+
   pi.registerTool({
     name: "wh_read",
     label: "Worker Harness Read",
     ...essentialToolPresentation,
-    description:
-      "Token-efficient read-only Worker Harness inspection. Choose the narrowest action:\n" +
-      "- `list_queue(worker_id?)`: shared GPU schedule; inspect it before scheduling a GPU experiment.\n" +
-      "- `available_gpus`: online machines with at least one telemetry-free GPU.\n" +
-      "- `list_workers`: compact one-row-per-worker fleet overview; use only when offline/busy workers matter.\n" +
-      "- `get_worker(worker_id)`: full detail after selecting one worker.\n" +
-      "- `list_data(query?)`: shallow directory-to-worker catalog; `/data/shared/...` is fleet-shared, `/data/local/...` is worker-specific, and `/code/...` contains repos. Pass `query` for known names; omit it only for full inventory.\n" +
-      "- `list_jobs(worker_id?, status?, origin_session_id?)`: job history; `get_job_logs(job_id, tail|head|follow?)` reads logs.\n" +
-      "- `list_tunnels`, `get_worker_summary`, `pi_sessions(worker_id?)`, and `pi_delegation(delegation_id)` inspect their named resources.\n\n" +
-      "MUST use instead of the `wh` CLI or Worker Harness APIs. Mutation/admin operations require `wh_dispatch`/`wh_admin_*`; if unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. Use returned full worker IDs for dispatch because worker names can be duplicated.",
-    promptSnippet:
-      "wh_read (RO): inspect list_queue before scheduling GPU work; use available_gpus for telemetry availability; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) for shallow /data/shared, /data/local, and /code discovery. Filter list_jobs/logs. Never invoke the wh CLI/API directly.",
-    parameters: whReadParams,
+    description: readDescription,
+    promptSnippet: readPromptSnippet,
+    parameters: roleReadParams,
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       text.setText(buildReadHeader(args, theme));
@@ -487,7 +604,6 @@ export function registerGroupedTools(
         action,
         worker_id,
         job_id,
-        delegation_id,
         origin_session_id,
         status,
         query,
@@ -496,6 +612,7 @@ export function registerGroupedTools(
         follow,
       } = params;
       try {
+        if (typeof action !== "string" || !readActions.includes(action)) throw new Error(`Action ${action} is not available for role ${role || "operator"}`);
         switch (action) {
           case "list_workers": {
             const workers = await listWorkers();
@@ -623,18 +740,19 @@ export function registerGroupedTools(
               details: { tunnels },
             };
           }
-          case "pi_sessions": {
+          case "pi_sessions":
+          case "fleet_status": {
             const sessions = await listPiSessions(worker_id);
             return {
               content: [{ type: "text", text: JSON.stringify(sessions, null, 2) }],
               details: { sessions },
             };
           }
-          case "pi_delegation": {
-            const delegation = await getDelegation(requireField(delegation_id, "delegation_id"));
+          case "list_projects": {
+            const projects = await listProjects();
             return {
-              content: [{ type: "text", text: JSON.stringify(delegation, null, 2) }],
-              details: delegation,
+              content: [{ type: "text", text: JSON.stringify(projects, null, 2) }],
+              details: { projects },
             };
           }
           default:
@@ -650,14 +768,9 @@ export function registerGroupedTools(
     name: "wh_dispatch",
     label: "Worker Harness Dispatch",
     ...essentialToolPresentation,
-    description:
-      "Mutating and capability-bearing Worker Harness operations: scheduled and immediate jobs, tunnels, file transfer, git access, Pi delegation, pruning, worker-to-worker data copy, and managed Marimo lifecycle/execution. MUST use instead of the `wh` CLI or Worker Harness APIs. Inspection requires `wh_read`; image deployment/restart requires `wh_admin_*`. If a required tool is unavailable, report the limitation—NEVER work around it through Bash, the CLI, or APIs. `tools: [\"wh_dispatch\"]` grants a child the full mutation and Marimo capability surface.\n\n" +
-      "Inspect `wh_read(action=\"list_queue\")` before scheduling a GPU experiment. Use `enqueue(worker_id, command, name, expected_seconds, gpu_count?, no_pty?)` for scheduled GPU work. `exec` is an immediate queue bypass reserved for short setup, diagnosis, and non-GPU commands. Any agent can update or stop any job, but MUST NOT move, reorder, or edit another queued job or stop running work unless the user explicitly asks to schedule something ASAP, reorganize the queue, cancel work, or kill a running job. Preferred over local Bash for long-running jobs, experiments, GPU work, remote compute, and every Marimo operation. Before immediate GPU work call `wh_read(action=\"available_gpus\")` once and dispatch with the returned full worker ID; do not fetch the full fleet or repeatedly preflight unchanged state. If `wh_read` is unavailable and the assignment does not identify an available worker/GPU, report the missing preflight instead of launching. On workers, create project-local `uv` environments for dependencies as needed.\n\n" +
-      "Action-specific fields: `data_copy(src_worker, src_path, dst_worker, dst_path, ttl_seconds?)`; `enqueue(worker_id, command, name, expected_seconds, gpu_count?, no_pty?)`; `update_queued_job(job_id, worker_id?, position?, name?, expected_seconds?, gpu_count?)`; `exec(worker_id, command, name?, no_pty?, sync?, sync_timeout?)`; `stop_job(job_id)`; `add_tunnel(worker_id, local_port, remote_port, name?)`; `remove_tunnel(tunnel_id)`; `workers_prune(minutes?)`; `upload_file(worker_id, path, content_b64)`; `download_file(worker_id, path, max_bytes?)`; `delegate(task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)`; `grant_git_access(worker_id, repo?)`; `list_marimo(worker_id?)`; `get_marimo(marimo_session_id)`; `start_marimo(worker_id, notebook_path, environment, ready_timeout?)`; `stop_marimo(marimo_session_id)`; `execute_marimo(marimo_session_id, code)`.\n\n" +
-      "`enqueue` has no synchronous mode. `exec` defaults asynchronous and returns a job ID; `sync: true` blocks and returns output. `start_marimo` creates the notebook kernel itself, so `execute_marimo` works with no browser open; the first browser to open the returned URL resumes that same kernel and sees the work. For versioned project files prefer git plus `grant_git_access`; use upload/download for ad-hoc files. Before `data_copy`, use `wh_read(action=\"list_data\", query=\"known-substring\")`; omit `query` only when a complete data inventory is actually needed.",
-    promptSnippet:
-      "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled GPU work; exec bypasses the queue only for short setup, diagnosis, or non-GPU commands, and before immediate GPU work call wh_read available_gpus once and use its full worker ID. Do not alter another agent's job without explicit user direction. Before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; no browser is needed to execute. Never invoke the wh CLI/API directly.",
-    parameters: whDispatchParams,
+    description: dispatchDescription,
+    promptSnippet: dispatchPromptSnippet,
+    parameters: roleDispatchParams,
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       text.setText(buildDispatchHeader(args, theme));
@@ -688,19 +801,26 @@ export function registerGroupedTools(
         expected_seconds,
         gpu_count,
         position,
-        task,
-        parent_session_id,
-        cwd,
-        timeout_seconds,
         repo,
         marimo_session_id,
         notebook_path,
         environment,
         ready_timeout,
         code,
+        question,
+        note,
+        branch,
+        briefing,
+        task_session_id,
+        text,
+        summary,
+        force,
+        project,
+        message,
       } = params;
 
       try {
+        if (typeof action !== "string" || !dispatchActions.includes(action)) throw new Error(`Action ${action} is not available for role ${role || "operator"}`);
         switch (action) {
           case "data_copy": {
             const result = await copyData({
@@ -999,26 +1119,84 @@ export function registerGroupedTools(
               details: result,
             };
           }
-          case "delegate": {
-            const delegation = await createDelegation({
-              task: requireField(task, "task"),
-              worker_id,
-              parent_session_id,
-              cwd,
-              timeout_seconds,
-              sync,
-            });
-            const syncNote = delegation.settled === undefined
-              ? ""
-              : delegation.settled
-                ? "\nSettled: yes"
-                : "\nSettled: no (wait cap elapsed; child still running)";
+          case "ask_pm": {
+            const sessionId = requireField(process.env.WH_SESSION_ID, "WH_SESSION_ID");
+            const result = await askPm(sessionId, requireField(question, "question"));
             return {
-              content: [{
-                type: "text",
-                text: `Delegated to worker: ${delegation.child_session_id}\nDelegation: ${delegation.delegation_id}\nState: ${delegation.state}${syncNote}`,
-              }],
-              details: delegation,
+              content: [{ type: "text", text: "Question queued for the project manager; this task is now blocked." }],
+              details: result,
+            };
+          }
+          case "notify_pm": {
+            const sessionId = requireField(process.env.WH_SESSION_ID, "WH_SESSION_ID");
+            const result = await notifyPm(sessionId, requireField(note, "note"));
+            return {
+              content: [{ type: "text", text: "Project manager notified." }],
+              details: result,
+            };
+          }
+          case "dispatch_task": {
+            const sessionId = requireField(process.env.WH_SESSION_ID, "WH_SESSION_ID");
+            const session = await getPiSession(sessionId);
+            const projectName = requireField(
+              typeof session.meta.project === "string" ? session.meta.project : undefined,
+              "meta.project",
+            );
+            const taskSession = await dispatchTask(
+              projectName,
+              requireField(branch, "branch"),
+              requireField(briefing, "briefing"),
+            );
+            return {
+              content: [{ type: "text", text: `Task launched: ${taskSession.id}` }],
+              details: { session: taskSession },
+            };
+          }
+          case "answer": {
+            const result = await sendSessionMessage(
+              requireField(task_session_id, "task_session_id"),
+              requireField(text, "text"),
+            );
+            return {
+              content: [{ type: "text", text: "Answer sent to task agent." }],
+              details: result,
+            };
+          }
+          case "submit_pr": {
+            const result = await submitPr(
+              requireField(task_session_id, "task_session_id"),
+              requireField(summary, "summary"),
+            );
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+              details: result,
+            };
+          }
+          case "teardown_task": {
+            const result = await teardownTask(
+              requireField(task_session_id, "task_session_id"),
+              force,
+            );
+            return {
+              content: [{ type: "text", text: "Task agent torn down." }],
+              details: result,
+            };
+          }
+          case "escalate": {
+            const result = await sendOrchestratorMessage(requireField(text, "text"));
+            return {
+              content: [{ type: "text", text: "Escalation sent to the orchestrator." }],
+              details: result,
+            };
+          }
+          case "pm_send": {
+            const result = await sendProjectMessage(
+              requireField(project, "project"),
+              requireField(message, "message"),
+            );
+            return {
+              content: [{ type: "text", text: "Message sent to the project manager." }],
+              details: result,
             };
           }
           case "grant_git_access": {

@@ -1,21 +1,34 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
   ApiError,
+  askPm,
+  dispatchTask,
   enqueueJob,
   getOrchestratorUrl,
+  getPiSession,
+  listProjects,
   listQueue,
+  notifyPm,
+  sendProjectMessage,
+  sendSessionMessage,
+  sendOrchestratorMessage,
   setOrchestratorUrl,
   stopJob,
+  submitPr,
+  teardownTask,
   updateQueuedJob,
 } from "./api.ts";
 
 const originalFetch = globalThis.fetch;
 const originalUrl = getOrchestratorUrl();
+const environmentKeys = ["WH_SESSION_TOKEN", "WH_SESSION_ROLE", "WH_OPERATOR_TOKEN", "WH_OPERATOR_TOKEN_FILE", "WH_ORCHESTRATOR_URL"] as const;
+const originalEnvironment = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
 let requests: Array<{ url: string; init?: RequestInit }>;
 let responseBody: unknown;
 let responseStatus: number;
 
 beforeEach(() => {
+  for (const key of environmentKeys) delete process.env[key];
   requests = [];
   responseBody = [];
   responseStatus = 200;
@@ -32,6 +45,10 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   setOrchestratorUrl(originalUrl);
+  for (const key of environmentKeys) {
+    if (originalEnvironment[key] === undefined) delete process.env[key];
+    else process.env[key] = originalEnvironment[key];
+  }
 });
 
 test("listQueue serializes the optional worker query exactly", async () => {
@@ -43,6 +60,76 @@ test("listQueue serializes the optional worker query exactly", async () => {
     "http://queue.test/api/v1/jobs/queue",
   ]);
   expect(requests[0].init?.method).toBeUndefined();
+});
+
+test("API requests add the session bearer token only when configured", async () => {
+  delete process.env.WH_SESSION_TOKEN;
+  await listQueue();
+  expect(new Headers(requests[0].init?.headers).has("Authorization")).toBeFalse();
+
+  process.env.WH_SESSION_TOKEN = "session-secret";
+  await listQueue();
+  expect(new Headers(requests[1].init?.headers).get("Authorization")).toBe(
+    "Bearer session-secret",
+  );
+});
+
+test("environment pins the service for API calls even after setting a user default", async () => {
+  process.env.WH_ORCHESTRATOR_URL = " http://fleet.test/// ";
+  setOrchestratorUrl("http://other.test");
+  await listQueue();
+  expect(requests[0].url).toBe("http://fleet.test/api/v1/jobs/queue");
+  delete process.env.WH_ORCHESTRATOR_URL;
+  await listQueue();
+  expect(requests[1].url).toBe("http://other.test/api/v1/jobs/queue");
+});
+
+test("ordinary operators authenticate but a fleet role never inherits operator authority", async () => {
+  process.env.WH_OPERATOR_TOKEN = "operator-secret";
+  await listQueue();
+  process.env.WH_SESSION_ROLE = "task";
+  await listQueue();
+  process.env.WH_SESSION_TOKEN = "task-secret";
+  await listQueue();
+  expect(requests.map(({ init }) => new Headers(init?.headers).get("Authorization"))).toEqual([
+    "Bearer operator-secret", null, "Bearer task-secret",
+  ]);
+});
+
+test("PM escalation uses the lazy orchestrator mailbox rather than a cached session", async () => {
+  await sendOrchestratorMessage("Need an operator decision");
+  expect(requests.map(({ url, init }) => [url, init?.method, JSON.parse(String(init?.body))])).toEqual([
+    ["http://queue.test/api/v1/pi/orchestrator:send", "POST", { message: "Need an operator decision" }],
+  ]);
+});
+
+test("fleet helpers use the hierarchical session and project routes", async () => {
+  responseBody = { id: "session-1" };
+  await getPiSession("session/1");
+  await askPm("task/1", "Which database?");
+  await notifyPm("task/1", "Ready for review");
+  await dispatchTask("my/project", "feature", "Implement it");
+  await sendSessionMessage("task/1", "Use SQLite");
+  await submitPr("task/1", "six sections");
+  await teardownTask("task/1", true);
+  await listProjects();
+  await sendProjectMessage("my/project", "Please investigate");
+
+  expect(requests.map(({ url, init }) => [
+    url,
+    init?.method,
+    init?.body === undefined ? undefined : JSON.parse(String(init.body)),
+  ])).toEqual([
+    ["http://queue.test/api/v1/pi/sessions/session%2F1", undefined, undefined],
+    ["http://queue.test/api/v1/pi/sessions/task%2F1:ask-pm", "POST", { question: "Which database?" }],
+    ["http://queue.test/api/v1/pi/sessions/task%2F1:notify-pm", "POST", { note: "Ready for review" }],
+    ["http://queue.test/api/v1/pi/projects/my%2Fproject/tasks", "POST", { branch: "feature", briefing: "Implement it" }],
+    ["http://queue.test/api/v1/pi/sessions/task%2F1:send", "POST", { message: "Use SQLite" }],
+    ["http://queue.test/api/v1/pi/sessions/task%2F1:submit-pr", "POST", { summary: "six sections" }],
+    ["http://queue.test/api/v1/pi/sessions/task%2F1:teardown", "POST", { force: true }],
+    ["http://queue.test/api/v1/pi/projects", undefined, undefined],
+    ["http://queue.test/api/v1/pi/projects/my%2Fproject:send", "POST", { message: "Please investigate" }],
+  ]);
 });
 
 test("enqueueJob sends the exact queue POST body with defaults", async () => {

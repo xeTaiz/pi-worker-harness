@@ -25,11 +25,25 @@ Update the Pi installation with `pi update git:github.com/xeTaiz/pi-worker-harne
 Update the OMP installation by repeating its install command. Restart the agent
 after installation or update so the extension module is initialized.
 
+For pinned rollouts, package the reviewed checkout with `npm pack` and install the
+resulting `pi-worker-harness-0.1.4.tgz` artifact rather than resolving a moving
+branch. Record its checksum and install the same artifact on every host. A
+running agent keeps its loaded module: restart after installation, and confirm
+`omp plugin list` reports `pi-worker-harness@0.1.4` before launching fleet roles.
+
 ## Configuration
 
 The extension uses HTTP endpoints (not CLI subprocesses).
 
 - Default base URL: `http://orchestrator.hs.d0me.xyz:12889`
+- `WH_ORCHESTRATOR_URL` overrides the persisted default and runtime URL command.
+  API calls, bridge registration/events/command polling/acknowledgements, and log
+  streams all use this same normalized base URL.
+- Ordinary operator authentication: `WH_OPERATOR_TOKEN`, or a UTF-8 bearer file
+  named by `WH_OPERATOR_TOKEN_FILE`. Keep the file outside agent-readable roots.
+  Fleet roles use `WH_SESSION_TOKEN` and never fall back to operator credentials.
+  Unauthenticated ordinary sessions only work against an explicitly unconfigured
+  development server; a configured fleet requires an operator credential.
 - Persisted config file:
   - Pi: `~/.pi/worker-harness/config.json`
   - OMP: `~/.omp/worker-harness/config.json`
@@ -40,83 +54,72 @@ The extension uses HTTP endpoints (not CLI subprocesses).
 
 ## Tools
 
-The extension exposes **two grouped tools plus the admin tools**. Subagent
-configs use the grouped names to grant an entire tier with a single entry
-(`tools: ["wh_read"]` / `tools: ["wh_dispatch"]`).
+The extension exposes role-scoped `wh_read` and `wh_dispatch` action schemas.
+Actions outside `WH_SESSION_ROLE` are omitted at registration and rejected by
+execution handlers. Unknown roles register no harness tools. All Worker Harness
+HTTP requests carry the selected bearer, including bridge traffic and log streams.
 
-**Agent access policy:** agents must never invoke the `wh` CLI/binary from a
-shell or call Worker Harness APIs directly. They must use only the provided
-`wh_*` tools. If no provided tool supports an operation, the agent must report
-the limitation rather than working around it through the CLI, API, or another
-interactive Pi session. The `wh` CLI remains an operator-facing interface.
+### Normal operator session (`WH_SESSION_ROLE` unset)
 
-### `wh_read` (RO)
-Inspect workers, jobs, tunnels, data paths, and Pi sessions.
-- `list_workers`
-- `get_worker` (worker_id)
-- `get_worker_summary`
-- `list_data`
-- `list_jobs` (worker_id?, status?, origin_session_id?)
-- `get_job_logs` (job_id; tail? | head? | follow?)
-- `list_tunnels`
-- `pi_sessions` (worker_id?)
-- `pi_delegation` (delegation_id)
+- `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
+  `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`, `get_job_logs`,
+  `list_tunnels`, `pi_sessions`
+- `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
+  `update_queued_job`, `add_tunnel`, `remove_tunnel`, `workers_prune`,
+  `upload_file`, `download_file`, `grant_git_access`, `list_marimo`,
+  `get_marimo`, `start_marimo`, `stop_marimo`, `execute_marimo`
+- Administration: `wh_admin_deploy_image`, `wh_admin_deploy_status`,
+  `wh_admin_deploy_cancel`, `wh_admin_restart`
 
-`wh_read` intentionally exposes no Marimo action. Marimo list/get responses
-contain a Tailnet URL for an unauthenticated notebook server capable of
-arbitrary Python execution, so those operations require `wh_dispatch`.
+### Orchestrator
 
-`list_data` is a shallow directory-to-worker catalog. Paths below
-`/data/shared/<name>` identify the same deploy-managed network collection on
-every advertising worker; `/data/local/<name>` is worker-specific; `/code`
-contains repositories from the worker's configured code roots. Empty
-collections and nested descendants are not indexed.
+- `wh_read`: `fleet_status`, `list_projects`
+- `wh_dispatch`: `pm_send`
 
-### `wh_dispatch` (RW and capability-bearing)
-Mutations plus managed Marimo lifecycle and execution.
-- `data_copy` (src_worker, src_path, dst_worker, dst_path, ttl_seconds?)
-- `exec` (worker_id, command, name?, no_pty?, sync?, sync_timeout?)
-- `stop_job` (job_id)
-- `add_tunnel` (worker_id, local_port, remote_port, name?)
-- `remove_tunnel` (tunnel_id)
-- `workers_prune` (minutes?)
-- `upload_file` (worker_id, path, content_b64)
-- `download_file` (worker_id, path, max_bytes?)
-- `delegate` (task, worker_id?, parent_session_id?, cwd?, timeout_seconds?, sync?)
-- `grant_git_access` (worker_id, repo?)
-- `list_marimo` (worker_id?)
-- `get_marimo` (marimo_session_id)
-- `start_marimo` (worker_id, notebook_path, environment, ready_timeout?)
-- `stop_marimo` (marimo_session_id)
-- `execute_marimo` (marimo_session_id, code)
+The orchestrator routes project work to a project manager and has no compute,
+Marimo, file, tunnel, git, or administrative actions.
 
-Managed Marimo startup returns a direct `100.64.0.0/10` Tailnet URL. Marimo
-spawns a kernel only when a client attaches, so `start_marimo` attaches once
-over the SSE transport, waits for `kernel-ready`, detaches, and then runs the
-notebook's saved cells through code mode. Code therefore runs before anyone
-opens the notebook, and the first browser to open the URL resumes that same
-kernel and its state. Detaching matters: a consumer that stays attached would
-demote the user's browser to a non-editing viewer. Hydration matters too:
-`/api/kernel/execute` instantiates with `auto_run=False`, and marimo's
-`/api/kernel/instantiate` is behind skew protection that exempts only
-`/api/kernel/execute`. `execute_marimo` re-resolves the kernel on every call,
-creating one if the session has none, and reaches `/api/sessions`, `/sse`, and
-`/api/kernel/execute` directly at the returned URL; it does not use an
-orchestrator execution proxy.
+### Project manager
 
-Marimo operations are operator-side only and are not exposed to delegated
-agents. The launcher intentionally uses `--no-token`; Tailnet reachability and
-Headscale ACLs are the access boundary.
+- `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
+  `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`, `get_job_logs`,
+  `pi_sessions`
+- `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
+  `update_queued_job`, `list_marimo`, `get_marimo`, `start_marimo`,
+  `stop_marimo`, `execute_marimo`, `dispatch_task`, `answer`, `submit_pr`,
+  `teardown_task`, `escalate`
 
-### Admin (individual, not subagent-eligible)
-Image deployment and worker restart are exposed as their own tools and are not
-folded into `wh_dispatch`:
-- `wh_admin_deploy_image` (worker_id, image_path)
-- `wh_admin_deploy_status` (transfer_id?)
-- `wh_admin_deploy_cancel` (transfer_id)
-- `wh_admin_restart` (worker_id)
+The project manager reviews a task agent's worktree diff before `submit_pr`.
+`escalate` uses the orchestrator mailbox, which starts an absent orchestrator
+before delivering the message instead of selecting a stale session from the roster.
+
+### Task agent
+
+- `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
+  `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`, `get_job_logs`
+- `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
+  `update_queued_job`, `list_marimo`, `get_marimo`, `start_marimo`,
+  `stop_marimo`, `execute_marimo`, `ask_pm`, `notify_pm`
+
+A task agent edits only its allocated worktree. It never pushes or opens a pull
+request; it asks or notifies its project manager when coordination is needed.
+
+### Managed Marimo behavior
+
+Marimo list/get stays on `wh_dispatch` because responses contain a Tailnet URL
+for an unauthenticated notebook server capable of arbitrary Python execution.
+Managed startup returns a direct `100.64.0.0/10` Tailnet URL, attaches once to
+spawn the kernel, waits for `kernel-ready`, detaches, and runs saved cells.
+`execute_marimo` re-resolves the kernel on every call and directly reaches the
+returned notebook URL; it does not use an orchestrator execution proxy.
+
+The launcher uses `--no-token`; Tailnet reachability and Headscale ACLs are the
+Marimo access boundary.
 
 ## UI
+
+The orchestrator (and unknown roles) does not register the compute panel, widget,
+or associated commands/shortcut.
 
 ### Status widget
 Pinned above editor. Tracks selected worker/job and updates from streamed log lines.

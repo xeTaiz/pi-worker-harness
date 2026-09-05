@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import type {
   AddTunnelRequest,
   ApiErrorBody,
@@ -9,9 +10,8 @@ import type {
   MarimoCreateRequest,
   MarimoSession,
   QueuedJob,
-  PiDelegation,
-  PiDelegationCreateResult,
   PiSession,
+  Project,
   JobLogsResult,
   RemoveTunnelResponse,
   RemoveMarimoResponse,
@@ -44,8 +44,7 @@ export class ApiError extends Error {
 // The privileged control API is deliberately separate from worker registration.
 // This is a personal Tailnet extension: a fresh dotfiles checkout should find
 // the durable orchestrator without requiring a machine-local config file first.
-let orchestratorUrl = process.env.WH_ORCHESTRATOR_URL?.trim()
-  || "http://orchestrator.hs.d0me.xyz:12889";
+let orchestratorUrl = "http://orchestrator.hs.d0me.xyz:12889";
 
 /** Bound a stalled HTTP connection. Server-side lanes prevent worker-level
  * starvation; this protects the agent from a dead/unreachable server itself. */
@@ -53,11 +52,22 @@ const DEFAULT_API_TIMEOUT_MS = 30_000;
 const inFlightJobLists = new Map<string, Promise<Job[]>>();
 
 export function getOrchestratorUrl(): string {
-  return orchestratorUrl;
+  return (process.env.WH_ORCHESTRATOR_URL?.trim() || orchestratorUrl).replace(/\/+$/, "");
 }
 
 export function setOrchestratorUrl(url: string): void {
-  orchestratorUrl = url.replace(/\/+$/, "");
+  orchestratorUrl = url.trim().replace(/\/+$/, "");
+}
+
+/** Fleet sessions must never fall back to the operator's broader authority. */
+export async function getAuthorizationHeaders(): Promise<Record<string, string>> {
+  let token = process.env.WH_SESSION_TOKEN?.trim();
+  if (!token && !process.env.WH_SESSION_ROLE?.trim()) {
+    token = process.env.WH_OPERATOR_TOKEN?.trim();
+    const tokenFile = process.env.WH_OPERATOR_TOKEN_FILE?.trim();
+    if (!token && tokenFile) token = (await readFile(tokenFile, "utf8")).trim();
+  }
+  return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 async function parseErrorBody(res: Response): Promise<ApiErrorBody | null> {
@@ -115,6 +125,7 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     ? AbortSignal.any([options.signal, timeoutSignal])
     : timeoutSignal;
   const agentName = process.env.PI_AGENT_NAME || "pi";
+  const authorization = await getAuthorizationHeaders();
 
   let res: Response;
   try {
@@ -122,12 +133,12 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
       ...options,
       signal,
       body: normalizedBody,
-      // Force the real Pi child identity after caller-provided headers so one
-      // agent cannot evade its own token bucket by spoofing another agent.
+      // Extension-owned identity headers override caller-provided values.
       headers: {
         "Content-Type": "application/json",
         ...options?.headers,
         "X-Agent-Name": agentName,
+        ...authorization,
       },
     });
   } catch (err) {
@@ -157,6 +168,70 @@ export async function listPiSessions(workerId?: string): Promise<PiSession[]> {
   return apiFetch<PiSession[]>("/api/v1/pi/sessions" + qs);
 }
 
+export async function getPiSession(id: string): Promise<PiSession> {
+  return apiFetch<PiSession>("/api/v1/pi/sessions/" + encodeURIComponent(id));
+}
+
+export async function askPm(sessionId: string, question: string): Promise<unknown> {
+  return apiFetch(`/api/v1/pi/sessions/${encodeURIComponent(sessionId)}:ask-pm`, {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
+}
+
+export async function notifyPm(sessionId: string, note: string): Promise<unknown> {
+  return apiFetch(`/api/v1/pi/sessions/${encodeURIComponent(sessionId)}:notify-pm`, {
+    method: "POST",
+    body: JSON.stringify({ note }),
+  });
+}
+
+export async function dispatchTask(project: string, branch: string, briefing: string): Promise<PiSession> {
+  return apiFetch<PiSession>(`/api/v1/pi/projects/${encodeURIComponent(project)}/tasks`, {
+    method: "POST",
+    body: JSON.stringify({ branch, briefing }),
+  });
+}
+
+export async function sendSessionMessage(sessionId: string, message: string): Promise<unknown> {
+  return apiFetch(`/api/v1/pi/sessions/${encodeURIComponent(sessionId)}:send`, {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
+}
+
+export async function sendOrchestratorMessage(message: string): Promise<unknown> {
+  return apiFetch("/api/v1/pi/orchestrator:send", {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
+}
+
+export async function submitPr(taskSessionId: string, summary: string): Promise<unknown> {
+  return apiFetch(`/api/v1/pi/sessions/${encodeURIComponent(taskSessionId)}:submit-pr`, {
+    method: "POST",
+    body: JSON.stringify({ summary }),
+  });
+}
+
+export async function teardownTask(taskSessionId: string, force = false): Promise<unknown> {
+  return apiFetch(`/api/v1/pi/sessions/${encodeURIComponent(taskSessionId)}:teardown`, {
+    method: "POST",
+    body: JSON.stringify({ force }),
+  });
+}
+
+export async function listProjects(): Promise<Project[]> {
+  return apiFetch<Project[]>("/api/v1/pi/projects");
+}
+
+export async function sendProjectMessage(project: string, message: string): Promise<unknown> {
+  return apiFetch(`/api/v1/pi/projects/${encodeURIComponent(project)}:send`, {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
+}
+
 export async function createMarimo(params: MarimoCreateRequest): Promise<MarimoSession> {
   return apiFetch<MarimoSession>("/api/v1/marimo", {
     method: "POST",
@@ -179,24 +254,6 @@ export async function removeMarimo(id: string): Promise<RemoveMarimoResponse> {
   return apiFetch<RemoveMarimoResponse>("/api/v1/marimo/" + encodeURIComponent(cleanId), {
     method: "DELETE",
   });
-}
-
-export async function createDelegation(params: {
-  task: string;
-  worker_id?: string;
-  parent_session_id?: string;
-  cwd?: string;
-  timeout_seconds?: number;
-  sync?: boolean;
-}): Promise<PiDelegationCreateResult> {
-  return apiFetch<PiDelegationCreateResult>("/api/v1/pi/delegations", {
-    method: "POST",
-    body: JSON.stringify(params),
-  });
-}
-
-export async function getDelegation(id: string): Promise<PiDelegation> {
-  return apiFetch<PiDelegation>("/api/v1/pi/delegations/" + encodeURIComponent(id));
 }
 
 export async function listWorkers(): Promise<Worker[]> {

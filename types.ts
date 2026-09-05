@@ -48,7 +48,7 @@ export interface Job {
   queue_managed: boolean;
   exit_code: number | null;
   pty_enabled: boolean;
-  kind: "ssh" | "delegated";
+  kind: "ssh";
   origin_session_id: string | null;
   report_revision: number;
   expected_seconds: number;
@@ -208,6 +208,7 @@ export type PiSessionState =
   | "starting"
   | "working"
   | "idle"
+  | "blocked"
   | "stopped"
   | "failed"
   | "termination_unknown";
@@ -216,52 +217,32 @@ export interface PiSession {
   id: string;
   worker_id: string | null;
   parent_session_id: string | null;
-  session_type: "interactive" | "delegated" | "global-router";
+  session_type: "interactive" | "global-router";
   state: PiSessionState;
   task: string;
   cwd: string;
   tmux_session: string;
   detail: string;
+  role: "" | "orchestrator" | "pm" | "task";
+  question: string;
+  meta: Record<string, unknown>;
   created_at: number;
   updated_at: number;
 }
 
-export interface PiDelegation {
-  id: string;
-  parent_session_id: string | null;
-  worker_id: string;
-  child_session_id: string;
-  task: string;
-  state: PiSessionState;
-  timeout_seconds: number;
-  created_at: number;
-  completed_at: number;
-}
-
-export interface PiSessionEvent {
-  id: string;
-  session_id: string;
-  event_type: string;
-  payload: Record<string, unknown>;
-  created_at: number;
-}
-
-export interface PiDelegationCreateResult {
-  delegation_id: string;
-  child_session_id: string;
-  state: PiSessionState;
-  status_url: string;
-  /** Present only for a sync delegation request. */
-  settled?: boolean;
-  session?: PiSession | null;
-  delegation?: PiDelegation | null;
-  events?: PiSessionEvent[];
+export interface Project {
+  name: string;
+  machine: string;
+  repo: string;
+  remote: string;
+  base_branch: string;
 }
 
 export interface ApiErrorBody {
-  error: {
+  error?: {
     code: string;
     message: string;
     detail: unknown;
   };
+  detail?: unknown;
 }

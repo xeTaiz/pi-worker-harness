@@ -24,66 +24,41 @@ No worker-harness CLI invocation is required by this extension.
 
 ## Architecture
 
-```
+```text
 pi session
 ├── API clients
-│   ├── api.ts: orchestrator `/api/v1/*` lifecycle requests
+│   ├── api.ts: orchestrator `/api/v1/*` lifecycle and fleet requests
 │   └── marimo.ts: direct Tailnet `/api/sessions` and `/api/kernel/execute`
-│
-├── Tools (tools/*.ts)
-│   ├── wh_read (RO, action-based)
-│   │   ├── list_workers
-│   │   ├── get_worker
-│   │   ├── get_worker_summary
-│   │   ├── list_data
-│   │   ├── list_jobs
-│   │   ├── list_queue
-│   │   ├── get_job_logs
-│   │   ├── list_tunnels
-│   │   ├── pi_sessions
-│   │   └── pi_delegation
-│   ├── wh_dispatch (RW and capability-bearing, action-based)
-│   │   ├── data_copy
-│   │   ├── exec
-│   │   ├── enqueue
-│   │   ├── update_queued_job
-│   │   ├── stop_job
-│   │   ├── add_tunnel
-│   │   ├── remove_tunnel
-│   │   ├── workers_prune
-│   │   ├── upload_file
-│   │   ├── download_file
-│   │   ├── delegate
-│   │   ├── grant_git_access
-│   │   ├── list_marimo
-│   │   ├── get_marimo
-│   │   ├── start_marimo
-│   │   ├── stop_marimo
-│   │   └── execute_marimo
-│   └── wh_admin_* (admin, individual tools, not subagent-eligible)
-│       ├── wh_admin_deploy_image
-│       ├── wh_admin_deploy_status
-│       ├── wh_admin_deploy_cancel
-│       └── wh_admin_restart
-│
+├── Role-scoped grouped tools
+│   ├── normal operator: complete worker, queue, tunnel, file, git, and Marimo surface
+│   ├── orchestrator: fleet_status, list_projects, pm_send
+│   ├── project manager: compute/Marimo plus task lifecycle and escalation
+│   └── task agent: compute/Marimo plus ask_pm and notify_pm
 ├── Event bus (events.ts)
-│   └── worker-harness:refresh (+ future typed domain events)
-│
-├── TUI Panel (panel/index.ts)
-│   ├── Tabs: Workers / Jobs / Tunnels
-│   ├── Inline input modes: new job command, tunnel port input
-│   ├── Follow stream for running jobs
-│   └── Saved-log fallback for terminal jobs
-│
+├── TUI panel (panel/index.ts)
 └── Widget/status (widget.ts)
-    └── tracked worker/job + last log line summary
 ```
+
+`WH_SESSION_ROLE` is read at grouped-tool registration and actions outside the
+role are omitted from the schemas and rejected at execution. Unknown roles
+register no harness tools. Normal sessions with the variable unset keep the
+complete established surface and `wh_admin_*`; fleet roles do not receive
+administrative tools. Orchestrators also omit the compute panel/widget and its
+commands and shortcut.
 
 ---
 
 ## HTTP API contract used by extension
 
 Base URL is configured in `api.ts` (`getOrchestratorUrl` / `setOrchestratorUrl`).
+`WH_ORCHESTRATOR_URL` wins over both persisted defaults and runtime URL changes.
+All control-plane calls, bridge traffic, and log streams use that same base URL.
+Bearer selection is `WH_SESSION_TOKEN` first; only unscoped operator sessions
+may fall back to `WH_OPERATOR_TOKEN`, then the file at `WH_OPERATOR_TOKEN_FILE`.
+Configured but unreadable token files fail closed. Fleet launchers must scrub
+both operator variables and keep the credential file outside sandbox paths.
+Bridge registration reports `resume_path` from the agent's session manager;
+the service persists it for subsequent PM/orchestrator relaunches.
 
 ### Workers
 - `GET /api/v1/workers` → `Worker[]`
@@ -112,6 +87,19 @@ Base URL is configured in `api.ts` (`getOrchestratorUrl` / `setOrchestratorUrl`)
 - `GET /api/v1/marimo/:id` → `MarimoSession`
 - `DELETE /api/v1/marimo/:id` → `RemoveMarimoResponse`
 
+### Agent fleet
+- `GET /api/v1/pi/sessions` → `PiSession[]`
+- `GET /api/v1/pi/sessions/:id` → `PiSession`
+- `POST /api/v1/pi/sessions/:id:send` with `{ message }`
+- `POST /api/v1/pi/sessions/:id:ask-pm` with `{ question }`
+- `POST /api/v1/pi/sessions/:id:notify-pm` with `{ note }`
+- `POST /api/v1/pi/sessions/:id:submit-pr` with `{ summary }`
+- `POST /api/v1/pi/sessions/:id:teardown` with `{ force }`
+- `GET /api/v1/pi/projects` → `Project[]`
+- `POST /api/v1/pi/projects/:project:send` with `{ message }`
+- `POST /api/v1/pi/projects/:project/tasks` with `{ branch, briefing }`
+- `POST /api/v1/pi/orchestrator:send` with `{ message }` — lazy-starting PM escalation
+
 Kernel execution does not use the orchestrator API. `marimo.ts` fetches
 `/api/sessions`, creates a kernel when none matches the notebook by attaching to
 `/sse?session_id=…&file=…` until `kernel-ready` and then detaching, and posts to
@@ -136,17 +124,39 @@ because marimo's skew-protection middleware exempts only `/api/kernel/execute`,
 
 ## Tools
 
-Tools must use `api.ts` helpers, not direct fetch or CLI subprocesses.
+Tools use `api.ts` helpers, not direct fetch or CLI subprocesses. Orchestrator
+API, log-stream, and session-bridge requests include
+`Authorization: Bearer $WH_SESSION_TOKEN` when the token is set.
 
-The extension exposes **only two grouped tools** (`wh_read`, `wh_dispatch`) for
-all worker-harness operations, plus the `wh_admin_*` individual tools for image
-deployment and worker restart. Subagent configs can grant a full tier with one
-name (`tools: ["wh_read"]` / `tools: ["wh_dispatch"]`).
+### Registered actions
 
-`wh_read` exposes no Marimo action. Even lifecycle list/get reveal a direct URL
-to an unauthenticated notebook server capable of arbitrary Python execution, so
-all five Marimo actions stay on `wh_dispatch`. Marimo is operator-side only and
-is not available to delegated agents.
+- Unset:
+  - `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
+    `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`,
+    `get_job_logs`, `list_tunnels`, `pi_sessions`
+  - `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
+    `update_queued_job`, `add_tunnel`, `remove_tunnel`, `workers_prune`,
+    `upload_file`, `download_file`, `grant_git_access`, `list_marimo`,
+    `get_marimo`, `start_marimo`, `stop_marimo`, `execute_marimo`
+- Orchestrator:
+  - `wh_read`: `fleet_status`, `list_projects`
+  - `wh_dispatch`: `pm_send`
+- Project manager:
+  - `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
+    `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`,
+    `get_job_logs`, `pi_sessions`
+  - `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
+    `update_queued_job`, all five Marimo actions, `dispatch_task`, `answer`,
+    `submit_pr`, `teardown_task`, `escalate`
+- Task:
+  - `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
+    `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`, `get_job_logs`
+  - `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
+    `update_queued_job`, all five Marimo actions, `ask_pm`, `notify_pm`
+
+Marimo list/get remains on `wh_dispatch` because its direct URL grants Python
+execution. A task agent never pushes or opens a pull request; a project manager
+reviews the worktree diff before `submit_pr`.
 
 ### Required tool behaviors
 - Successful Marimo start/stop emits `worker-harness:refresh`; list/get/execute does not

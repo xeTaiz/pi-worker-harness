@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { hostname as systemHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
-import { getOrchestratorUrl } from "./api.ts";
+import { getAuthorizationHeaders, getOrchestratorUrl } from "./api.ts";
 import { harnessAgent } from "./config.ts";
 
 type BridgeState = "working" | "idle" | "stopped";
@@ -63,9 +63,9 @@ const homeHostRelays = [".pi", ".omp"].map((dir) => join(process.env.HOME || "",
 const HOST_RELAY_SCRIPT = [configuredHostRelay, adjacentHostRelay, ...homeHostRelays].find((path) => path && existsSync(path)) || adjacentHostRelay;
 
 export function registerSessionBridge(pi: ExtensionAPI): void {
-  // Delegated children use the worker-local UDS bridge instead. Headless Pi
-  // processes (subagents, planners, one-shot automation) are not operator
-  // sessions and would otherwise clutter discovery with short-lived copies.
+  // Headless Pi processes (subagents, planners, and one-shot automation) are
+  // not operator sessions and would otherwise clutter discovery with
+  // short-lived copies.
   if (process.env.WH_PI_SESSION_ID || !process.stdin.isTTY || !process.stdout.isTTY) return;
 
   let controller: AbortController | null = null;
@@ -93,9 +93,14 @@ export function registerSessionBridge(pi: ExtensionAPI): void {
     init: RequestInit = {},
     signal: AbortSignal | undefined = controller?.signal,
   ): Promise<Response> {
+    const authorization = await getAuthorizationHeaders();
     const response = await fetch(endpoint(path), {
       ...init,
-      headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+      headers: {
+        "content-type": "application/json",
+        ...(init.headers ?? {}),
+        ...authorization,
+      },
       signal,
     });
     if (!response.ok) {
@@ -512,6 +517,7 @@ export function registerSessionBridge(pi: ExtensionAPI): void {
             incarnation,
             cwd: ctx.cwd,
             name: ctx.sessionManager.getSessionName() ?? "",
+            resume_path: ctx.sessionManager.getSessionFile() ?? "",
             host: hostname,
             agent: harnessAgent(),
             terminal_attachable: terminal.attachable,
@@ -575,7 +581,7 @@ export function registerSessionBridge(pi: ExtensionAPI): void {
     const activeController = new AbortController();
     controller = activeController;
     bridgeContext = ctx;
-    sessionId = ctx.sessionManager.getSessionId();
+    sessionId = process.env.WH_SESSION_ID || ctx.sessionManager.getSessionId();
     incarnation = crypto.randomUUID();
     terminalLocator = discoverTerminalLocator();
     if (!sessionId) {

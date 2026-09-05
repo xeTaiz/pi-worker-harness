@@ -12,14 +12,21 @@ import type { MarimoSession } from "./types.ts";
 
 const originalFetch = globalThis.fetch;
 const originalOrchestratorUrl = getOrchestratorUrl();
+const environmentKeys = ["WH_ORCHESTRATOR_URL", "WH_SESSION_TOKEN", "WH_SESSION_ROLE", "WH_OPERATOR_TOKEN", "WH_OPERATOR_TOKEN_FILE"];
+const originalEnvironment = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
 
 beforeEach(() => {
+  for (const key of environmentKeys) delete process.env[key];
   setOrchestratorUrl("http://orchestrator.test");
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
   setOrchestratorUrl(originalOrchestratorUrl);
+  for (const key of environmentKeys) {
+    if (originalEnvironment[key] === undefined) delete process.env[key];
+    else process.env[key] = originalEnvironment[key];
+  }
 });
 
 function lifecycleSession(patch: Partial<MarimoSession> = {}): MarimoSession {

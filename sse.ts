@@ -1,4 +1,4 @@
-import { ApiError, getOrchestratorUrl } from "./api.ts";
+import { ApiError, getAuthorizationHeaders, getOrchestratorUrl } from "./api.ts";
 
 export interface JobLogStreamOptions {
   tail?: number;
@@ -58,9 +58,13 @@ export async function streamJobLogs(
     `${getOrchestratorUrl()}/api/v1/jobs/${encodeURIComponent(jobId)}/logs/stream?` +
     params.toString();
 
+  const authorization = await getAuthorizationHeaders();
   const res = await fetch(url, {
     method: "GET",
-    headers: { Accept: "text/plain" },
+    headers: {
+      Accept: "text/plain",
+      ...authorization,
+    },
     signal: options.signal,
   });
 

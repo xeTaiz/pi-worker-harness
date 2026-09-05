@@ -21,28 +21,34 @@ import {
 } from "./config.ts";
 
 export default async function (pi: ExtensionAPI) {
-  try {
-    const config = await loadWorkerHarnessConfig();
-    if (typeof config.orchestratorUrl === "string" && config.orchestratorUrl.trim()) {
-      setOrchestratorUrl(config.orchestratorUrl.trim());
+  // The persisted config is a user default. WH_ORCHESTRATOR_URL is set by the
+  // harness when it launches a fleet agent and names the control plane that
+  // agent must report to, so it must win over whatever this machine happens to
+  // have saved.
+  if (!process.env.WH_ORCHESTRATOR_URL?.trim()) {
+    try {
+      const config = await loadWorkerHarnessConfig();
+      if (typeof config.orchestratorUrl === "string" && config.orchestratorUrl.trim()) {
+        setOrchestratorUrl(config.orchestratorUrl.trim());
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[pi-worker-harness] Failed to load config ${getWorkerHarnessConfigPath()}: ${message}`);
     }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[pi-worker-harness] Failed to load config ${getWorkerHarnessConfigPath()}: ${message}`);
   }
 
-  // Ordinary non-worker Pi sessions register over the control plane. Worker
-  // delegates are excluded inside registerSessionBridge and keep their UDS-only profile.
+  // Interactive TTY sessions register over the control plane. Harness-launched
+  // sessions use WH_SESSION_ID so they bind to their preallocated fleet row.
   registerSessionBridge(pi);
 
-  // Register all tools.
-  // wh_read / wh_dispatch are the only worker-harness tools that cover workers,
-  // jobs, tunnels, file transfer, git access, and Pi session operations. They
-  // are action-based so subagent configs can grant RO/RW with one tool name.
-  // wh_admin_* remain as individual tools for image deploy / worker restart,
-  // which are not subagent-eligible.
+  // Grouped action schemas are role-scoped at registration time. Normal
+  // operator sessions retain administrative tools; sandboxed fleet roles do
+  // not receive host administration capabilities.
   registerGroupedTools(pi);
-  registerAdminTools(pi);
+  if (!process.env.WH_SESSION_ROLE?.trim()) registerAdminTools(pi);
+  const role = process.env.WH_SESSION_ROLE?.trim();
+  // The worker panel and widget issue compute API calls and expose exec controls.
+  if (role && role !== "pm" && role !== "task") return;
 
   // Captured from session_start to use ctx.ui for widget updates
   let uiCtx: ExtensionContext | null = null;
@@ -180,6 +186,11 @@ export default async function (pi: ExtensionAPI) {
           `Worker harness URL: ${getOrchestratorUrl()} (${getWorkerHarnessConfigPath()})`,
           "info",
         );
+        return;
+      }
+
+      if (process.env.WH_ORCHESTRATOR_URL?.trim()) {
+        ctx.ui.notify("WH_ORCHESTRATOR_URL pins this session's control plane; change it before restarting the agent.", "warning");
         return;
       }
 
