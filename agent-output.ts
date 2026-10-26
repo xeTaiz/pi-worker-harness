@@ -1,5 +1,5 @@
 import { workerGpuStatus } from "./gpu-status.ts";
-import type { DataPaths, QueuedJob, Worker } from "./types.ts";
+import type { ClusterTarget, ComputeTarget, DataPaths, QueuedJob, Worker } from "./types.ts";
 
 export interface DataCatalogWorker {
   id: string;
@@ -22,9 +22,10 @@ function columnWidths(workers: Worker[]): { name: number; dns: number } {
   };
 }
 
-export function formatWorkerOverview(workers: Worker[]): string {
-  if (workers.length === 0) return "No workers registered.";
-
+export function formatWorkerOverview(targets: Array<Worker | ComputeTarget>): string {
+  if (targets.length === 0) return "No workers registered.";
+  const workers = targets.filter((target): target is Worker => !("kind" in target) || target.kind !== "cluster");
+  const clusters = targets.filter((target): target is ClusterTarget => "kind" in target && target.kind === "cluster");
   const widths = columnWidths(workers);
   const header = "status   | worker_id                            | worker".padEnd(55 + widths.name)
     + " | tailnet_dns".padEnd(15 + widths.dns)
@@ -35,7 +36,23 @@ export function formatWorkerOverview(workers: Worker[]): string {
       .join(" · ") || "—";
     return `${worker.status.padEnd(8)} | ${worker.id} | ${worker.name.padEnd(widths.name)} | ${workerDns(worker).padEnd(widths.dns)} | ${gpuSummary}`;
   });
-  return [header, ...rows].join("\n");
+  const sections = workers.length ? [[header, ...rows].join("\n")] : [];
+  if (clusters.length) {
+    sections.push("Configured cluster targets (scheduler-backed, not online workers):\n"
+      + clusters.map(formatClusterTarget).join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
+export function formatClusterTarget(target: ClusterTarget): string {
+  const capacity = target.compute_kind === "gpu"
+    ? `${target.resource_classes.gpu_type} up to ${target.resource_classes.max_gpus} GPUs/allocation`
+    : "CPU-only";
+  const observed = target.availability.observed_at === null
+    ? "not observed" : new Date(target.availability.observed_at * 1000).toISOString();
+  return `${target.id} | ${target.name} | ${target.partition} | ${capacity}`
+    + ` | ${target.shared_path} | ${target.availability.status} (${observed}): ${target.availability.detail}`
+    + `\n  ${target.description}`;
 }
 
 export function availableGpuWorkers(workers: Worker[]): Worker[] {
@@ -109,9 +126,14 @@ export function formatQueueOverview(
   return lines.join("\n");
 }
 
-export function formatAvailableGpus(workers: Worker[]): string {
+export function formatAvailableGpus(workers: Worker[], clusters: ClusterTarget[] = []): string {
   const available = availableGpuWorkers(workers);
-  if (available.length === 0) return "No available GPUs.";
+  const schedulerTargets = clusters.filter((target) => target.compute_kind === "gpu");
+  const scheduler = schedulerTargets.length
+    ? "\n\nScheduler-backed GPU cluster capacity (not immediately free workers; scheduling/access unverified):\n"
+      + schedulerTargets.map(formatClusterTarget).join("\n")
+    : "";
+  if (available.length === 0) return "No available GPUs." + scheduler;
 
   const widths = columnWidths(available);
   const header = "worker_id                            | worker".padEnd(45 + widths.name)
@@ -124,7 +146,7 @@ export function formatAvailableGpus(workers: Worker[]): string {
       .join(" · ");
     return `${worker.id} | ${worker.name.padEnd(widths.name)} | ${workerDns(worker).padEnd(widths.dns)} | ${gpuSummary}`;
   });
-  return [header, ...rows].join("\n");
+  return [header, ...rows].join("\n") + scheduler;
 }
 
 function uniqueWorkerRefs(ids: string[]): Map<string, string> {

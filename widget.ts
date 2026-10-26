@@ -73,7 +73,7 @@ export function setupWidget(
   }
 
   function renderWidget() {
-    ui.setWidget("worker-harness", makeComponent, { placement: "aboveEditor" });
+    ui.setWidget("worker-harness", makeComponent, { placement: "belowEditor" });
   }
 
   renderWidget();
@@ -98,7 +98,7 @@ export function setupWidget(
     },
     teardown() {
       unsubscribeLogLine();
-      ui.setWidget("worker-harness", undefined, { placement: "aboveEditor" });
+      ui.setWidget("worker-harness", undefined, { placement: "belowEditor" });
     },
   };
 }

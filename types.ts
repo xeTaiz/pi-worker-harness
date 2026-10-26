@@ -23,12 +23,15 @@ export interface Worker {
   status: WorkerStatus;
   last_heartbeat_ts: number;
   created_at: number;
+  gpu_device_ids?: string[];
+  slurm?: SlurmWorkerInfo | null;
 }
 
 export interface GpuInfo {
   name: string;
   vram_total_gb: number;
   vram_used_gb: number;
+  uuid?: string | null;
 }
 
 export interface WorkerDetail extends Worker {
@@ -58,6 +61,8 @@ export interface Job {
   started_at: number;
   finished_at: number | null;
   stdout?: string; // only present in sync mode
+  notify_recipient_id?: string | null;
+  submission_key?: string | null;
 }
 
 export interface Tunnel {
@@ -90,6 +95,7 @@ export interface StartJobRequest {
   no_pty?: boolean;
   sync?: boolean;
   sync_timeout?: number;
+  notify_recipient_id?: string;
 }
 
 export interface QueuedJob extends Job {
@@ -103,6 +109,8 @@ export interface EnqueueJobRequest {
   expected_seconds: number;
   gpu_count?: number;
   no_pty?: boolean;
+  notify_recipient_id?: string;
+  submission_key?: string;
 }
 
 export interface UpdateQueuedJobRequest {
@@ -125,6 +133,106 @@ export interface StopJobResult {
   stopped: boolean;
   already_terminal: boolean;
   status: string | null;
+}
+
+/** Client-side targets are not registered workers or immediately free capacity. */
+export interface ClusterTarget {
+  id: `cluster:${string}`;
+  name: string;
+  kind: "cluster";
+  cluster_id: string;
+  compute_kind: "gpu" | "cpu";
+  partition: string;
+  description: string;
+  shared_path: string;
+  resource_classes: {
+    gpu_type?: string;
+    max_gpus: number;
+    max_cpus?: number;
+    max_memory_mb?: number;
+    max_walltime_seconds: number;
+  };
+  availability: {
+    status: "unknown" | "fresh" | "stale";
+    observed_at: number | null;
+    detail: string;
+    [key: string]: unknown;
+  };
+}
+
+export type ComputeTarget = (Worker & { kind: "worker" }) | ClusterTarget;
+
+export interface SlurmLaunchPolicy {
+  cluster_id: string;
+  storage_id: string;
+  compute_kind: "gpu" | "cpu";
+  cpus: number;
+  memory_mb: number;
+  walltime_seconds: number;
+  failure_grace_seconds: number;
+  warning_seconds: number;
+  termination_grace_seconds: number;
+}
+
+export interface SlurmWorkerInfo extends SlurmLaunchPolicy {
+  request_id: string;
+  recipient_id: string;
+  initial_job_id?: string | null;
+  slurm_job_id?: string | null;
+  scheduler_state?: string | null;
+  scheduler_reason?: string | null;
+  observed_at?: number | null;
+  submission_attempted: boolean;
+  submission_failed: boolean;
+  cancel_requested: boolean;
+  submitted_at?: number | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  failure_deadline?: number | null;
+  last_useful_started_at?: number | null;
+  last_useful_started_monotonic?: number | null;
+  last_useful_boot_id?: string | null;
+}
+
+export interface SlurmReservationRequest {
+  request_id: string;
+  name: string;
+  gpu_count: number;
+  recipient_id: string;
+  registration_token_hash: string;
+  slurm: SlurmLaunchPolicy;
+}
+
+export interface RunnerResult {
+  exit_code: number;
+  descendants_exited: true;
+  started_at?: number;
+  started_monotonic?: number;
+  finished_at: number;
+  finished_monotonic: number;
+  boot_id: string;
+  termination_reason?: string | null;
+}
+
+export interface SlurmObservation {
+  slurm_job_id?: string;
+  scheduler_state?: string;
+  scheduler_reason?: string;
+  observed_at: number;
+  submission_attempted?: boolean;
+  submission_failed?: boolean;
+  cancel_requested?: boolean;
+  cancel_if_empty?: boolean;
+  recovered_results?: Array<{ job_id: string; result: RunnerResult }>;
+}
+
+export interface SlurmEnqueueOptions {
+  project_path: string;
+  environment_path?: string;
+  cpus?: number;
+  memory_mb?: number;
+  walltime_seconds: number;
+  checkpoint_signal?: "USR1" | "TERM";
 }
 
 export interface AddTunnelRequest {

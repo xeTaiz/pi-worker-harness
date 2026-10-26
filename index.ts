@@ -19,6 +19,8 @@ import {
   loadWorkerHarnessConfig,
   saveWorkerHarnessConfig,
 } from "./config.ts";
+import { createClientSession, type ClientSession } from "./slurm/notifications.ts";
+import { runClusterAdd } from "./slurm/setup.ts";
 
 export default async function (pi: ExtensionAPI) {
   // The persisted config is a user default. WH_ORCHESTRATOR_URL is set by the
@@ -44,11 +46,53 @@ export default async function (pi: ExtensionAPI) {
   // Grouped action schemas are role-scoped at registration time. Normal
   // operator sessions retain administrative tools; sandboxed fleet roles do
   // not receive host administration capabilities.
-  registerGroupedTools(pi);
+  let computeSession: ClientSession | null = null;
+  let notificationRefreshUnsubscribe: (() => void) | null = null;
+  registerGroupedTools(pi, {
+    getContext: async () => {
+      if (!computeSession) throw new Error("Worker Harness client session has not started");
+      return computeSession.getContext();
+    },
+  });
   if (!process.env.WH_SESSION_ROLE?.trim()) registerAdminTools(pi);
   const role = process.env.WH_SESSION_ROLE?.trim();
   // The worker panel and widget issue compute API calls and expose exec controls.
   if (role && role !== "pm" && role !== "task") return;
+
+  // Compute notifications do not require an interactive terminal or Pi bridge.
+  // Native aside delivery owns user-stop/plan-mode suppression; session_stop
+  // is not evidence that the user interrupted the agent.
+  pi.on("session_start", async (_event, ctx) => {
+    computeSession?.stop();
+    notificationRefreshUnsubscribe?.();
+    const session = createClientSession({
+      kind: "omp",
+      sessionId: ctx.sessionManager.getSessionId(),
+      deliver: async (message) => {
+        await pi.sendMessage({
+          customType: "worker-harness-event",
+          content: message.content,
+          display: true,
+          details: message.meta,
+        }, { deliverAs: "aside", triggerTurn: true });
+      },
+    });
+    computeSession = session;
+    notificationRefreshUnsubscribe = events.on<void>("worker-harness:refresh", () => {
+      void session.refresh().catch((error) => {
+        console.warn(`[pi-worker-harness] Compute session refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    });
+    try { await session.start(); } catch (error) {
+      console.warn(`[pi-worker-harness] Compute notifications unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+  pi.on("session_shutdown", async () => {
+    computeSession?.stop();
+    computeSession = null;
+    notificationRefreshUnsubscribe?.();
+    notificationRefreshUnsubscribe = null;
+  });
 
   // Captured from session_start to use ctx.ui for widget updates
   let uiCtx: ExtensionContext | null = null;
@@ -172,6 +216,23 @@ export default async function (pi: ExtensionAPI) {
       } catch (err) {
         ctx.ui.notify(`Worker harness error: ${err}`, "error");
       }
+    },
+  });
+
+  pi.registerCommand("cluster-add", {
+    description: "Interactively register a Slurm cluster and dedicated local SSH key (optional cluster ID)",
+    handler: async (args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("/cluster-add requires an interactive UI.", "error");
+        return;
+      }
+      await runClusterAdd(ctx.ui, async (content) => {
+        await pi.sendMessage({
+          customType: "worker-harness-cluster-setup",
+          content,
+          display: true,
+        }, { triggerTurn: false });
+      }, Array.isArray(args) ? args.join(" ") : String(args ?? ""));
     },
   });
 

@@ -1,17 +1,7 @@
 import { afterAll, beforeAll, expect, mock, test } from "bun:test";
 import { getOrchestratorUrl, setOrchestratorUrl } from "./api.ts";
+import type { registerGroupedTools as RegisterGroupedTools } from "./tools/grouped.ts";
 
-mock.module("typebox", () => ({
-  Type: {
-    Object: (properties: Record<string, unknown>) => ({ type: "object", properties }),
-    Optional: (schema: Record<string, unknown>) => ({ ...schema, optional: true }),
-    String: (options: Record<string, unknown> = {}) => ({ type: "string", ...options }),
-    Number: (options: Record<string, unknown> = {}) => ({ type: "number", ...options }),
-    Boolean: (options: Record<string, unknown> = {}) => ({ type: "boolean", ...options }),
-    Literal: (value: string) => ({ const: value }),
-    Union: (anyOf: unknown[]) => ({ anyOf }),
-  },
-}));
 
 mock.module("@earendil-works/pi-tui", () => ({
   Text: class Text {
@@ -42,7 +32,10 @@ const tools = new Map<string, CapturedTool>();
 const originalOrchestratorUrl = getOrchestratorUrl();
 const environmentKeys = ["WH_ORCHESTRATOR_URL", "WH_SESSION_TOKEN", "WH_SESSION_ROLE", "WH_OPERATOR_TOKEN", "WH_OPERATOR_TOKEN_FILE"];
 const originalEnvironment = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
-let registerGroupedTools: (pi: never) => void;
+let registerGroupedTools: typeof RegisterGroupedTools;
+const groupedOptions = {
+  getContext: async () => ({ client_kind: "omp", session_id: "marimo-test", recipient_id: "marimo-recipient" }),
+};
 
 beforeAll(async () => {
   for (const key of environmentKeys) delete process.env[key];
@@ -52,7 +45,7 @@ beforeAll(async () => {
     registerTool(tool: CapturedTool) {
       tools.set(tool.name, tool);
     },
-  } as never);
+  } as never, groupedOptions);
   setOrchestratorUrl("http://orchestrator.test");
 });
 
@@ -79,7 +72,7 @@ function roleTools(role: string): Map<string, CapturedTool> {
       registerTool(tool: CapturedTool) {
         captured.set(tool.name, tool);
       },
-    } as never);
+    } as never, groupedOptions);
   } finally {
     if (originalRole === undefined) delete process.env.WH_SESSION_ROLE;
     else process.env.WH_SESSION_ROLE = originalRole;

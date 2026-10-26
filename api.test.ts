@@ -6,6 +6,13 @@ import {
   enqueueJob,
   getOrchestratorUrl,
   getPiSession,
+  getWorker,
+  listWorkers,
+  startJob,
+  addTunnel,
+  uploadFile,
+  downloadFile,
+  createMarimo,
   listProjects,
   listQueue,
   notifyPm,
@@ -207,4 +214,26 @@ test("stopJob reuses DELETE for pending and running queue jobs", async () => {
     ["http://queue.test/api/v1/jobs/pending", "DELETE"],
     ["http://queue.test/api/v1/jobs/running", "DELETE"],
   ]);
+});
+
+test("worker-only APIs reject cluster IDs locally, including encoded host string values", async () => {
+  const target = "cluster:cpu";
+  for (const operation of [
+    () => getWorker(target),
+    () => startJob({ worker_id: target, command: "id" }),
+    () => addTunnel({ worker_id: target, local_port: 8080, remote_port: 8080 }),
+    () => uploadFile(target, "/x", ""),
+    () => downloadFile(JSON.stringify(target), "/x"),
+    () => createMarimo({ worker_id: target, notebook_path: "/x.py", environment: "/env" }),
+  ]) await expect(operation()).rejects.toMatchObject({ code: "CLUSTER_REQUIRES_ENQUEUE" });
+  expect(requests).toHaveLength(0);
+  responseBody = [{ id: target }];
+  await expect(listWorkers()).rejects.toMatchObject({ code: "RESERVED_TARGET_PREFIX" });
+});
+
+test("Slurm conflicts retain FastAPI detail machine codes", async () => {
+  responseStatus = 409;
+  responseBody = { detail: { code: "SLURM_WORKER_FINISHED", message: "Submit a fresh allocation" } };
+  await expect(enqueueJob({ worker_id: "finished", command: "id", name: "x", expected_seconds: 1 }))
+    .rejects.toMatchObject({ status: 409, code: "SLURM_WORKER_FINISHED", message: "[409] SLURM_WORKER_FINISHED: Submit a fresh allocation" });
 });

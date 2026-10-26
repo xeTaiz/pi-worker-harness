@@ -17,6 +17,8 @@ import type {
   RemoveMarimoResponse,
   StartJobRequest,
   StopJobResult,
+  SlurmObservation,
+  SlurmReservationRequest,
   UpdateQueuedJobRequest,
   Tunnel,
   Worker,
@@ -85,7 +87,7 @@ async function parseErrorBody(res: Response): Promise<ApiErrorBody | null> {
  * surrounding double-quotes) instead of the bare 36-char `<uuid>`. This walks
  * the value and unwraps any string that is a JSON-encoded string.
  */
-function unwrapDoubleStringified(value: unknown): unknown {
+export function unwrapDoubleStringified(value: unknown): unknown {
   if (typeof value !== "string") return value;
   if (value.length < 2 || value[0] !== '"' || value[value.length - 1] !== '"') return value;
   try {
@@ -93,6 +95,17 @@ function unwrapDoubleStringified(value: unknown): unknown {
     return typeof parsed === "string" ? parsed : value;
   } catch {
     return value;
+  }
+}
+
+export function isClusterTargetId(id: string | undefined): id is `cluster:${string}` {
+  return typeof id === "string" && String(unwrapDoubleStringified(id)).startsWith("cluster:");
+}
+
+export function requireWorkerTarget(id: string | undefined): void {
+  if (isClusterTargetId(id)) {
+    throw new ApiError(409, "CLUSTER_REQUIRES_ENQUEUE",
+      "Cluster targets accept enqueue only. Use an existing worker or enqueue a CPU preparation allocation for exec, files, tunnels and Marimo.", null);
   }
 }
 
@@ -150,12 +163,13 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const body = await parseErrorBody(res);
-    // FastAPI's HTTPException returns {"detail": "..."} (no nested "error"
-    // object), so fall back to body.detail for both message and detail.
-    const errCode = body?.error?.code ?? "HTTP_ERROR";
-    const errMsg =
-      body?.error?.message ??
-      (typeof body?.detail === "string" ? body.detail : res.statusText);
+    // FastAPI also uses detail:{code,message} for transactional Slurm conflicts.
+    const detail = body?.detail;
+    const detailCode = detail && typeof detail === "object" && "code" in detail && typeof detail.code === "string" ? detail.code : undefined;
+    const detailMessage = detail && typeof detail === "object" && "message" in detail && typeof detail.message === "string" ? detail.message : undefined;
+    const errCode = body?.error?.code ?? detailCode ?? "HTTP_ERROR";
+    const errMsg = body?.error?.message ?? detailMessage
+      ?? (typeof detail === "string" ? detail : res.statusText);
     const errDetail = body?.error?.detail ?? body?.detail ?? null;
     throw new ApiError(res.status, errCode, errMsg, errDetail);
   }
@@ -233,6 +247,7 @@ export async function sendProjectMessage(project: string, message: string): Prom
 }
 
 export async function createMarimo(params: MarimoCreateRequest): Promise<MarimoSession> {
+  requireWorkerTarget(params.worker_id);
   return apiFetch<MarimoSession>("/api/v1/marimo", {
     method: "POST",
     body: JSON.stringify(params),
@@ -240,6 +255,7 @@ export async function createMarimo(params: MarimoCreateRequest): Promise<MarimoS
 }
 
 export async function listMarimo(workerId?: string): Promise<MarimoSession[]> {
+  requireWorkerTarget(workerId);
   const qs = workerId ? "?worker_id=" + encodeURIComponent(workerId) : "";
   return apiFetch<MarimoSession[]>("/api/v1/marimo" + qs);
 }
@@ -257,10 +273,15 @@ export async function removeMarimo(id: string): Promise<RemoveMarimoResponse> {
 }
 
 export async function listWorkers(): Promise<Worker[]> {
-  return apiFetch<Worker[]>("/api/v1/workers");
+  const workers = await apiFetch<Worker[]>("/api/v1/workers");
+  if (workers.some((worker) => isClusterTargetId(worker.id))) {
+    throw new ApiError(409, "RESERVED_TARGET_PREFIX", "A backend worker ID collides with the reserved cluster: prefix.", null);
+  }
+  return workers;
 }
 
 export async function getWorker(id: string): Promise<WorkerDetail> {
+  requireWorkerTarget(id);
   const cleanId = unwrapDoubleStringified(id) as string;
   return apiFetch<WorkerDetail>("/api/v1/workers/" + encodeURIComponent(cleanId));
 }
@@ -285,6 +306,8 @@ export async function copyData(params: {
   dst_path: string;
   ttl_seconds?: number;
 }): Promise<DataCopyResult> {
+  requireWorkerTarget(params.src_worker);
+  requireWorkerTarget(params.dst_worker);
   return apiFetch<DataCopyResult>("/api/v1/data/copy", {
     method: "POST",
     body: JSON.stringify(params),
@@ -292,6 +315,7 @@ export async function copyData(params: {
 }
 
 export async function startJob(params: StartJobRequest): Promise<Job> {
+  requireWorkerTarget(params.worker_id);
   const body: Record<string, unknown> = {
     worker_id: params.worker_id,
     command: params.command,
@@ -299,11 +323,13 @@ export async function startJob(params: StartJobRequest): Promise<Job> {
   };
   if (params.name) body.name = params.name;
   if (params.sync) body.sync = true;
+  if (params.notify_recipient_id) body.notify_recipient_id = params.notify_recipient_id;
   if (params.sync_timeout) body.sync_timeout = params.sync_timeout;
   return apiFetch<Job>("/api/v1/jobs", { method: "POST", body: JSON.stringify(body) });
 }
 
 export async function listQueue(workerId?: string): Promise<QueuedJob[]> {
+  requireWorkerTarget(workerId);
   const cleanWorkerId = workerId === undefined
     ? undefined
     : unwrapDoubleStringified(workerId) as string;
@@ -314,6 +340,7 @@ export async function listQueue(workerId?: string): Promise<QueuedJob[]> {
 }
 
 export async function enqueueJob(params: EnqueueJobRequest): Promise<Job> {
+  requireWorkerTarget(params.worker_id);
   return apiFetch<Job>("/api/v1/jobs/queue", {
     method: "POST",
     body: JSON.stringify({
@@ -323,6 +350,8 @@ export async function enqueueJob(params: EnqueueJobRequest): Promise<Job> {
       expected_seconds: params.expected_seconds,
       gpu_count: params.gpu_count ?? 1,
       no_pty: params.no_pty ?? false,
+      notify_recipient_id: params.notify_recipient_id,
+      submission_key: params.submission_key,
     }),
   });
 }
@@ -331,6 +360,7 @@ export async function updateQueuedJob(
   id: string,
   params: UpdateQueuedJobRequest,
 ): Promise<QueuedJob> {
+  requireWorkerTarget(params.worker_id);
   const cleanId = unwrapDoubleStringified(id) as string;
   const body: Record<string, unknown> = {};
   if (params.worker_id !== undefined) body.worker_id = params.worker_id;
@@ -349,6 +379,7 @@ export async function listJobs(filters?: {
   status?: string;
   origin_session_id?: string;
 }): Promise<Job[]> {
+  requireWorkerTarget(filters?.worker_id);
   const params = new URLSearchParams();
   if (filters?.worker_id) params.set("worker_id", filters.worker_id);
   if (filters?.status) params.set("status", filters.status);
@@ -370,6 +401,28 @@ export async function listJobs(filters?: {
   }
 }
 
+export async function getJob(id: string): Promise<Job> {
+  const cleanId = unwrapDoubleStringified(id) as string;
+  const job = (await listJobs()).find((candidate) => candidate.id === cleanId);
+  if (!job) throw new ApiError(404, "JOB_NOT_FOUND", `Job not found: ${cleanId}`, null);
+  return job;
+}
+
+export async function reserveWorker(params: SlurmReservationRequest): Promise<{ worker_id: string }> {
+  return apiFetch<{ worker_id: string }>("/api/v1/workers/reservations", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export async function observeSlurmWorker(workerId: string, params: SlurmObservation, signal?: AbortSignal): Promise<Worker> {
+  return apiFetch<Worker>("/api/v1/workers/" + encodeURIComponent(workerId) + "/slurm", {
+    method: "PATCH",
+    body: JSON.stringify(params),
+    signal,
+  });
+}
+
 export async function getJobLogs(id: string, opts?: { tail?: number; head?: number }): Promise<JobLogsResult> {
   const cleanId = unwrapDoubleStringified(id) as string;
   const params = new URLSearchParams();
@@ -385,6 +438,7 @@ export async function stopJob(id: string): Promise<StopJobResult> {
 }
 
 export async function addTunnel(params: AddTunnelRequest): Promise<Tunnel> {
+  requireWorkerTarget(params.worker_id);
   return apiFetch<Tunnel>("/api/v1/tunnels", { method: "POST", body: JSON.stringify(params) });
 }
 
@@ -401,6 +455,7 @@ export async function uploadFile(
   path: string,
   contentB64: string,
 ): Promise<FileTransferResult> {
+  requireWorkerTarget(workerId);
   const cleanId = unwrapDoubleStringified(workerId) as string;
   return apiFetch<FileTransferResult>(
     "/api/v1/workers/" + encodeURIComponent(cleanId) + "/files",
@@ -413,6 +468,7 @@ export async function downloadFile(
   path: string,
   maxBytes?: number,
 ): Promise<FileTransferResult> {
+  requireWorkerTarget(workerId);
   const cleanId = unwrapDoubleStringified(workerId) as string;
   const params = new URLSearchParams({ path });
   if (maxBytes !== undefined) params.set("max_bytes", String(maxBytes));

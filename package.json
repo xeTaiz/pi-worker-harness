@@ -7,7 +7,10 @@
     "type": "git",
     "url": "git+https://github.com/xeTaiz/pi-worker-harness.git"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "typebox": "1.4.3"
+  },
   "omp": {
     "extensions": ["./index.ts"]
   },

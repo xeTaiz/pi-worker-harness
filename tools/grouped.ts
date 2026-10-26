@@ -22,10 +22,8 @@ import { StringEnum } from "../utils.ts";
 import { events } from "../events.ts";
 import { gpuAvailability, workerGpuStatus } from "../gpu-status.ts";
 import type { GpuModelStatus } from "../gpu-status.ts";
-import type { QueuedJob, Worker } from "../types.ts";
+import type { ClusterTarget, ComputeTarget, QueuedJob, Worker } from "../types.ts";
 import {
-  availableGpuWorkers,
-  buildDataCatalog,
   formatDataCatalog,
   formatAvailableGpus,
   formatQueueOverview,
@@ -33,60 +31,37 @@ import {
 } from "../agent-output.ts";
 import type { DataCatalog } from "../agent-output.ts";
 import {
-  ApiError,
-  addTunnel,
   askPm,
-  copyData,
-  createMarimo,
   dispatchTask,
-  downloadFile,
-  enqueueJob,
-  getJobLogs,
-  getMarimo,
-  getOrchestratorUrl,
+  requireWorkerTarget,
   getPiSession,
   getWorker,
-  getWorkerSummary,
-  listDataPaths,
-  listJobs,
-  listMarimo,
   listPiSessions,
   listProjects,
-  listQueue,
-  listTunnels,
-  listWorkers,
   notifyPm,
   pruneWorkers,
-  removeMarimo,
-  removeTunnel,
   sendOrchestratorMessage,
   sendProjectMessage,
   sendSessionMessage,
   startJob,
-  stopJob,
   submitPr,
   teardownTask,
-  updateQueuedJob,
-  uploadFile,
 } from "../api.ts";
-import { subscribeJobLogs } from "../sse.ts";
-import { ensureKernelSession, executeMarimoCode, hydrateNotebook } from "../marimo.ts";
+import type { SlurmContext } from "../slurm/client.ts";
+import {
+  COMPUTE_READ_ACTIONS,
+  COMPUTE_DISPATCH_ACTIONS,
+  computeReadSchema,
+  computeDispatchSchema,
+  executeComputeRead,
+  executeComputeDispatch,
+  requireField,
+  toToolError,
+  type ComputeSlurmClient,
+} from "./compute-actions.ts";
 
 // ── shared helpers ─────────────────────────────────────
 
-function toToolError(err: unknown): Error {
-  if (err instanceof ApiError) {
-    return new Error(`${err.message}${err.detail ? ` (${JSON.stringify(err.detail)})` : ""}`);
-  }
-  return err instanceof Error ? err : new Error(String(err));
-}
-
-function requireField<T>(value: T | undefined, name: string): T {
-  if (value === undefined || value === null || value === "") {
-    throw new Error(`Missing required parameter for action: ${name}`);
-  }
-  return value;
-}
 
 /** Run a local command synchronously (used by grant_git_access for gh API). */
 async function runLocal(
@@ -316,34 +291,8 @@ export function buildWorkerList(workers: Worker[], theme: Theme): string {
  * without complaining about absent siblings.
  */
 const whReadParams = Type.Object({
-  action: StringEnum([
-    "list_workers",
-    "available_gpus",
-    "get_worker",
-    "get_worker_summary",
-    "list_data",
-    "list_jobs",
-    "list_queue",
-    "get_job_logs",
-    "list_tunnels",
-    "pi_sessions",
-    "fleet_status",
-    "list_projects",
-  ]),
-  worker_id: Type.Optional(Type.String({ description: "Worker ID or name" })),
-  query: Type.Optional(
-    Type.String({ description: "Case-insensitive substring filter for list_data paths" }),
-  ),
-  job_id: Type.Optional(Type.String({ description: "Job ID" })),
-  origin_session_id: Type.Optional(
-    Type.String({ description: "Child Pi session ID that originated the job" }),
-  ),
-  status: Type.Optional(StringEnum(["pending", "starting", "running", "done", "failed"])),
-  tail: Type.Optional(Type.Number({ description: "Last N log lines. Default 10" })),
-  head: Type.Optional(
-    Type.Number({ description: "First N log lines. Mutually exclusive with tail" }),
-  ),
-  follow: Type.Optional(Type.Boolean({ description: "Stream logs in real time" })),
+  ...computeReadSchema.properties,
+  action: StringEnum([...COMPUTE_READ_ACTIONS, "pi_sessions", "fleet_status", "list_projects"]),
 });
 
 /**
@@ -353,79 +302,16 @@ const whReadParams = Type.Object({
  * fields are enforced at runtime via `requireField`.
  */
 const whDispatchParams = Type.Object({
+  ...computeDispatchSchema.properties,
   action: StringEnum([
-    "data_copy",
-    "exec",
-    "stop_job",
-    "enqueue",
-    "update_queued_job",
-    "add_tunnel",
-    "remove_tunnel",
-    "workers_prune",
-    "upload_file",
-    "download_file",
-    "grant_git_access",
-    "list_marimo",
-    "get_marimo",
-    "start_marimo",
-    "stop_marimo",
-    "execute_marimo",
-    "ask_pm",
-    "notify_pm",
-    "dispatch_task",
-    "answer",
-    "submit_pr",
-    "teardown_task",
-    "escalate",
-    "pm_send",
+    ...COMPUTE_DISPATCH_ACTIONS,
+    "workers_prune", "grant_git_access", "ask_pm", "notify_pm", "dispatch_task",
+    "answer", "submit_pr", "teardown_task", "escalate", "pm_send",
   ]),
-  // data_copy
-  src_worker: Type.Optional(Type.String({ description: "Source worker ID or name for data_copy" })),
-  src_path: Type.Optional(Type.String({ description: "Advertised absolute source path for data_copy" })),
-  dst_worker: Type.Optional(Type.String({ description: "Destination worker ID or name for data_copy" })),
-  dst_path: Type.Optional(Type.String({ description: "Absolute destination path for data_copy" })),
-  ttl_seconds: Type.Optional(Type.Number({ description: "Temporary source export TTL in seconds (default 21600)" })),
-  // exec
-  worker_id: Type.Optional(Type.String({ description: "Worker ID or name" })),
-  command: Type.Optional(Type.String({
-    description:
-      "Shell command to execute on the worker. Workers have uv, build-essential, cmake, ninja and the full CUDA toolkit (nvcc 12.6, cudnn, headers) pre-installed and on PATH. " +
-      "For Python deps: create a venv with `uv venv $WH_DIR/harness/<name> && source $WH_DIR/harness/<name>/bin/activate && uv pip install <pkgs>`. " +
-      "For extra CUDA libraries (cuBLAS, cuDNN, NCCL, …) install via `uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-nccl-cu12 …`. " +
-      "Use /code for repos, /data/shared for fleet-shared storage, /data/local for worker-local storage, and ~ for home files.",
-  })),
-  name: Type.Optional(Type.String({ description: "Job or service label" })),
-  no_pty: Type.Optional(Type.Boolean({ description: "Disable PTY" })),
-  sync: Type.Optional(Type.Boolean({
-    description: "Block until command finishes, return stdout (exec action). Default: false",
-  })),
-  sync_timeout: Type.Optional(Type.Number({ description: "Timeout in seconds for sync mode (default 120)" })),
-  expected_seconds: Type.Optional(Type.Number({
-    minimum: 1,
-    description: "Expected duration in seconds; scheduling information only",
-  })),
-  gpu_count: Type.Optional(Type.Number({
-    minimum: 1,
-    description: "Number of GPUs requested (default 1 for enqueue)",
-  })),
-  position: Type.Optional(Type.Number({
-    minimum: 1,
-    description: "One-based pending queue position",
-  })),
-  // stop_job / remove_tunnel
-  job_id: Type.Optional(Type.String({ description: "Job ID" })),
-  tunnel_id: Type.Optional(Type.String({ description: "Tunnel ID" })),
-  // add_tunnel
-  local_port: Type.Optional(Type.Number({ description: "Local port" })),
-  remote_port: Type.Optional(Type.Number({ description: "Remote worker port" })),
   // workers_prune
   minutes: Type.Optional(
     Type.Number({ description: "Stale worker threshold in minutes (default 5)" }),
   ),
-  // upload_file / download_file
-  path: Type.Optional(Type.String({ description: "Remote file path on worker (for file transfer)" })),
-  content_b64: Type.Optional(Type.String({ description: "Base64-encoded file content (for upload_file)" })),
-  max_bytes: Type.Optional(Type.Number({ description: "Max bytes to download (default 10MB)" })),
   // Hierarchical agent fleet
   question: Type.Optional(Type.String({ description: "Question for this task's project manager" })),
   note: Type.Optional(Type.String({ description: "Non-blocking note for this task's project manager" })),
@@ -441,16 +327,6 @@ const whDispatchParams = Type.Object({
   repo: Type.Optional(Type.String({
     description: 'GitHub repo in "owner/repo" format. If omitted, detected from the current directory\'s git remote.',
   })),
-  // managed Marimo lifecycle and direct kernel execution
-  marimo_session_id: Type.Optional(Type.String({ description: "Managed Marimo session ID" })),
-  notebook_path: Type.Optional(Type.String({ description: "Absolute notebook path on the worker" })),
-  environment: Type.Optional(Type.String({ description: "Absolute Python environment path on the worker" })),
-  ready_timeout: Type.Optional(Type.Number({
-    minimum: 1,
-    maximum: 300,
-    description: "Marimo server readiness timeout in seconds (1–300)",
-  })),
-  code: Type.Optional(Type.String({ description: "Python code to execute in the notebook kernel" })),
 });
 
 // ── registration ───────────────────────────────────────
@@ -458,38 +334,21 @@ const whDispatchParams = Type.Object({
 // Spreading it avoids requiring standard Pi's ToolDefinition type to declare it.
 const essentialToolPresentation = { loadMode: "essential" as const };
 
+export interface GroupedToolOptions {
+  getContext: () => Promise<SlurmContext>;
+  slurmClient?: ComputeSlurmClient;
+}
 
-export function registerGroupedTools(
-  pi: ExtensionAPI,
-) {
+export function registerGroupedTools(pi: ExtensionAPI, options: GroupedToolOptions) {
   const role = process.env.WH_SESSION_ROLE?.trim() ?? "";
   let readActions: string[];
   let dispatchActions: string[];
   let readDescription: string;
   let dispatchDescription: string;
 
-  const computeReadActions = [
-    "list_workers",
-    "available_gpus",
-    "get_worker",
-    "get_worker_summary",
-    "list_data",
-    "list_jobs",
-    "list_queue",
-    "get_job_logs",
-  ];
-  const computeDispatchActions = [
-    "data_copy",
-    "exec",
-    "stop_job",
-    "enqueue",
-    "update_queued_job",
-    "list_marimo",
-    "get_marimo",
-    "start_marimo",
-    "stop_marimo",
-    "execute_marimo",
-  ];
+  const computeReadActions = COMPUTE_READ_ACTIONS.filter((action) => action !== "list_tunnels");
+  const computeDispatchActions = COMPUTE_DISPATCH_ACTIONS.filter((action) =>
+    !["add_tunnel", "remove_tunnel", "upload_file", "download_file"].includes(action));
 
   if (role === "orchestrator") {
     readActions = ["fleet_status", "list_projects"];
@@ -550,10 +409,10 @@ export function registerGroupedTools(
 
   const readPromptSnippet = role === "orchestrator"
     ? "wh_read: inspect fleet_status or list_projects before routing work to a project manager."
-    : "wh_read (RO): inspect list_queue before scheduling GPU work; use available_gpus for telemetry availability; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) for shallow /data/shared, /data/local, and /code discovery. Filter list_jobs/logs. Never invoke the wh CLI/API directly.";
+    : "wh_read (RO): inspect list_queue before scheduling GPU work; available_gpus separates immediately free workers from scheduler-backed cluster capacity. list_workers merges real workers and configured cluster targets without polling every cluster; get_worker refreshes one chosen target's resources/pending reasons. list_data(query) discovers shallow /data/shared, /data/local, and /code paths. Filter list_jobs/logs. Never invoke the wh CLI/API directly.";
   const dispatchPromptSnippet = role === "orchestrator"
     ? "wh_dispatch: use pm_send to route a request to exactly one configured project's manager."
-    : "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled GPU work; exec bypasses the queue only for short setup, diagnosis, or non-GPU commands, and before immediate GPU work call wh_read available_gpus once and use its full worker ID. Do not alter another agent's job without explicit user direction. Before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; no browser is needed to execute. Never invoke the wh CLI/API directly.";
+    : "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled work. Cluster targets (cluster:<id>) require slurm.project_path and explicit slurm.walltime_seconds; selected shared environment bin/cwd persist in the queued command. Prepare shared files/environments through ordinary worker tools or CPU cluster enqueue; never exec a cluster target. Preserve submission_key on uncertainty and inspect get_worker evidence before candidate_job_id. stop_job defaults to job scope; allocation scope requests cancellation of the entire verified allocation. exec bypasses the queue only for short setup, diagnosis, or non-GPU commands; before immediate GPU work inspect available_gpus and use its full actual worker ID. Do not alter another agent's job without explicit user direction. Before data_copy inspect list_data with a known query. Use wh_dispatch for managed Marimo; no browser is needed to execute. Never invoke the wh CLI/API directly.";
 
   const roleReadParams = Type.Object({
     ...whReadParams.properties,
@@ -582,6 +441,8 @@ export function registerGroupedTools(
         jobs?: QueuedJob[];
         queue?: boolean;
         data?: DataCatalog;
+        targets?: ComputeTarget[];
+        cluster_targets?: ClusterTarget[];
       } | undefined;
       if (details?.queue && Array.isArray(details.workers) && Array.isArray(details.jobs)) {
         return new Text(
@@ -589,6 +450,12 @@ export function registerGroupedTools(
           0,
           0,
         );
+      }
+      if (details?.targets) {
+        return new Text(formatWorkerOverview(details.targets), 0, 0);
+      }
+      if (details?.cluster_targets) {
+        return new Text(formatAvailableGpus(details.workers ?? [], details.cluster_targets), 0, 0);
       }
       if (Array.isArray(details?.workers)) {
         return new Text(buildWorkerList(details.workers, theme), 0, 0);
@@ -600,146 +467,31 @@ export function registerGroupedTools(
       return new Text(text?.type === "text" ? text.text : "", 0, 0);
     },
     async execute(_toolCallId, params, signal, onUpdate) {
-      const {
-        action,
-        worker_id,
-        job_id,
-        origin_session_id,
-        status,
-        query,
-        tail,
-        head,
-        follow,
-      } = params;
+      const { action, worker_id } = params;
       try {
         if (typeof action !== "string" || !readActions.includes(action)) throw new Error(`Action ${action} is not available for role ${role || "operator"}`);
+        if (action !== "get_worker" && action !== "get_worker_summary" && action !== "list_jobs" && action !== "list_queue") {
+          requireWorkerTarget(worker_id);
+        }
         switch (action) {
-          case "list_workers": {
-            const workers = await listWorkers();
-            return {
-              content: [{ type: "text", text: formatWorkerOverview(workers) }],
-              details: { workers },
-            };
-          }
-          case "available_gpus": {
-            const workers = await listWorkers();
-            return {
-              content: [{ type: "text", text: formatAvailableGpus(workers) }],
-              details: { workers: availableGpuWorkers(workers) },
-            };
-          }
-          case "get_worker": {
-            const worker = await getWorker(requireField(worker_id, "worker_id"));
-            return {
-              content: [{ type: "text", text: JSON.stringify(worker, null, 2) }],
-              details: { worker },
-            };
-          }
-          case "get_worker_summary": {
-            const summary = await getWorkerSummary();
-            return {
-              content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
-              details: { summary },
-            };
-          }
-          case "list_data": {
-            const catalog = buildDataCatalog(await listDataPaths(), query);
-            return {
-              content: [{ type: "text", text: JSON.stringify(catalog) }],
-              details: { data: catalog, query: query ?? "" },
-            };
-          }
-          case "list_jobs": {
-            const jobs = await listJobs({ worker_id, status, origin_session_id });
-            return {
-              content: [{ type: "text", text: JSON.stringify(jobs, null, 2) }],
-              details: { jobs },
-            };
-          }
-          case "list_queue": {
-            const [workers, jobs] = await Promise.all([
-              listWorkers(),
-              listQueue(worker_id),
-            ]);
-            return {
-              content: [{
-                type: "text",
-                text: formatQueueOverview(workers, jobs, Math.floor(Date.now() / 1000)),
-              }],
-              details: { workers, jobs, queue: true },
-            };
-          }
-          case "get_job_logs": {
-            const id = requireField(job_id, "job_id");
-            if (follow) {
-              if (head !== undefined) {
-                throw new Error("head is not supported in follow mode");
-              }
-
-              const lines: string[] = [];
-              const timeoutController = new AbortController();
-              const timeout = setTimeout(() => timeoutController.abort(), 60_000);
-
-              let abortListener: (() => void) | null = null;
-              if (signal) {
-                const onAbort = () => timeoutController.abort();
-                signal.addEventListener("abort", onAbort, { once: true });
-                abortListener = () => signal.removeEventListener("abort", onAbort);
-              }
-
-              const sub = subscribeJobLogs(id, {
-                tail: tail ?? 50,
-                pollSeconds: 1,
-                onLine: (line) => {
-                  lines.push(line);
-                  onUpdate?.({ content: [{ type: "text", text: line + "\n" }] });
-                  if (line.trim()) {
-                    events.emit("worker-harness:log-line", { job_id: id, line });
-                  }
-                },
-              });
-
-              try {
-                await sub.done;
-              } catch (err) {
-                const isAbortError =
-                  (err instanceof Error && err.name === "AbortError") ||
-                  (!!err &&
-                    typeof err === "object" &&
-                    "name" in err &&
-                    (err as { name?: string }).name === "AbortError");
-                if (!isAbortError) throw err;
-              } finally {
-                clearTimeout(timeout);
-                abortListener?.();
-                sub.stop();
-              }
-
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: (lines.length > 0 ? lines.join("\n") + "\n" : "") + "[Follow mode ended]",
-                  },
-                ],
-                details: { lines },
-              };
-            }
-
-            const logs = await getJobLogs(id, { tail, head });
-            const text = typeof logs.logs === "string" ? logs.logs : JSON.stringify(logs, null, 2);
-            return {
-              content: [{ type: "text", text }],
-              details: logs,
-            };
-          }
-          case "list_tunnels": {
-            const tunnels = await listTunnels();
-            return {
-              content: [{ type: "text", text: JSON.stringify(tunnels, null, 2) }],
-              details: { tunnels },
-            };
-          }
+          case "list_workers":
+          case "available_gpus":
+          case "get_worker":
+          case "get_worker_summary":
+          case "list_data":
+          case "list_jobs":
+          case "list_queue":
+          case "get_job_logs":
+          case "list_tunnels":
+            return await executeComputeRead(params, {
+              slurmContext: await options.getContext(),
+              slurmClient: options.slurmClient,
+              signal,
+              callbacks: {
+                onUpdate,
+                onLogLine: (job_id, line) => events.emit("worker-harness:log-line", { job_id, line }),
+              },
+            });
           case "pi_sessions":
           case "fleet_status": {
             const sessions = await listPiSessions(worker_id);
@@ -778,344 +530,46 @@ export function registerGroupedTools(
     },
     async execute(_toolCallId, params, signal, onUpdate) {
       const {
-        action,
-        worker_id,
-        src_worker,
-        src_path,
-        dst_worker,
-        dst_path,
-        ttl_seconds,
-        command,
-        name,
-        no_pty,
-        job_id,
-        tunnel_id,
-        local_port,
-        remote_port,
-        minutes,
-        path,
-        content_b64,
-        max_bytes,
-        sync,
-        sync_timeout,
-        expected_seconds,
-        gpu_count,
-        position,
-        repo,
-        marimo_session_id,
-        notebook_path,
-        environment,
-        ready_timeout,
-        code,
-        question,
-        note,
-        branch,
-        briefing,
-        task_session_id,
-        text,
-        summary,
-        force,
-        project,
-        message,
+        action, worker_id, minutes, slurm, repo, question, note, branch, briefing,
+        task_session_id, text, summary, force, project, message,
       } = params;
 
       try {
         if (typeof action !== "string" || !dispatchActions.includes(action)) throw new Error(`Action ${action} is not available for role ${role || "operator"}`);
+        if (slurm !== undefined && action !== "enqueue") throw new Error("slurm is valid only for cluster enqueue");
+        if (action !== "enqueue") {
+          requireWorkerTarget(worker_id);
+        }
         switch (action) {
-          case "data_copy": {
-            const result = await copyData({
-              src_worker: requireField(src_worker, "src_worker"),
-              src_path: requireField(src_path, "src_path"),
-              dst_worker: requireField(dst_worker, "dst_worker"),
-              dst_path: requireField(dst_path, "dst_path"),
-              ttl_seconds,
-            });
-            events.emit("worker-harness:refresh", undefined);
-            return {
-              content: [{
-                type: "text",
-                text: `Data copy started: ${result.job_id} (${result.source_worker}:${result.source_path} → ${result.destination_worker}:${result.destination_path})`,
-              }],
-              details: result,
-            };
-          }
-          case "exec": {
-            const resolvedWorkerId = requireField(worker_id, "worker_id");
-            const resolvedCommand = requireField(command, "command");
-            const job = await startJob({
-              worker_id: resolvedWorkerId,
-              command: resolvedCommand,
-              name,
-              no_pty,
-              sync,
-              sync_timeout,
-            });
-            events.emit("worker-harness:job-started", { job });
-            events.emit("worker-harness:refresh", undefined);
-
-            // Sync mode: return the command output directly
-            if (sync && job.stdout !== undefined) {
-              const text =
-                job.status === "done"
-                  ? job.stdout || "(no output)"
-                  : `[${job.status}] ${job.stdout}`.trim();
-              return {
-                content: [{ type: "text", text }],
-                details: { job },
-              };
-            }
-
-            // Resolve the worker name for a human-readable message. Best-effort:
-            // fall back to whatever the caller passed (name or id) so the message
-            // is still informative even if the lookup fails.
-            let workerLabel = resolvedWorkerId;
-            try {
-              const worker = await getWorker(resolvedWorkerId);
-              workerLabel = worker.name || resolvedWorkerId;
-            } catch {
-              /* keep fallback */
-            }
-
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Job started: ${job.id} on ${workerLabel}\nSession: ${job.tmux_session}`,
-                },
-              ],
-              details: { job },
-            };
-          }
-          case "enqueue": {
-            const job = await enqueueJob({
-              worker_id: requireField(worker_id, "worker_id"),
-              command: requireField(command, "command"),
-              name: requireField(name, "name"),
-              expected_seconds: requireField(expected_seconds, "expected_seconds"),
-              gpu_count: gpu_count ?? 1,
-              no_pty,
-            });
-            events.emit("worker-harness:refresh", undefined);
-            return {
-              content: [{
-                type: "text",
-                text: `Job queued: ${job.id} (${job.name}) on ${job.worker_id} [${job.status}]`,
-              }],
-              details: { job },
-            };
-          }
-          case "update_queued_job": {
-            const resolvedJobId = requireField(job_id, "job_id");
-            if (
-              worker_id === undefined
-              && position === undefined
-              && name === undefined
-              && expected_seconds === undefined
-              && gpu_count === undefined
-            ) {
-              throw new Error("update_queued_job requires at least one queue field");
-            }
-            const job = await updateQueuedJob(resolvedJobId, {
-              worker_id,
-              position,
-              name,
-              expected_seconds,
-              gpu_count,
-            });
-            events.emit("worker-harness:refresh", undefined);
-            return {
-              content: [{
-                type: "text",
-                text: `Queued job updated: ${job.id} (${job.name}) on ${job.worker_id} [${job.status}]`,
-              }],
-              details: { job },
-            };
-          }
-          case "stop_job": {
-            const resolvedJobId = requireField(job_id, "job_id");
-            const result = await stopJob(resolvedJobId);
-            events.emit("worker-harness:refresh", undefined);
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: result.stopped
-                    ? `Job stopped: ${resolvedJobId}`
-                    : `Failed to stop job: ${resolvedJobId}`,
-                },
-              ],
-              details: result,
-            };
-          }
-          case "add_tunnel": {
-            const resolvedWorkerId = requireField(worker_id, "worker_id");
-            const resolvedLocalPort = requireField(local_port, "local_port");
-            const resolvedRemotePort = requireField(remote_port, "remote_port");
-            const tunnel = await addTunnel({
-              worker_id: resolvedWorkerId,
-              local_port: resolvedLocalPort,
-              remote_port: resolvedRemotePort,
-              name,
-            });
-            events.emit("worker-harness:refresh", undefined);
-            const orchestratorUrl = getOrchestratorUrl();
-            const orchestratorHost = (() => {
-              try {
-                return new URL(orchestratorUrl).hostname;
-              } catch {
-                return orchestratorUrl;
-              }
-            })();
-            return {
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Tunnel started: localhost:${tunnel.local_port} → ${tunnel.worker_name ?? tunnel.worker_id}:${tunnel.remote_port}\n` +
-                    `Service: ${tunnel.service_name} (PID: ${tunnel.pid})\n` +
-                    `Access: ${orchestratorHost}:${tunnel.local_port}`,
-                },
-              ],
-              details: { tunnel, access: { orchestrator_url: orchestratorUrl, host: orchestratorHost, port: tunnel.local_port } },
-            };
-          }
-          case "remove_tunnel": {
-            const resolvedTunnelId = requireField(tunnel_id, "tunnel_id");
-            const result = await removeTunnel(resolvedTunnelId);
-            events.emit("worker-harness:refresh", undefined);
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: result.removed
-                    ? `Tunnel removed: ${resolvedTunnelId}`
-                    : `Failed to remove tunnel: ${resolvedTunnelId}`,
-                },
-              ],
-              details: result,
-            };
-          }
-          case "list_marimo": {
-            const sessions = await listMarimo(worker_id);
-            return {
-              content: [{ type: "text", text: JSON.stringify(sessions, null, 2) }],
-              details: { sessions },
-            };
-          }
-          case "get_marimo": {
-            const session = await getMarimo(requireField(marimo_session_id, "marimo_session_id"));
-            return {
-              content: [{ type: "text", text: JSON.stringify(session, null, 2) }],
-              details: { session },
-            };
-          }
-          case "start_marimo": {
-            const session = await createMarimo({
-              worker_id: requireField(worker_id, "worker_id"),
-              notebook_path: requireField(notebook_path, "notebook_path"),
-              environment: requireField(environment, "environment"),
-              ...(ready_timeout === undefined ? {} : { ready_timeout }),
-            });
-            events.emit("worker-harness:refresh", undefined);
-            // Create the kernel and run the saved notebook, so code executes
-            // immediately and the first browser to open the URL sees outputs.
-            let kernelSessionId: string | null = null;
-            let kernelError: string | null = null;
-            let cellsRun: number | null = null;
-            try {
-              kernelSessionId = (await ensureKernelSession(session, { signal })).id;
-              cellsRun = await hydrateNotebook(session, { signal });
-            } catch (err) {
-              kernelError = err instanceof Error ? err.message : String(err);
-            }
-            const notice = kernelError !== null
-              ? `\nKernel warm-up failed: ${kernelError}\nexecute_marimo will retry creating a kernel.`
-              : `\nKernel ready (${kernelSessionId}), ${cellsRun} saved cell(s) run. ` +
-                "execute_marimo works now, and the first browser to open the URL resumes this kernel.";
-            return {
-              content: [{ type: "text", text: `${JSON.stringify(session, null, 2)}${notice}` }],
-              details: { session, kernel_session_id: kernelSessionId, cells_run: cellsRun, kernel_error: kernelError },
-            };
-          }
-          case "stop_marimo": {
-            const result = await removeMarimo(requireField(marimo_session_id, "marimo_session_id"));
-            events.emit("worker-harness:refresh", undefined);
-            return {
-              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              details: result,
-            };
-          }
-          case "execute_marimo": {
-            const sessionId = requireField(marimo_session_id, "marimo_session_id");
-            const session = await getMarimo(sessionId);
-            const result = await executeMarimoCode(
-              session,
-              requireField(code, "code"),
-              {
-                signal,
-                onStdout: (text) => onUpdate?.({ content: [{ type: "text", text }] }),
-                onStderr: (text) => onUpdate?.({
-                  content: [{ type: "text", text: `[stderr] ${text}` }],
-                }),
+          case "data_copy":
+          case "exec":
+          case "enqueue":
+          case "update_queued_job":
+          case "stop_job":
+          case "add_tunnel":
+          case "remove_tunnel":
+          case "list_marimo":
+          case "get_marimo":
+          case "start_marimo":
+          case "stop_marimo":
+          case "execute_marimo":
+          case "upload_file":
+          case "download_file":
+            return await executeComputeDispatch(params, {
+              slurmContext: await options.getContext(),
+              slurmClient: options.slurmClient,
+              signal,
+              callbacks: {
+                onUpdate,
+                onRefresh: () => events.emit("worker-harness:refresh", undefined),
+                onJobStarted: (job) => events.emit("worker-harness:job-started", { job }),
               },
-            );
-            const sections: string[] = [];
-            if (result.kernel_created) {
-              sections.push(
-                `Created a new kernel (${result.kernel_session_id}); its namespace started empty.`,
-              );
-            }
-            if (result.stdout) sections.push(result.stdout);
-            if (result.stderr) sections.push(`[stderr]\n${result.stderr}`);
-            if (result.output !== undefined) {
-              sections.push(
-                `Output:\n${typeof result.output === "string"
-                  ? result.output
-                  : JSON.stringify(result.output, null, 2)}`,
-              );
-            }
-            return {
-              content: [{
-                type: "text",
-                text: sections.length > 0 ? sections.join("\n") : "Marimo execution completed successfully.",
-              }],
-              details: result,
-            };
-          }
+            });
           case "workers_prune": {
             const result = await pruneWorkers(minutes);
             events.emit("worker-harness:refresh", undefined);
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              details: result,
-            };
-          }
-          case "upload_file": {
-            const resolvedWorkerId = requireField(worker_id, "worker_id");
-            const resolvedPath = requireField(path, "path");
-            const resolvedContent = requireField(content_b64, "content_b64");
-            const result = await uploadFile(resolvedWorkerId, resolvedPath, resolvedContent);
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Uploaded ${result.size} bytes to ${result.path} on ${resolvedWorkerId}`,
-                },
-              ],
-              details: result,
-            };
-          }
-          case "download_file": {
-            const resolvedWorkerId = requireField(worker_id, "worker_id");
-            const resolvedPath = requireField(path, "path");
-            const result = await downloadFile(resolvedWorkerId, resolvedPath, max_bytes);
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Downloaded ${result.size} bytes from ${result.path} on ${resolvedWorkerId}`,
-                },
-              ],
               details: result,
             };
           }

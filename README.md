@@ -1,10 +1,11 @@
 # pi-worker-harness
 
-`pi-worker-harness` integrates a running worker-harness HTTP orchestrator into Pi and OMP.
+`pi-worker-harness` integrates a running worker-harness HTTP orchestrator into Pi,
+OMP, and Claude Code (Bun MCP stdio).
 
 ## Requirements
 
-- Pi v0.70+ or OMP
+- Pi v0.70+ or OMP; alternatively Bun for the Claude MCP server
 - worker-harness server reachable at `http://orchestrator.hs.d0me.xyz:12889` (default)
 
 ## Installation
@@ -31,9 +32,42 @@ branch. Record its checksum and install the same artifact on every host. A
 running agent keeps its loaded module: restart after installation, and confirm
 `omp plugin list` reports `pi-worker-harness@0.1.4` before launching fleet roles.
 
+### Local Slurm feature checkout and replacement
+
+The standalone root handoff is [`specs/local-slurm.md`](../../specs/local-slurm.md)
+in the Worker Harness repository. It includes the complete CPU/GPU configuration,
+control/runtime rollout, shared-storage and environment preparation, security,
+local evidence, and live IBEX acceptance gates. This extension is also usable
+standalone, but installing it alone does not add server reservation/event support
+or the new SIF runtime.
+
+`feature/local-slurm` is the transfer branch in both repositories; the root pins
+the exact extension commit. Clone `git@github.com:xeTaiz/worker-harness.git` with
+`--branch feature/local-slurm --recurse-submodules`. The extension origin is
+`git@github.com:xeTaiz/pi-worker-harness.git`; keep the root-pinned detached
+submodule checkout for a reviewed matching pair.
+
+Record `omp plugin list` and preserve the old install source/version/path for
+rollback. Replace an existing installation explicitly, rather than relying on a
+link overwriting it:
+
+C1
+```bash
+omp plugin uninstall pi-worker-harness
+cd /absolute/path/to/worker-harness-local-slurm/extensions/pi-worker-harness
+bun install
+omp plugin link /absolute/path/to/worker-harness-local-slurm/extensions/pi-worker-harness
+omp plugin list
+```
+
+Restart OMP completely. Rollback means uninstalling this link, reinstalling or
+linking the preserved old source, and restarting; preserve personal OMP/model
+login state. A linked development checkout is not a pinned fleet package.
+
 ## Configuration
 
-The extension uses HTTP endpoints (not CLI subprocesses).
+Ordinary worker operations use HTTP endpoints (not the worker-harness CLI).
+Configured cluster targets additionally use the submitting client's local SSH.
 
 - Default base URL: `http://orchestrator.hs.d0me.xyz:12889`
 - `WH_ORCHESTRATOR_URL` overrides the persisted default and runtime URL command.
@@ -51,6 +85,159 @@ The extension uses HTTP endpoints (not CLI subprocesses).
 - Runtime command:
   - `/worker-harness-url` (show current URL + config path)
   - `/worker-harness-url http://host:port` (set URL and persist to config file)
+
+## Claude Code MCP and job notifications
+
+Run `bun install` in this extension directory before launching the standalone
+server. It pins `@modelcontextprotocol/sdk` to `1.32.2` ([npm registry](https://registry.npmjs.org/@modelcontextprotocol/sdk/1.32.2)).
+Register the reviewed absolute checkout path as server `worker-harness`:
+
+```json
+{
+  "mcpServers": {
+    "worker-harness": {
+      "command": "bun",
+      "args": ["/absolute/path/to/pi-worker-harness/mcp.ts", "--client-key", "my-project"],
+      "env": { "WH_ORCHESTRATOR_URL": "http://orchestrator.hs.d0me.xyz:12889" }
+    }
+  }
+}
+```
+
+Supply the same control credentials described above through the process
+environment or a private token file, not command arguments. `--client-key NAME`
+is required: use a stable, distinct name for each independently active Claude
+session. Reusing that key on restart resumes its persisted recipient and event
+cursor; do not concurrently share a key between clients.
+
+The standalone server exposes only shared compute `wh_read` and `wh_dispatch`
+handlers: worker/cluster discovery, jobs/queue/logs, data/file operations,
+tunnels and managed Marimo. Pi-session/fleet messaging, worker pruning,
+`grant_git_access` and `wh_admin_*` are neither advertised nor dispatchable. It imports no Pi/TUI
+runtime. Stdout is exclusively MCP protocol; diagnostics go to stderr.
+
+For **interactive** custom-channel testing during the research preview:
+
+```bash
+claude --dangerously-load-development-channels server:worker-harness
+```
+
+Accept Claude's development-channel warning and MCP consent. Channels require a
+compatible authenticated Claude Code session and remain subject to preview
+availability and organization `channelsEnabled` policy. The development flag
+bypasses only the custom-channel allowlist; it is ignored with `-p` and the Agent
+SDK. See the [official channel reference](https://code.claude.com/docs/en/channels-reference).
+Successful stdio transport delivery alone does not prove Claude received or
+acted on an event.
+
+OMP delivers ordinary and Slurm job events as native asides with a requested
+turn, respecting the runtime's user-stop and plan-mode suppression. Claude uses
+`notifications/claude/channel` after the MCP initialization handshake. Both
+clients reuse one session recipient for tools, SSE replay and local scheduler
+polling. Ordinary submitted jobs also receive that recipient. Streams and polls
+stop when the client closes; credentials/URL changes replace the active
+connection. Returned clients replay after their durable cursor.
+
+Events include worker/job/event identifiers and bounded failure/log/deadline
+context. Logs are untrusted workload content, not instructions. A transport
+handoff advances the cursor, not an acknowledgement that the agent acted; crash
+replay is possible and failure deadlines never wait for acknowledgement. Inspect
+ordinary job state before diagnosing with `exec` or rerunning with `enqueue`.
+Recipient routing is for today's single-user service, **not multi-user privacy**.
+
+### Local Slurm through ordinary tools
+
+Configure `WH_CLUSTER_CONFIG` or
+`${XDG_CONFIG_HOME:-$HOME/.config}/worker-harness/clusters.json` with the version-1
+cluster profiles described in the root Worker Harness README. `list_workers`
+includes `cluster:<profile-id>` targets without pretending they are online
+workers; `get_worker` refreshes scheduler evidence. `available_gpus` labels
+cluster availability separately from free fleet GPUs.
+
+Use `enqueue` with a cluster target and `slurm.project_path` plus an explicit
+`slurm.walltime_seconds`; optional `slurm.environment_path` selects a tested
+shared environment. GPU profiles default to one GPU with proportional configured
+CPU/RAM sizing; CPU profiles require zero GPUs and default to 1 CPU/4096 MiB.
+Shared project/environment paths must resolve beneath
+`/data/shared/<storage_id>`. The project and optional environment are persisted in
+the actual queued command, not only the batch shell.
+
+Prepare source/data and uv environments through ordinary transfer/exec or a CPU
+target's enqueue. Use the common SIF and shared storage, not copied virtualenvs or
+per-experiment images. There is no separate prepare/submit tool or self-chaining
+worker. `exec`, file, tunnel and Marimo operations require an actual worker ID.
+Enqueue returns the ordinary job/reserved-worker IDs, scheduler evidence and
+shared paths. Preserve `submission_key` when recovering an uncertain submission;
+read-only inspection never submits a replacement. `stop_job` defaults to one job;
+`scope:"allocation"` cancels its verified allocation. A finished allocation
+requires fresh enqueue, not a hidden successor.
+
+Local state lives in `WH_CLUSTER_STATE_DIR` or
+`${XDG_STATE_HOME:-$HOME/.local/state}/worker-harness/slurm`, namespaced by
+orchestrator/client/session with private files. Client closure pauses local
+observations, not remote useful work or its finite shutdown policy.
+
+### Add a cluster interactively
+
+C2
+```text
+/cluster-add
+/cluster-add ibex-cpu
+```
+
+The optional argument supplies the new profile ID. This is an interactive
+Pi/OMP command, not a new `wh_dispatch` or MCP compute action. It validates a
+complete version-1 profile, offers review/edit/cancel, and requires explicit
+confirmation of the initially unencrypted login-key warning before any file
+writes, key generation, or process spawning. It never logs in, installs a key
+remotely, changes host trust, or submits an allocation.
+
+Prompts cover a unique ID/description, CPU or GPU kind, connection reuse or
+alias/direct SSH destination, shared storage ID/root and SIF, runtime/setup,
+account and **actual** partition, GPU type/maximum for GPU only, walltime,
+failure/termination grace, enrollment key file/login server, and registration
+host. CPU profiles require `max_gpus:0` and omit `gpu_type`. Advanced options
+are QoS, feature constraint, CPU/RAM caps, warning seconds (default 120),
+registration port (12888), and polling seconds (15); `-` clears an optional
+value. A site's actual values and permissions must come from its operator, not
+guessed IBEX partition names.
+
+Profiles are saved to `WH_CLUSTER_CONFIG` or the XDG configuration path above.
+New connections use `dirname(clusters.json)/ssh/<id>/id_ed25519`, its `.pub`,
+`config` and `bootstrap_config`, with 0700 directories/0600 files. The profile records
+`ssh_config_file`; cluster SSH calls use `-F` without modifying `~/.ssh/config`.
+Alias mode retains normal user/system SSH includes. Direct mode creates
+`wh-<id>` with supplied hostname/user/port and optional ProxyJump. Reusing
+another profile keeps its managed connection/key and offers shared storage,
+SIF/runtime/enrollment defaults with retained-path confirmation. Run the
+command again for a CPU preparation target sharing the GPU profile's
+`storage_id`, `shared_root`, and SIF; use the real authorized CPU partition.
+
+The completion message prints the exact paths and commands. Review them, then
+in your own terminal verify the login host's fingerprint against an independent
+site source, establish known-host trust, and install **only the public key**:
+`ssh-copy-id -F <bootstrap_config> -i <public-key> <alias>` (or the printed manual
+authorized_keys alternative). The first-connect command also uses bootstrap_config,
+which retains existing default-file/agent/password authentication without forcing
+the not-yet-authorized dedicated identity. Commands are printed, not executed.
+Do not disable strict host checking or trust ssh-keyscan alone.
+
+The new private key initially has no passphrase. Add one interactively with
+`ssh-keygen -p -f <private-key>`, then `ssh-add <private-key>` in an existing
+SSH agent; start an agent if needed and ensure OMP inherits `SSH_AUTH_SOCK`.
+The printed strict probe uses the dedicated `config` (not bootstrap_config)/alias with `BatchMode=yes`,
+`StrictHostKeyChecking=yes`, and `ConnectTimeout=10`. It must succeed before
+using tools; unattended submission cannot answer a passphrase/MFA prompt.
+Registration of the profile only makes `cluster:<id>` discoverable, not ready.
+
+This login key is **not** `tailnet_key_file` (a separately provisioned restricted
+ephemeral allocation-enrollment key) or the WH operator/session control bearer.
+Keep all secret files outside Git. The human client talks to control **12889**;
+allocated workers register on **12888**, with orchestrator-to-worker Tailnet SSH
+**22** allowed. Do not grant workers privileged control access. Host mounts,
+shared-identity proof on an existing participating worker, a one-time updated
+candidate SIF build, matching deployed control/runtime, and site/charged-submit
+approval remain prerequisites; onboarding does not provision them.
 
 ## Tools
 
@@ -122,7 +309,7 @@ The orchestrator (and unknown roles) does not register the compute panel, widget
 or associated commands/shortcut.
 
 ### Status widget
-Pinned above editor. Tracks selected worker/job and updates from streamed log lines.
+Pinned below the editor so the native OMP context-window display remains unobstructed. Shows worker/job/GPU totals when no worker is selected; otherwise tracks the selected worker/job and streamed log lines.
 
 ### Panel (`/worker-harness`)
 Tabs: Workers / Jobs / Tunnels
@@ -139,6 +326,43 @@ Key bindings:
 - `q` / `Esc`: close panel
 
 ## Notes from validation
+
+### Local Slurm and client proof
+
+Prior integrated suites passed 336 root Python tests (one existing Starlette
+warning) and 278 Bun tests (zero failures, 1,388 expectations/13 files).
+The suite including onboarding now passes **343 Bun tests**, zero failures,
+2,308 expectations/14 files (1.52 seconds). Actual interactive OMP onboarding
+also passed (14.91 seconds): isolated plugin replacement/relink and discovery,
+cancel without artifacts, save preserving existing profiles, real Ed25519
+public-key/fingerprint/permissions, bootstrap/dedicated OpenSSH `-G` resolution,
+and visible durable public setup instructions.
+
+Because this host's 0644 system ssh_config is owned by UID 65534 and correctly
+rejected by OpenSSH Include checks, both proofs used bwrap to substitute only that
+file with an owned empty system-config fixture; private HOME/user config stayed
+real. No product bypass or host system edit. OMP startup provider/catalog CONNECT
+attempts were all denied locally with 403 before TLS; no external forwarding,
+model completions, real cluster SSH connection, or submission occurred.
+The updated candidate SIF has not been built/executed, and no live IBEX/charged
+submission has been performed.
+
+Isolated local validation exercised the real control API, database, queue,
+daemon and job runner through actual Bun MCP stdio: cluster discovery/enqueue,
+failure notification while the worker remained online, ordinary exec diagnosis
+and CPU rerun, finite shutdown without a successor, and ordinary-job event
+delivery/disconnected replay. The installed OMP runtime loaded the actual
+extension and delivered an idle job event without a new prompt; native user-stop
+and interactive plan-mode suppression were also exercised with a loopback model
+provider, without external model calls.
+
+SSH, Slurm scheduling, container/SIF mounting and Tailnet enrollment were local
+test boundaries, not live-cluster proof. Actual GPU allocation, live Slurm and
+Tailnet behavior, site preemption, and interactive Claude custom-channel
+approval/delivery remain external acceptance gates. This feature remains in an
+isolated, unmerged worktree and has not been deployed to the fleet.
+
+### Earlier ordinary HTTP integration
 
 Integration was validated against `http://orchestrator.hs.d0me.xyz:12889` for:
 - health

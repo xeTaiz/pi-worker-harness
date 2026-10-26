@@ -7,7 +7,7 @@ import {
   formatQueueOverview,
   formatWorkerOverview,
 } from "./agent-output.ts";
-import type { DataPaths, QueuedJob, Worker } from "./types.ts";
+import type { ClusterTarget, DataPaths, QueuedJob, Worker } from "./types.ts";
 
 function worker(patch: Partial<Worker>): Worker {
   return {
@@ -180,4 +180,27 @@ test("deduplicates worker identities and filters paths by query", () => {
   });
   expect(buildDataCatalog(data, "missing")).toEqual({ workers: {}, paths: {} });
   expect(formatDataCatalog({ workers: {}, paths: {} })).toBe("No data paths matched.");
+});
+
+test("cluster overview never treats configured targets as online workers or free GPUs", () => {
+  const cluster: ClusterTarget = {
+    id: "cluster:gpu", cluster_id: "gpu", kind: "cluster", name: "GPU partition",
+    compute_kind: "gpu", partition: "gpu", description: "Preemptible; account limits apply",
+    shared_path: "/data/shared/site",
+    resource_classes: { gpu_type: "a100", max_gpus: 8, max_walltime_seconds: 600 },
+    availability: { status: "stale", observed_at: 100, detail: "Cached capacity, refresh selected target" },
+  };
+  const cpu: ClusterTarget = {
+    ...cluster, id: "cluster:cpu", cluster_id: "cpu", compute_kind: "cpu", name: "CPU preparation",
+    resource_classes: { max_gpus: 0, max_walltime_seconds: 600 },
+  };
+  const overview = formatWorkerOverview([worker({}), cluster, cpu]);
+  expect(overview).toContain("scheduler-backed, not online workers");
+  expect(overview).toContain("cluster:cpu");
+  expect(overview).toContain("stale (1970-01-01T00:01:40.000Z)");
+  const available = formatAvailableGpus([worker({})], [cluster, cpu]);
+  expect(available).toContain("Scheduler-backed GPU cluster capacity (not immediately free workers");
+  expect(available).toContain("cluster:gpu");
+  expect(available).not.toContain("cluster:cpu");
+  expect(formatAvailableGpus([], [cluster])).toContain("No available GPUs.");
 });
