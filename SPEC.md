@@ -170,8 +170,13 @@ key, `config`, and `bootstrap_config`; directories are 0700 and generated files 
 `ssh_config_file` is an absolute profile path, passed through discovery,
 submission, recovery, polling, cancellation and log SSH as argv `-F <path>`.
 Without the field the established ordinary SSH behavior remains unchanged.
-Managed config includes ordinary user/system configuration without editing
-`~/.ssh/config`, preserving alias/ProxyJump/ControlMaster policy. Direct-host
+Managed config includes ordinary user configuration without editing `~/.ssh/config`.
+It includes `/etc/ssh/ssh_config` only when readable, regular, root/current-UID
+owned, and without group/world write permission. Unsafe, absent or inaccessible
+system config is omitted with a durable warning directing required site options
+into user config. The user's configuration remains subject to strict OpenSSH
+checks; no ownership/permission checks are weakened. This preserves
+alias/ProxyJump/ControlMaster policy where safely available. Direct-host
 setup uses a unique `wh-<id>` alias with supplied user/port/optional ProxyJump.
 Reusing a profile reuses its connection/key and offers shared storage,
 SIF/runtime/enrollment defaults with explicit retained-path confirmation.
@@ -186,7 +191,7 @@ user's own terminal and unlocked via an agent inherited through SSH_AUTH_SOCK.
 No key/passphrase/token is put in Git, workload argv, or an allocation.
 
 First-connect and key-install commands use `bootstrap_config`, which retains the
-normal target/user/system config without the dedicated IdentityFile/IdentitiesOnly
+target/user config and the safe conditional system Include without dedicated IdentityFile/IdentitiesOnly
 restriction. This preserves existing default-file/agent/password/MFA bootstrap
 authentication before the new key is authorized. Only the final strict BatchMode
 probe uses the dedicated profile `config`.
@@ -457,21 +462,23 @@ Widget should gracefully handle:
 
 Prior integrated results: 336 root Python tests passed with one existing
 Starlette warning; 278 extension Bun tests passed with zero failures
-(1,388 expectations/13 files). The suite including onboarding now passes **343
-Bun tests**, zero failures, 2,308 expectations/14 files (1.52 seconds).
-Actual interactive OMP onboarding passed in 14.91 seconds: isolated plugin
+(1,388 expectations/13 files). Native bare `bun test` including onboarding and
+SSH portability now passes **345 tests**, zero failures, 2,341 expectations/14
+files (1.62 seconds), without bwrap or a system-config fixture.
+Native interactive OMP onboarding passed in 15.14 seconds: isolated plugin
 replacement/relink/discovery, artifact-free cancellation, existing-profile
 preservation on save, actual Ed25519 public-key/fingerprint/permissions, real
 bootstrap/dedicated OpenSSH `-G` host/user/port/jump/original-identity resolution,
 and durable visible public instructions.
 
-OpenSSH correctly rejects this host's UID-65534-owned 0644 system ssh_config
-Include, so both proofs used bwrap to substitute only an owned empty system-config
-fixture, preserving real private HOME/user config. No product bypass or host
-system edits. OMP startup provider/catalog CONNECT attempts were denied by a
-local proxy with 403 before TLS; no external forwarding/model completions or
-real cluster SSH/submission occurred. The candidate updated SIF is not
-built/executed, and live IBEX/charged acceptance is not done.
+Both current proofs ran without bwrap or system-SSH-config substitution. The
+production inclusion guard handled this host's unsafe UID-65534-owned 0644
+system config by omitting it with a durable warning. No product permission
+bypass or host system edit was used. OMP startup provider/catalog CONNECT
+attempts were recorded and denied by a local proxy with 403 before TLS:
+zero forwarded connections/model completions, and no real cluster SSH/submission.
+The candidate updated SIF is not built/executed, and live IBEX/charged acceptance
+is not done.
 
 Local proof covers real runtime/control/database/queue behavior through actual
 Bun MCP stdio, including cluster enqueue, failure delivery during worker

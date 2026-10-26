@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { isIP } from "node:net";
@@ -68,19 +68,40 @@ function keygen(path: string): Promise<void> {
   child.once("close", (code) => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error("ssh-keygen failed; no profile was saved")); });
   return promise;
 }
-function managedConfig(connection: Exclude<Connection, { kind: "reuse" }>, alias: string, home: string, key?: string): string {
+/** An Include is checked as user configuration, unlike OpenSSH's implicit system defaults. */
+export async function inspectSystemSshConfig(
+  path = "/etc/ssh/ssh_config",
+  inspect: (path: string) => Promise<Pick<Stats, "uid" | "mode" | "isFile">> = stat,
+): Promise<{ includePath?: string; warning?: string }> {
+  try {
+    const resolved = await realpath(path);
+    const info = await inspect(resolved);
+    if (info.isFile() && (info.uid === 0 || info.uid === process.getuid?.()) && (info.mode & 0o022) === 0) {
+      return { includePath: resolved };
+    }
+  } catch {
+    // Missing/unreadable system config is also not a safe explicit Include.
+  }
+  return {
+    warning: `Warning: system SSH defaults from ${path} were not inherited: the resolved file is missing, inaccessible, non-regular, owned by neither root nor the current user, or group/world-writable. Put required site settings in your normal ~/.ssh/config. SSH ownership and permission checks have not been weakened.`,
+  };
+}
+
+function managedConfig(connection: Exclude<Connection, { kind: "reuse" }>, alias: string, home: string, systemConfig: string | undefined, key?: string): string {
   const lines = [`Host ${alias}`, ...(key ? [`  IdentityFile ${sshPath(key)}`, "  IdentitiesOnly yes"] : [])];
   if (connection.kind === "direct") {
     lines.push(`  HostName ${connection.hostname}`, `  User ${connection.user}`, `  Port ${connection.port}`);
     if (connection.jump) lines.push(`  ProxyJump ${connection.jump}`);
   }
   // Reset Host context before Include: aliases inside the user's file still match.
-  lines.push("Host *", `  Include ${includePath(join(home, ".ssh", "config"))}`, "Host *", "  Include /etc/ssh/ssh_config", "");
+  lines.push("Host *", `  Include ${includePath(join(home, ".ssh", "config"))}`);
+  if (systemConfig) lines.push("Host *", `  Include ${includePath(systemConfig)}`);
+  lines.push("");
   return lines.join("\n");
 }
 
 /** Commit one new profile under an exclusive cooperating-writer lock; never replace keys or entries. */
-async function saveProfile(profile: ClusterProfile, connection: Connection, env: Environment): Promise<{ key: string; publicKey?: string }> {
+async function saveProfile(profile: ClusterProfile, connection: Connection, env: Environment): Promise<{ key: string; publicKey?: string; warning?: string }> {
   const configPath = resolveClusterConfigPath(env);
   const directory = dirname(configPath);
   await safeDirectory(directory);
@@ -98,6 +119,7 @@ async function saveProfile(profile: ClusterProfile, connection: Connection, env:
     parseClusterProfiles({ version: 1, clusters: [...document.clusters, profile] }, configPath);
     let key: string;
     let publicKey: string | undefined;
+    let warning: string | undefined;
     if (connection.kind === "reuse") {
       if (profile.ssh_config_file !== connection.config) throw new Error("Copied SSH configuration changed during setup");
       await safeRead(connection.config).then((content) => { if (content === undefined) throw new Error("Copied SSH configuration no longer exists"); });
@@ -122,9 +144,11 @@ async function saveProfile(profile: ClusterProfile, connection: Connection, env:
       await chmod(key + ".pub", 0o600);
       publicKey = (await readFile(key + ".pub", "utf8")).trim();
       if (!validPublicKey(publicKey)) throw new Error("ssh-keygen did not produce a valid Ed25519 public key");
-      await privateFile(join(target, "config"), managedConfig(connection, profile.ssh_host, home, key));
+      const system = await inspectSystemSshConfig();
+      warning = system.warning;
+      await privateFile(join(target, "config"), managedConfig(connection, profile.ssh_host, home, system.includePath, key));
       // Bootstrap keeps ordinary default-file/agent/password authentication available.
-      await privateFile(join(target, "bootstrap_config"), managedConfig(connection, profile.ssh_host, home));
+      await privateFile(join(target, "bootstrap_config"), managedConfig(connection, profile.ssh_host, home, system.includePath));
     }
     temporary = join(directory, `.clusters-${randomUUID()}.tmp`);
     await privateFile(temporary, JSON.stringify({ version: 1, clusters: [...document.clusters, profile] }, null, 2) + "\n");
@@ -133,7 +157,7 @@ async function saveProfile(profile: ClusterProfile, connection: Connection, env:
     await rename(temporary, configPath);
     temporary = undefined;
     created = undefined;
-    return { key, publicKey };
+    return { key, publicKey, warning };
   } finally {
     if (temporary) await rm(temporary, { force: true });
     if (created) await rm(created, { recursive: true, force: true });
@@ -267,6 +291,7 @@ export async function runClusterAdd(ui: SetupUI, publish: (content: string) => v
       `Cluster ${profile.id} registered and visible immediately as cluster:${profile.id}.`,
       `Profiles: ${configPath}`, `SSH config: ${config}`, `Bootstrap SSH config (ordinary authentication): ${bootstrap}`, `Dedicated key: ${result.key}${connection.kind === "reuse" ? " (reused; not replaced)" : " (initially unencrypted)"}`,
       "No allocation submitted. Registration is not proof of connectivity.",
+      ...(result.warning ? [result.warning] : []),
       "In your own terminal, first connect and verify the host fingerprint against a trusted site source (do not bypass host checking):",
       `ssh -F ${destination}`,
       "Install the public key yourself (password / keyboard-interactive authentication remains available; this is never auto-executed):",

@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { loadClusterProfiles, sharedPath, type ClusterProfile, type Environment } from "./profiles.ts";
-import { runClusterAdd, type SetupUI } from "./setup.ts";
+import { inspectSystemSshConfig, runClusterAdd, type SetupUI } from "./setup.ts";
 
 let root: string;
 let home: string;
@@ -599,4 +599,69 @@ test("concurrent registrations of the same ID commit exactly one key/profile wit
   expect(await readdir(join(dirname(configPath), "ssh"))).toEqual(["same-id"]);
   await expectSecureFiles(winners[0]!);
   expect((await tree()).some((entry) => /\.lock$|\.tmp$/.test(entry.path))).toBe(false);
+});
+
+test("system SSH inclusion requires a regular resolved file with safe ownership and write permissions", async () => {
+  const path = join(root, "system-config-fixture");
+  await writeFile(path, "Host *\n  ServerAliveInterval 29\n", { mode: 0o644 });
+  const resolved = await realpath(path);
+  expect(await inspectSystemSshConfig(path)).toEqual({ includePath: resolved });
+  const currentUid = process.getuid!();
+  // Ownership seams model root/foreign-owned files without chown privileges.
+  for (const uid of [0, currentUid]) {
+    expect(await inspectSystemSshConfig(path, async () => ({ uid, mode: 0o100644, isFile: () => true }))).toEqual({ includePath: resolved });
+  }
+  const foreignUid = currentUid + 1;
+  const foreign = await inspectSystemSshConfig(path, async () => ({ uid: foreignUid, mode: 0o100644, isFile: () => true }));
+  expect(foreign.includePath).toBeUndefined();
+  expect(foreign.warning).toContain("system SSH defaults");
+  expect(foreign.warning).toContain("required site settings");
+  expect(foreign.warning).toContain("~/.ssh/config");
+  for (const mode of [0o664, 0o646, 0o666]) {
+    await chmod(path, mode);
+    const unsafe = await inspectSystemSshConfig(path);
+    expect(unsafe.includePath).toBeUndefined();
+    expect(unsafe.warning).toContain("have not been weakened");
+  }
+  await chmod(path, 0o644);
+  const link = join(root, "system-config-link");
+  await symlink(path, link);
+  expect(await inspectSystemSshConfig(link)).toEqual({ includePath: resolved });
+  expect((await inspectSystemSshConfig(root)).includePath).toBeUndefined();
+  expect((await inspectSystemSshConfig(join(root, "missing-system-config"))).warning).toContain("not inherited");
+});
+
+test("native system SSH config policy permits safe user alias resolution without weakening user config checks", async () => {
+  const system = await inspectSystemSshConfig();
+  try {
+    const info = await stat(await realpath("/etc/ssh/ssh_config"));
+    const safe = info.isFile() && (info.uid === 0 || info.uid === process.getuid!()) && (info.mode & 0o022) === 0;
+    expect(Boolean(system.includePath)).toBe(safe);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    expect(system.includePath).toBeUndefined();
+  }
+  const ui = new WizardUI("native-system-policy", { replies: { "SSH connection": "Existing SSH alias" } });
+  const profile = await ui.run();
+  ui.expectScriptUsed();
+  expect(profile).toBeDefined();
+  const effective = await effectiveSSH(profile!);
+  const bootstrap = await effectiveSSH(profile!, join(dirname(profile!.ssh_config_file!), "bootstrap_config"));
+  for (const values of [effective, bootstrap]) {
+    expect(values.get("hostname")).toBe("192.0.2.42");
+    expect(values.get("user")).toBe("site-user");
+    expect(values.get("proxyjump")).toBe("gateway.example.test");
+    expect(values.get("controlmaster")).toBe("auto");
+  }
+  const message = ui.published.join("\n");
+  if (system.warning) {
+    expect(message).toContain(system.warning);
+    expect(message).toContain("required site settings in your normal ~/.ssh/config");
+  } else expect(message).not.toContain("system SSH defaults from /etc/ssh/ssh_config were not inherited");
+  // A bad user config must still fail normally; it is never silently omitted.
+  await chmod(join(home, ".ssh", "config"), 0o666);
+  const child = Bun.spawn(["ssh", "-G", "-F", profile!.ssh_config_file!, profile!.ssh_host], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  expect(code).not.toBe(0);
+  expect(stderr).toContain("Bad owner or permissions");
 });

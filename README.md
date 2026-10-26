@@ -206,8 +206,12 @@ Profiles are saved to `WH_CLUSTER_CONFIG` or the XDG configuration path above.
 New connections use `dirname(clusters.json)/ssh/<id>/id_ed25519`, its `.pub`,
 `config` and `bootstrap_config`, with 0700 directories/0600 files. The profile records
 `ssh_config_file`; cluster SSH calls use `-F` without modifying `~/.ssh/config`.
-Alias mode retains normal user/system SSH includes. Direct mode creates
-`wh-<id>` with supplied hostname/user/port and optional ProxyJump. Reusing
+Alias mode retains user SSH configuration. The system `/etc/ssh/ssh_config` is
+included only if readable/regular, owned by root or the current UID, and not
+group/world writable. Unsafe, missing or inaccessible system config is omitted
+with a durable warning; put required site options in user config before continuing.
+User config remains subject to strict OpenSSH checks; no checks are weakened.
+Direct mode creates `wh-<id>` with supplied hostname/user/port and optional ProxyJump. Reusing
 another profile keeps its managed connection/key and offers shared storage,
 SIF/runtime/enrollment defaults with retained-path confirmation. Run the
 command again for a CPU preparation target sharing the GPU profile's
@@ -331,19 +335,20 @@ Key bindings:
 
 Prior integrated suites passed 336 root Python tests (one existing Starlette
 warning) and 278 Bun tests (zero failures, 1,388 expectations/13 files).
-The suite including onboarding now passes **343 Bun tests**, zero failures,
-2,308 expectations/14 files (1.52 seconds). Actual interactive OMP onboarding
-also passed (14.91 seconds): isolated plugin replacement/relink and discovery,
+Native bare `bun test` including onboarding/SSH portability now passes **345
+tests**, zero failures, 2,341 expectations/14 files (1.62 seconds), without bwrap
+or a system-config fixture. Native interactive OMP onboarding also passed
+(15.14 seconds): isolated plugin replacement/relink and discovery,
 cancel without artifacts, save preserving existing profiles, real Ed25519
 public-key/fingerprint/permissions, bootstrap/dedicated OpenSSH `-G` resolution,
 and visible durable public setup instructions.
 
-Because this host's 0644 system ssh_config is owned by UID 65534 and correctly
-rejected by OpenSSH Include checks, both proofs used bwrap to substitute only that
-file with an owned empty system-config fixture; private HOME/user config stayed
-real. No product bypass or host system edit. OMP startup provider/catalog CONNECT
-attempts were all denied locally with 403 before TLS; no external forwarding,
-model completions, real cluster SSH connection, or submission occurred.
+Both current proofs ran without bwrap or system-config substitution. The production
+guard omitted this host's unsafe UID-65534-owned 0644 system SSH config with a
+durable warning; no product permission bypass or host system edit was used.
+OMP startup provider/catalog CONNECT attempts were recorded and denied locally
+with 403 before TLS; there were zero forwarded connections/model completions,
+and no real cluster SSH connection or submission occurred.
 The updated candidate SIF has not been built/executed, and no live IBEX/charged
 submission has been performed.
 
