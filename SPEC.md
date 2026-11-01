@@ -236,33 +236,55 @@ complete CPU/GPU example config, environment hashing/flock rules, and live gates
 ### Sandbox persistence and verification boundary
 
 The agent-sandbox allowlist at
-`~/dotfiles/agent-sandbox/.config/agent-sandbox/paths` must persist both
-`~/.config/worker-harness` and `~/.local/state/worker-harness`, preserving all
-unrelated entries. Before relaunch, an operator creates these directories with
-0700 permissions **outside the current masked sandbox HOME**; absent source
-directories are skipped by the launcher. This session's filesystem visibility
+`~/dotfiles/agent-sandbox/.config/agent-sandbox/paths` persists
+`human:~/.config/worker-harness` and `human:~/.local/state/worker-harness`,
+preserving unrelated legacy entries. Only human launches (`WH_SESSION_ROLE`
+unset or empty) strip `human:` before normal path validation. Every nonempty
+role, including `orchestrator` and unknown roles, skips those binds entirely.
+Human config can contain SSH/enrollment credentials; state can contain scoped
+tokens, so scrubbing operator environment variables alone is insufficient.
+Empty/malformed marked paths fail human-launch validation, never downgrade to
+unmarked binds. Unmarked paths remain shared; a separately shared parent can
+defeat this narrow boundary, which is not hostile-user isolation. No other
+credentials or SSH-agent access are exposed by this change.
+Before relaunch, an operator creates these directories with 0700 permissions
+**outside the current masked sandbox HOME**; absent source directories are
+skipped, not created by the launcher. This session's filesystem visibility
 does not establish whether host profiles or state already exist.
-For relaunch, explicitly set host `AGENT_SANDBOX_PATHS` to the edited dotfiles
-file or verify the active host paths-file/symlink resolves to it; that host
-configuration has not been observed from this sandbox.
+For relaunch, invoke the edited dotfiles launcher explicitly at
+`"$HOME/dotfiles/agent-sandbox/.local/bin/agent-sandbox"` with the usual
+tool/binary arguments, and set host
+`AGENT_SANDBOX_PATHS="$HOME/dotfiles/agent-sandbox/.config/agent-sandbox/paths"`.
+Alternatively, update the host's stow/symlink installation for **both** launcher
+and allowlist and verify both active paths resolve to these edited files.
+An older installed launcher rejects `human:`; selecting the edited allowlist
+alone is insufficient. The active host launcher/config symlinks have not been
+observed here.
 
 Custom `XDG_CONFIG_HOME`/`WH_CLUSTER_CONFIG` and
-`XDG_STATE_HOME`/`WH_CLUSTER_STATE_DIR` require allowlisting and creating the
-actual host configuration/managed-SSH and state locations. Config persistence
+`XDG_STATE_HOME`/`WH_CLUSTER_STATE_DIR` require allowlisting the actual host
+configuration/managed-SSH and state locations with **`human:`**, and creating
+them outside the sandbox before launch. Do not expose broader unmarked parents.
+Config persistence
 alone loses recovery journals/cursors; state persistence alone loses login
 identity/trust. Existing profiles require explicit `/cluster-ssh-migrate`;
 adding mounts cannot repair legacy paths or authorize the shared key remotely.
 
 Mount changes require a complete **agent-sandbox restart**, not just an OMP
-module/process restart. The launcher currently unsets `SSH_AUTH_SOCK`; an
-encrypted key requires separately provisioned dedicated agent/socket access and
-explicit SSH selection inside the new sandbox. Host `ssh-add` is insufficient,
-and this feature changes neither launcher nor agent-forwarding policy.
+module/process restart; human OMP must launch with `WH_SESSION_ROLE` unset or
+empty. The launcher still unsets `SSH_AUTH_SOCK`; an encrypted key requires
+separately provisioned dedicated agent/socket access and explicit SSH selection
+inside the new sandbox. Host `ssh-add` is insufficient. This correction changes
+only role-scoped allowlist parsing, not SSH-agent forwarding policy.
 
-The main agent exercised the actual launcher and edited allowlist against a
-private HOME fixture: config/state mounts were visible, writes persisted to
-the outside fixture, unrelated `~/.ssh` stayed hidden and SSH_AUTH_SOCK stayed
-unset. No real host directory/key creation occurred. The final native extension
+The main agent exercised the **actual edited dotfiles launcher and actual
+allowlist** against a private-HOME fixture. With `WH_SESSION_ROLE` unset,
+config/state files were visible and writes persisted outside the fixture.
+With `orchestrator`, `worker`, and `unknown-role`, those files were hidden and
+could not be mutated. Ordinary Work paths stayed available in every specimen,
+unrelated `~/.ssh` stayed hidden, `SSH_AUTH_SOCK` stayed unset, and operator
+environment variables were stripped for the role specimens. No real host
+directory/key creation occurred. The final native extension
 suite passed **361 tests, zero failures**, 2,764 expectations/14 files (2.19 seconds).
 Actual **OMP 18.14.2 shared-SSH onboarding/migration smoke passed in 32.39 seconds**,
 including native `/export` runtime-message handoff evidence (details below).
@@ -540,7 +562,8 @@ attempts were recorded and denied by a local proxy with 403 before TLS:
 zero forwarded connections/model completions, and no real cluster SSH/submission.
 The candidate updated SIF is not built/executed, and live IBEX/charged acceptance
 is not done.
-Current sandbox mount-fixture proof passed as recorded above. The final native
+The actual-dotfiles-launcher role-scoped mount-fixture proof passed as recorded
+above. The final native
 extension suite passed **361 tests, zero failures**, 2,764 expectations/14 files
 (2.19 seconds). Actual **OMP 18.14.2 shared-SSH smoke passed in 32.39 seconds**:
 normal plugin link/discovery, `/cluster-add` cancel/two independent profiles
