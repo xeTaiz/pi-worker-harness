@@ -1,32 +1,46 @@
+import { spawn } from "node:child_process";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { events } from "../events.ts";
 import {
   addTunnel,
+  createMarimo,
+  getCredentialIdentity,
+  getMarimo,
+  enqueueJob,
   getJobLogs,
   listJobs,
+  listQueue,
+  listMarimo,
   listTunnels,
   listWorkers,
+  removeMarimo,
+  removeTunnel,
   startJob,
   stopJob,
 } from "../api.ts";
 import { subscribeJobLogs, type JobLogSubscription } from "../sse.ts";
-import type { Job, Tunnel, Worker } from "../types.ts";
+import type { OwnedJob, Tunnel, PublicWorker, QueueBoard, QueueJob, MarimoSession } from "../types.ts";
+import { formatDelayEntry } from "../agent-output.ts";
 
-type Tab = "workers" | "jobs" | "tunnels";
+type Tab = "workers" | "queue" | "jobs" | "tunnels" | "marimo";
 
 const TAB_LABELS: Record<Tab, string> = {
   workers: "Workers",
-  jobs: "Jobs",
+  queue: "Shared queue",
+  jobs: "My jobs",
   tunnels: "Tunnels",
+  marimo: "Marimo",
 };
 
 interface PanelState {
-  workers: Worker[];
-  jobs: Job[];
+  workers: PublicWorker[];
+  jobs: OwnedJob[];
+  queue: QueueBoard;
   tunnels: Tunnel[];
+  marimo: MarimoSession[];
   tab: Tab;
   selectedIndex: number;
-  logJob: Job | null;
+  logJob: OwnedJob | null;
   logLines: string[];
   following: boolean;
   logFocusMode: boolean;
@@ -38,6 +52,9 @@ interface PanelState {
   newJobNameMode: boolean;
   newJobNameBuffer: string;
   newJobPendingCommand: string;
+  newJobDetailsMode: "duration" | "mode" | "gpu_count" | null;
+  newJobDetailsBuffer: string;
+  newJobExpectedSeconds: number;
   newTunnelPortMode: boolean;
   newTunnelPortBuffer: string;
   newTunnelLocalPortMode: boolean;
@@ -108,11 +125,8 @@ function gpuBar(used: number, total: number, width = 20): string {
   return usageBar(used, total, width);
 }
 
-function resourceBar(used: number, total: number, width = 20): string {
-  return usageBar(used, total, width);
-}
 
-function formatTimestamp(ts: number): string {
+function formatTimestamp(ts: number | null): string {
   if (!ts) return "-";
   return new Date(ts * 1000).toLocaleTimeString(undefined, {
     hour: "2-digit",
@@ -120,7 +134,7 @@ function formatTimestamp(ts: number): string {
   });
 }
 
-function sortJobs(jobs: Job[]): Job[] {
+function sortJobs(jobs: OwnedJob[]): OwnedJob[] {
   return [...jobs].sort((a, b) => {
     const order: Record<string, number> = {
       starting: 0,
@@ -133,6 +147,23 @@ function sortJobs(jobs: Job[]): Job[] {
   });
 }
 
+function queueJobs(board: QueueBoard): QueueJob[] {
+  return board.workers.flatMap((worker) => [...worker.jobs, ...worker.cpu_jobs]);
+}
+
+function queueMetadata(job: QueueJob): string[] {
+  return [
+    `Owner: ${job.owner_display_name} · Priority: ${job.priority} · ${job.gpu_count > 0 ? `${job.gpu_count} GPU` : "CPU/setup"}`,
+    `Runtime: ${job.expected_seconds > 0 ? `${job.expected_seconds}s` : "unknown"}`,
+    job.estimate_status === "known"
+      ? `Estimated start: ${formatTimestamp(job.estimated_start_at)} · finish: ${formatTimestamp(job.estimated_finish_at)}`
+      : `ETA unknown: ${job.estimate_explanation}`,
+    ...(job.priority_note ? [`Priority note: ${job.priority_note}`] : []),
+    ...(job.deadline_at ? [`Deadline: ${new Date(job.deadline_at * 1000).toLocaleString()}`] : []),
+    ...job.delay_history.map(formatDelayEntry).filter(Boolean),
+  ];
+}
+
 function lastNonEmptyLine(lines: string[]): string | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -143,10 +174,13 @@ function lastNonEmptyLine(lines: string[]): string | null {
 
 function shortcutsHint(state: PanelState): string {
   if (state.newJobCommandMode) {
-    return "[type command] [Enter]start [Esc]cancel [Backspace]edit";
+    return "[type command] [Enter]next [Esc]cancel [Backspace]edit";
   }
   if (state.newJobNameMode) {
-    return "[optional job name] [Enter]start [Esc]cancel [Backspace]edit";
+    return "[required public job name] [Enter]next [Esc]cancel [Backspace]edit";
+  }
+  if (state.newJobDetailsMode) {
+    return "[Enter]continue [Esc]cancel [Backspace]edit";
   }
   if (state.newTunnelPortMode) {
     return "[type remote port] [Enter]next [Esc]cancel [Backspace]edit";
@@ -162,8 +196,10 @@ function shortcutsHint(state: PanelState): string {
   }
 
   const base = "[j/k]nav [tab/S-tab h/l]tab [r]refresh [q]close";
-  if (state.tab === "workers") return `${base} [n]new job [t]tunnel`;
+  if (state.tab === "workers") return `${base} [n]new job [t]tunnel [m]new Marimo`;
   if (state.tab === "jobs") return `${base} [f]open logs [s]stop [n]new job [t]tunnel`;
+  if (state.tab === "marimo") return `${base} [m]create [o]open [s]stop`;
+  if (state.tab === "tunnels") return `${base} [d]remove`;
   return base;
 }
 
@@ -212,7 +248,7 @@ function buildPanel(
       fg("dim", `Workers:${online} Jobs:${running} Tunnels:${state.tunnels.length}`),
   );
 
-  const tabs: Tab[] = ["workers", "jobs", "tunnels"];
+  const tabs: Tab[] = ["workers", "queue", "jobs", "tunnels", "marimo"];
   const tabLine = tabs
     .map((t) =>
       t === state.tab
@@ -236,7 +272,15 @@ function buildPanel(
     lines.push(fg("accent", "  new job command> ") + truncateToWidth(state.newJobCommandBuffer, Math.max(10, width - 20)));
   }
   if (state.newJobNameMode) {
-    lines.push(fg("accent", "  job name (optional)> ") + truncateToWidth(state.newJobNameBuffer, Math.max(10, width - 25)));
+    lines.push(fg("accent", "  public job name (required)> ") + truncateToWidth(state.newJobNameBuffer, Math.max(10, width - 30)));
+  }
+  if (state.newJobDetailsMode) {
+    const prompts = {
+      duration: "expected duration in seconds (positive integer)",
+      mode: "mode: cpu (default) or gpu",
+      gpu_count: "GPU count (positive integer)",
+    };
+    lines.push(fg("accent", `  ${prompts[state.newJobDetailsMode]}> `) + state.newJobDetailsBuffer);
   }
   if (state.newTunnelPortMode) {
     lines.push(fg("accent", "  tunnel remote port> ") + truncateToWidth(state.newTunnelPortBuffer, Math.max(5, width - 24)));
@@ -263,6 +307,21 @@ function buildPanel(
         lines.push(prefix + fg(statusColor(w.status), statusIcon(w.status)) + " " + name + gpu);
       }
     }
+  } else if (state.tab === "queue") {
+    const jobs = queueJobs(state.queue);
+    if (jobs.length === 0) lines.push(fg("muted", state.loading ? "  (loading shared queue...)" : "  (no shared jobs)"));
+    let index = 0;
+    for (const worker of state.queue.workers) {
+      if (worker.jobs.length + worker.cpu_jobs.length === 0) continue;
+      lines.push(fg("accent", `  ${worker.worker_name} · revision ${worker.revision}`));
+      for (const [label, jobs] of [["GPU queue (FIFO)", worker.jobs], ["CPU/setup (active)", worker.cpu_jobs]] as const) {
+        lines.push(fg("muted", `    ${label}`));
+        for (const job of jobs) {
+          const prefix = index++ === state.selectedIndex ? "▸ " : "  ";
+          lines.push(prefix + `${job.position > 0 ? `#${job.position}` : job.status} ${job.name} · ${job.owner_display_name} · ${job.priority} · ${job.execution_state}`);
+        }
+      }
+    }
   } else if (state.tab === "jobs") {
     const sorted = sortJobs(state.jobs);
     if (sorted.length === 0) {
@@ -283,14 +342,26 @@ function buildPanel(
         );
       }
     }
+  } else if (state.tab === "marimo") {
+    if (!state.marimo.length) lines.push(fg("muted", state.loading ? "  (loading notebooks...)" : "  (no owned notebooks; press m to create)"));
+    for (let i = 0; i < state.marimo.length; i++) {
+      const session = state.marimo[i];
+      lines.push(`${i === state.selectedIndex ? "▸ " : "  "}${session.worker_name} · ${session.notebook_path} · ${session.status}`);
+      if (i === state.selectedIndex) {
+        lines.push(`    Environment: ${session.environment}`);
+        lines.push(`    Browser: ${session.url}`);
+      }
+    }
   } else {
+    lines.push(fg("yellow", "  Raw TCP is reachable on the trusted Tailnet; the target service must authenticate."));
     if (state.tunnels.length === 0) {
       lines.push(fg("muted", state.loading ? "  (loading tunnels...)" : "  (no tunnels)"));
     } else {
-      for (const t of state.tunnels) {
+      for (let i = 0; i < state.tunnels.length; i++) {
+        const t = state.tunnels[i];
         const wname = t.worker_name || t.worker_id.slice(0, 8);
         lines.push(
-          "  → localhost:" +
+          (i === state.selectedIndex ? "▸ " : "  ") + "→ " + t.bind_host + ":" +
             t.local_port +
             " → " +
             wname +
@@ -317,33 +388,8 @@ function buildPanel(
           " " +
           fg(statusColor(w.status), statusIcon(w.status)),
       );
-      lines.push(fg("muted", "  " + (w.dns_name || w.worker_ip)));
-
-      const ramUsed = finiteNumber(w.used_ram_gb, 0);
-      const ramTotal = finiteNumber(w.total_ram_gb, 0);
-      const ramBar = resourceBar(ramUsed, ramTotal, 20);
-      lines.push(
-        "  RAM  " +
-          fg("accent", ramBar) +
-          " " +
-          ramUsed.toFixed(0) +
-          "/" +
-          ramTotal.toFixed(0) +
-          " GB",
-      );
-
-      const diskUsed = finiteNumber(w.used_disk_gb, 0);
-      const diskTotal = finiteNumber(w.total_disk_gb, 0);
-      const diskBar = resourceBar(diskUsed, diskTotal, 20);
-      lines.push(
-        "  DISK " +
-          fg("accent", diskBar) +
-          " " +
-          diskUsed.toFixed(0) +
-          "/" +
-          diskTotal.toFixed(0) +
-          " GB",
-      );
+      lines.push(fg("muted", `  CPU cores: ${w.cpu_cores}`));
+      if (w.data_paths.length) lines.push(fg("muted", "  Shared data: " + w.data_paths.join(", ")));
 
       for (let i = 0; i < w.gpu_count; i++) {
         const name = w.gpu_names[i] || `GPU ${i}`;
@@ -360,7 +406,20 @@ function buildPanel(
             " GB  " +
             name,
         );
+        const available = w.gpu_available[i];
+        const utilization = w.gpu_utilization_percent[i];
+        lines.push(fg("muted", `    ${available === true ? "available" : available === false ? "unavailable" : "availability unknown"} · utilization ${utilization === null || utilization === undefined ? "unknown" : `${utilization}%`}`));
       }
+    }
+  } else if (state.tab === "queue") {
+    const job = queueJobs(state.queue)[state.selectedIndex];
+    if (job) {
+      lines.push(bold(`  ${job.name} · ${job.status} · ${job.execution_state}`));
+      for (const line of queueMetadata(job)) lines.push("  " + line);
+      if (job.termination_reason) lines.push(`  Stop reason: ${job.termination_reason}`);
+      lines.push(fg("muted", "  Private command/log/stop controls are available only in My jobs."));
+    } else {
+      lines.push(fg("muted", "  (no shared job selected)"));
     }
   } else if (state.tab === "jobs") {
     const sorted = sortJobs(state.jobs);
@@ -376,6 +435,11 @@ function buildPanel(
           fg("muted", j.status),
       );
       lines.push("  " + truncateToWidth(stripAnsi(j.command), 80));
+      lines.push(`  Public name: ${j.name} · Owner: ${j.owner_display_name} · Priority: ${j.priority}`);
+      lines.push(`  Runtime: ${j.expected_seconds > 0 ? `${j.expected_seconds}s` : "unknown"} · State: ${j.execution_state}`);
+      if (j.termination_reason) lines.push(`  Stop reason: ${j.termination_reason}`);
+      const shared = queueJobs(state.queue).find((job) => job.id === j.id);
+      if (shared) for (const line of queueMetadata(shared).slice(2)) lines.push("  " + line);
       if (j.exit_code !== null) {
         lines.push(fg(j.exit_code === 0 ? "green" : "red", "  exit: " + j.exit_code));
       }
@@ -433,19 +497,22 @@ class SimplePanel {
   private theme!: { fg: (color: string, text: string) => string; bold: (text: string) => string };
   private done!: (value: void) => void;
   private uiCtx: any;
-  private onTrackJob!: (job: Job) => void;
-  private onSetWidget!: (worker: Worker | null, job: Job | null, jobName: string | null) => void;
+  private onTrackJob!: (job: OwnedJob) => void;
+  private onSetWidget!: (worker: PublicWorker | null, job: OwnedJob | null, jobName: string | null) => void;
   private refreshUnsubscribe: (() => void) | null = null;
   private jobStartedUnsubscribe: (() => void) | null = null;
   private logSub: JobLogSubscription | null = null;
-  private startedJobs = new Map<string, { job: Job; expiresAt: number }>();
+  private startedJobs = new Map<string, { job: OwnedJob; expiresAt: number }>();
   private inFlightFetch: Promise<void> | null = null;
   private previewRequestSeq = 0;
+  private credentialIdentity: string | null = null;
 
   private state: PanelState = {
     workers: [],
     jobs: [],
+    queue: { workers: [], as_of: 0 },
     tunnels: [],
+    marimo: [],
     tab: "workers",
     selectedIndex: 0,
     logJob: null,
@@ -460,6 +527,9 @@ class SimplePanel {
     newJobNameMode: false,
     newJobNameBuffer: "",
     newJobPendingCommand: "",
+    newJobDetailsMode: null,
+    newJobDetailsBuffer: "",
+    newJobExpectedSeconds: 0,
     newTunnelPortMode: false,
     newTunnelPortBuffer: "",
     newTunnelLocalPortMode: false,
@@ -470,10 +540,38 @@ class SimplePanel {
     newTunnelPendingLocalPort: null,
   };
 
+  private syncCredentialIdentity(): string | null {
+    let identity: string | null;
+    try {
+      identity = getCredentialIdentity();
+    } catch {
+      identity = null;
+    }
+    if (identity !== null && identity === this.credentialIdentity) return identity;
+    this.credentialIdentity = identity;
+    this.stopFollow();
+    this.previewRequestSeq++;
+    this.startedJobs.clear();
+    this.state = {
+      ...this.state,
+      jobs: [], tunnels: [], marimo: [], selectedIndex: 0,
+      logJob: null, logLines: [], following: false, logFocusMode: false, logScrollOffset: 0,
+      newJobCommandMode: false, newJobCommandBuffer: "", newJobNameMode: false,
+      newJobNameBuffer: "", newJobPendingCommand: "", newJobDetailsMode: null,
+      newJobDetailsBuffer: "", newJobExpectedSeconds: 0, newTunnelPortMode: false,
+      newTunnelPortBuffer: "", newTunnelLocalPortMode: false, newTunnelLocalPortBuffer: "",
+      newTunnelNameMode: false, newTunnelNameBuffer: "", newTunnelPendingRemotePort: null,
+      newTunnelPendingLocalPort: null, loading: false,
+      lastError: identity === null ? "Worker Harness credentials unavailable; configure the current session's credentials." : "Credentials changed; press r to reload your resources.",
+    };
+    this.onSetWidget?.(null, null, null);
+    return identity;
+  }
+
   async show(
     uiCtx: any,
-    onTrackJob: (job: Job) => void,
-    onSetWidget: (worker: Worker | null, job: Job | null, jobName: string | null) => void,
+    onTrackJob: (job: OwnedJob) => void,
+    onSetWidget: (worker: PublicWorker | null, job: OwnedJob | null, jobName: string | null) => void,
   ): Promise<void> {
     this.uiCtx = uiCtx;
     this.onTrackJob = onTrackJob;
@@ -483,9 +581,8 @@ class SimplePanel {
       await this.refreshData({ notifyOnError: true });
     });
 
-    this.jobStartedUnsubscribe = events.on<{ job: Job }>("worker-harness:job-started", ({ job }) => {
-      this.insertOptimisticJob(job, { focus: this.state.tab === "jobs" });
-      this.tui?.requestRender();
+    this.jobStartedUnsubscribe = events.on<void>("worker-harness:job-started", () => {
+      void this.refreshData();
     });
 
     const panelPromise = new Promise<void>((resolve, reject) => {
@@ -543,7 +640,7 @@ class SimplePanel {
         ? this.state.workers.length
         : this.state.tab === "jobs"
           ? this.state.jobs.length
-          : this.state.tunnels.length;
+          : this.state.tab === "queue" ? queueJobs(this.state.queue).length : this.state.tab === "marimo" ? this.state.marimo.length : this.state.tunnels.length;
 
     if (count === 0) {
       this.state.selectedIndex = 0;
@@ -552,7 +649,7 @@ class SimplePanel {
     this.state.selectedIndex = Math.max(0, Math.min(count - 1, this.state.selectedIndex));
   }
 
-  private insertOptimisticJob(job: Job, options: { focus?: boolean } = {}) {
+  private insertOptimisticJob(job: OwnedJob, options: { focus?: boolean } = {}) {
     this.startedJobs.set(job.id, { job, expiresAt: Date.now() + 2 * 60 * 1000 });
 
     this.updateState((s) => {
@@ -583,11 +680,15 @@ class SimplePanel {
     }
 
     this.inFlightFetch = (async () => {
-      const [workers, jobs, tunnels] = await Promise.all([
+      const identity = this.syncCredentialIdentity();
+      const [workers, jobs, tunnels, queue, marimo] = await Promise.all([
         listWorkers(),
         listJobs(),
         listTunnels(),
+        listQueue(),
+        listMarimo(),
       ]);
+      if (identity === null || this.syncCredentialIdentity() !== identity) return;
 
       const now = Date.now();
       for (const [id, pending] of this.startedJobs.entries()) {
@@ -610,6 +711,8 @@ class SimplePanel {
         workers,
         jobs: mergedJobs,
         tunnels,
+        queue,
+        marimo,
       }));
       this.clampSelection();
     })();
@@ -622,16 +725,23 @@ class SimplePanel {
   }
 
   private async refreshData(options: { notifyOnError?: boolean } = {}) {
+    const identity = this.syncCredentialIdentity();
+    if (identity === null) {
+      this.tui?.requestRender();
+      return;
+    }
     this.updateState((s) => ({ ...s, loading: true }));
     this.tui?.requestRender();
 
     try {
       await this.fetchAll();
+      if (identity === null || this.syncCredentialIdentity() !== identity) return;
       this.updateState((s) => ({ ...s, loading: false, lastError: null }));
       if (this.state.tab === "jobs" && !this.state.logFocusMode) {
         void this.loadSelectedJobPreview();
       }
     } catch (err) {
+      if (identity === null || this.syncCredentialIdentity() !== identity) return;
       const message = this.errorMessage(err);
       this.updateState((s) => ({ ...s, loading: false, lastError: message }));
       if (options.notifyOnError) {
@@ -662,6 +772,7 @@ class SimplePanel {
 
   render(width: number): string[] {
     try {
+      this.syncCredentialIdentity();
       return buildPanel(
         this.state,
         (c, t) => this.theme.fg(c, t),
@@ -681,12 +792,17 @@ class SimplePanel {
 
   handleInput(data: string): void {
     try {
+      this.syncCredentialIdentity();
       if (this.state.newJobCommandMode) {
         this.handleNewJobCommandInput(data);
         return;
       }
       if (this.state.newJobNameMode) {
         this.handleNewJobNameInput(data);
+        return;
+      }
+      if (this.state.newJobDetailsMode) {
+        this.handleNewJobDetailsInput(data);
         return;
       }
       if (this.state.newTunnelPortMode) {
@@ -761,6 +877,15 @@ class SimplePanel {
         if (this.state.tab === "jobs") {
           this.stopSelectedJob().catch((err) => this.uiCtx.notify(this.errorMessage(err), "error"));
         }
+        if (this.state.tab === "marimo") {
+          this.stopSelectedMarimo().catch((err) => this.uiCtx.notify(this.errorMessage(err), "error"));
+        }
+      } else if (data === "m" && (this.state.tab === "marimo" || this.state.tab === "workers")) {
+        this.createOwnedMarimo().catch((err) => this.uiCtx.notify(this.errorMessage(err), "error"));
+      } else if (data === "o" && this.state.tab === "marimo") {
+        this.openSelectedMarimo().catch((err) => this.uiCtx.notify(this.errorMessage(err), "error"));
+      } else if (data === "d" && this.state.tab === "tunnels") {
+        this.removeSelectedTunnel().catch((err) => this.uiCtx.notify(this.errorMessage(err), "error"));
       }
     } catch (err) {
       const message = this.errorMessage(err);
@@ -771,7 +896,7 @@ class SimplePanel {
   }
 
   private navigateTab(delta: number) {
-    const tabs: Tab[] = ["workers", "jobs", "tunnels"];
+    const tabs: Tab[] = ["workers", "queue", "jobs", "tunnels", "marimo"];
     const idx = tabs.indexOf(this.state.tab);
     const next = (idx + delta + tabs.length) % tabs.length;
     this.updateState((s) => ({
@@ -788,6 +913,9 @@ class SimplePanel {
       newJobNameMode: false,
       newJobNameBuffer: "",
       newJobPendingCommand: "",
+      newJobDetailsMode: null,
+      newJobDetailsBuffer: "",
+      newJobExpectedSeconds: 0,
       newTunnelPortMode: false,
       newTunnelPortBuffer: "",
       newTunnelLocalPortMode: false,
@@ -807,7 +935,7 @@ class SimplePanel {
   private navigate(delta: number) {
     const { tab, workers, jobs, tunnels } = this.state;
     const count =
-      tab === "workers" ? workers.length : tab === "jobs" ? jobs.length : tunnels.length;
+      tab === "workers" ? workers.length : tab === "jobs" ? jobs.length : tab === "queue" ? queueJobs(this.state.queue).length : tab === "marimo" ? this.state.marimo.length : tunnels.length;
     if (count === 0) return;
     this.updateState((s) => ({
       ...s,
@@ -819,12 +947,13 @@ class SimplePanel {
     this.tui?.requestRender();
   }
 
-  private selectedJob(): Job | null {
+  private selectedJob(): OwnedJob | null {
     const sorted = sortJobs(this.state.jobs);
     return sorted[this.state.selectedIndex] ?? null;
   }
 
   private async loadSelectedJobPreview() {
+    const identity = this.syncCredentialIdentity();
     if (this.state.tab !== "jobs" || this.state.logFocusMode || this.state.following) return;
 
     const job = this.selectedJob();
@@ -837,6 +966,7 @@ class SimplePanel {
     const seq = ++this.previewRequestSeq;
     try {
       const logs = await getJobLogs(job.id, { tail: 1 });
+      if (identity === null || this.syncCredentialIdentity() !== identity) return;
       if (seq !== this.previewRequestSeq) return;
       if (this.state.logFocusMode || this.state.following) return;
       const current = this.selectedJob();
@@ -898,7 +1028,9 @@ class SimplePanel {
     }
   }
 
-  private async loadJobLogs(job: Job, options: { tail?: number; keepLogFocus?: boolean } = {}) {
+  private async loadJobLogs(job: OwnedJob, options: { tail?: number; keepLogFocus?: boolean } = {}) {
+    const identity = this.syncCredentialIdentity();
+    if (!this.state.jobs.some((owned) => owned.id === job.id)) return;
     const tail = Number.isFinite(options.tail) ? Math.max(1, Math.floor(options.tail ?? 200)) : 200;
 
     this.stopFollow();
@@ -916,6 +1048,7 @@ class SimplePanel {
     this.onTrackJob(job);
 
     const logs = await getJobLogs(job.id, { tail });
+    if (identity === null || this.syncCredentialIdentity() !== identity) return;
     const lines = typeof logs.logs === "string" ? logs.logs.split("\n") : [JSON.stringify(logs)];
     this.updateState((s) => ({
       ...s,
@@ -926,7 +1059,9 @@ class SimplePanel {
     this.tui?.requestRender();
   }
 
-  private async followLogs(job: Job, options: { tail?: number; keepLogFocus?: boolean } = {}) {
+  private async followLogs(job: OwnedJob, options: { tail?: number; keepLogFocus?: boolean } = {}) {
+    const identity = this.syncCredentialIdentity();
+    if (!this.state.jobs.some((owned) => owned.id === job.id)) return;
     const tail = Number.isFinite(options.tail) ? Math.max(1, Math.floor(options.tail ?? 50)) : 50;
 
     this.stopFollow();
@@ -947,19 +1082,21 @@ class SimplePanel {
       tail,
       pollSeconds: 1,
       onLine: (line) => {
+        if (identity === null || this.syncCredentialIdentity() !== identity) return;
         this.updateState((s) => ({
           ...s,
           logLines: [...s.logLines, line].slice(-5000),
           following: true,
         }));
         if (line.trim()) {
-          events.emit("worker-harness:log-line", { job_id: job.id, line });
+          events.emit("worker-harness:log-line", { job_id: job.id, line, credentialIdentity: identity });
         }
         this.tui?.requestRender();
       },
     });
 
     this.logSub.done.catch((err) => {
+      if (identity === null || this.syncCredentialIdentity() !== identity) return;
       if (!this.isAbortError(err)) {
         this.uiCtx.notify(this.errorMessage(err), "error");
       }
@@ -994,6 +1131,9 @@ class SimplePanel {
       newJobNameMode: false,
       newJobNameBuffer: "",
       newJobPendingCommand: "",
+      newJobDetailsMode: null,
+      newJobDetailsBuffer: "",
+      newJobExpectedSeconds: 0,
       newTunnelPortMode: false,
       newTunnelPortBuffer: "",
       newTunnelLocalPortMode: false,
@@ -1067,14 +1207,18 @@ class SimplePanel {
         return;
       }
 
-      const name = this.state.newJobNameBuffer.trim() || undefined;
+      const name = this.state.newJobNameBuffer.trim();
+      if (!name) {
+        this.uiCtx.notify("A public job name is required; do not include private command or path details.", "warning");
+        return;
+      }
       this.updateState((s) => ({
         ...s,
         newJobNameMode: false,
-        newJobPendingCommand: "",
-        newJobNameBuffer: "",
+        newJobNameBuffer: name,
+        newJobDetailsMode: "duration",
+        newJobDetailsBuffer: "",
       }));
-      this.startNewJob(command, name).catch((err) => this.uiCtx.notify(this.errorMessage(err), "error"));
       this.tui?.requestRender();
       return;
     }
@@ -1106,6 +1250,54 @@ class SimplePanel {
       }));
       this.tui?.requestRender();
     }
+  }
+
+  private handleNewJobDetailsInput(data: string) {
+    if (matchesKey(data, Key.escape)) {
+      this.updateState((s) => ({ ...s, newJobDetailsMode: null, newJobDetailsBuffer: "", newJobPendingCommand: "", newJobNameBuffer: "", newJobExpectedSeconds: 0 }));
+    } else if (data === "\u007f" || data === "\b") {
+      this.updateState((s) => ({ ...s, newJobDetailsBuffer: s.newJobDetailsBuffer.slice(0, -1) }));
+    } else if (data === "\r" || data === "\n") {
+      const input = this.state.newJobDetailsBuffer.trim();
+      if (this.state.newJobDetailsMode === "duration") {
+        const seconds = Number(input);
+        if (!Number.isSafeInteger(seconds) || seconds < 1) {
+          this.uiCtx.notify("Expected duration must be a positive integer in seconds.", "warning");
+          return;
+        }
+        this.updateState((s) => ({ ...s, newJobExpectedSeconds: seconds, newJobDetailsMode: "mode", newJobDetailsBuffer: "" }));
+      } else if (this.state.newJobDetailsMode === "mode") {
+        const mode = input.toLowerCase() || "cpu";
+        if (mode !== "cpu" && mode !== "gpu") {
+          this.uiCtx.notify("Choose cpu (default) or gpu.", "warning");
+          return;
+        }
+        if (mode === "gpu") {
+          this.updateState((s) => ({ ...s, newJobDetailsMode: "gpu_count", newJobDetailsBuffer: "" }));
+        } else {
+          this.submitNewJob(0);
+        }
+      } else {
+        const count = Number(input);
+        const worker = this.state.workers.find((worker) => worker.id === this.selectedWorkerId());
+        if (!Number.isSafeInteger(count) || count < 1 || !worker || count > worker.gpu_count) {
+          this.uiCtx.notify("GPU count must be positive and within the selected worker's capacity.", "warning");
+          return;
+        }
+        this.submitNewJob(count);
+      }
+    } else if (this.isPrintableInput(data)) {
+      this.updateState((s) => ({ ...s, newJobDetailsBuffer: s.newJobDetailsBuffer + data }));
+    }
+    this.tui?.requestRender();
+  }
+
+  private submitNewJob(gpuCount: number) {
+    const command = this.state.newJobPendingCommand;
+    const name = this.state.newJobNameBuffer;
+    const seconds = this.state.newJobExpectedSeconds;
+    this.updateState((s) => ({ ...s, newJobDetailsMode: null, newJobDetailsBuffer: "" }));
+    this.startNewJob(command, name, seconds, gpuCount).catch((err) => this.uiCtx.notify(this.errorMessage(err), "error"));
   }
 
   private isPrintableInput(data: string): boolean {
@@ -1197,8 +1389,8 @@ class SimplePanel {
       let localPort: number | null = null;
       if (trimmed.length > 0) {
         const parsed = Number(trimmed);
-        if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
-          this.uiCtx.notify("Local port must be blank or an integer between 1 and 65535.", "warning");
+        if (!Number.isInteger(parsed) || parsed < 1024 || parsed > 65535) {
+          this.uiCtx.notify("Local port must be blank or an integer between 1024 and 65535.", "warning");
           return;
         }
         localPort = parsed;
@@ -1317,18 +1509,25 @@ class SimplePanel {
     );
   }
 
-  private async startNewJob(command: string, name?: string) {
+  private async startNewJob(command: string, name: string, expectedSeconds: number, gpuCount: number) {
+    const identity = this.syncCredentialIdentity();
+    if (identity === null) return;
     const workerId = this.selectedWorkerId();
     if (!workerId) {
       this.uiCtx.notify("Select a worker (or a job tied to a worker) before pressing n.", "warning");
       return;
     }
 
-    const job = await startJob({
+    const request = {
       worker_id: workerId,
       command,
       name,
-    });
+      expected_seconds: expectedSeconds,
+    };
+    const job = gpuCount > 0
+      ? await enqueueJob({ ...request, gpu_count: gpuCount })
+      : await startJob(request);
+    if (identity === null || this.syncCredentialIdentity() !== identity) return;
 
     this.updateState((s) => ({
       ...s,
@@ -1343,10 +1542,11 @@ class SimplePanel {
     void this.sleep(1200).then(() => this.refreshData());
 
     events.emit("worker-harness:refresh", undefined);
-    this.uiCtx.notify(`Started job ${job.id.slice(0, 8)} on ${workerId}.`, "info");
+    this.uiCtx.notify(`${gpuCount > 0 ? "Queued" : "Started"} job ${job.id.slice(0, 8)} on ${workerId}.`, "info");
   }
 
   private async createTunnel(remotePort: number, localPort?: number, name?: string) {
+    const identity = this.syncCredentialIdentity();
     const workerId = this.selectedWorkerId();
     if (!workerId) {
       this.uiCtx.notify("Select a worker (or a job tied to a worker) before pressing t.", "warning");
@@ -1357,6 +1557,7 @@ class SimplePanel {
     const useRandomLocalPort = !Number.isInteger(localPort);
 
     for (let attempt = 0; attempt < 8; attempt++) {
+      if (identity === null || this.syncCredentialIdentity() !== identity) return;
       const candidateLocalPort = useRandomLocalPort ? this.randomLocalPort() : Number(localPort);
       try {
         const tunnel = await addTunnel({
@@ -1365,6 +1566,7 @@ class SimplePanel {
           remote_port: remotePort,
           name,
         });
+        if (this.syncCredentialIdentity() !== identity) return;
 
         this.updateState((s) => ({
           ...s,
@@ -1382,6 +1584,7 @@ class SimplePanel {
         );
         return;
       } catch (err) {
+        if (this.syncCredentialIdentity() !== identity) return;
         lastErr = err;
         if (!useRandomLocalPort || !this.isTunnelPortConflictError(err)) break;
       }
@@ -1392,10 +1595,68 @@ class SimplePanel {
 
   private async stopSelectedJob() {
     const job = this.selectedJob();
-    if (!job || (job.status !== "starting" && job.status !== "running")) return;
+    if (!job || !["pending", "starting", "running"].includes(job.status)) return;
 
     await stopJob(job.id);
     events.emit("worker-harness:refresh", undefined);
+    await this.refreshData({ notifyOnError: true });
+  }
+
+  private async createOwnedMarimo() {
+    const identity = this.syncCredentialIdentity();
+    const selected = this.state.tab === "workers" ? this.state.workers[this.state.selectedIndex] : null;
+    let worker = selected;
+    if (!worker) {
+      const name = await this.uiCtx.select("Marimo worker", this.state.workers.map((worker) => worker.name));
+      worker = this.state.workers.find((worker) => worker.name === name) ?? null;
+    }
+    if (!worker) return;
+    const notebookPath = await this.uiCtx.input("Notebook path", "/workspace/notebook.py");
+    if (!notebookPath?.trim()) return;
+    const environment = await this.uiCtx.input("Environment", "/workspace/.venv");
+    if (!environment?.trim()) return;
+    const timeoutInput = await this.uiCtx.input("Ready timeout in seconds (blank = 30)", "30");
+    if (timeoutInput === undefined) return;
+    const timeout = timeoutInput.trim() ? Number(timeoutInput) : 30;
+    if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("Ready timeout must be positive.");
+    if (identity === null || this.syncCredentialIdentity() !== identity) return;
+    await createMarimo({ worker_id: worker.id, notebook_path: notebookPath.trim(), environment: environment.trim(), ready_timeout: timeout });
+    if (this.syncCredentialIdentity() !== identity) return;
+    this.state.tab = "marimo";
+    this.state.selectedIndex = 0;
+    await this.refreshData({ notifyOnError: true });
+  }
+
+  private async openSelectedMarimo() {
+    const identity = this.syncCredentialIdentity();
+    const selected = this.state.marimo[this.state.selectedIndex];
+    if (!selected) return;
+    const session = await getMarimo(selected.id);
+    if (identity === null || this.syncCredentialIdentity() !== identity) return;
+    if (session.status !== "ready") throw new Error("This notebook is stopped.");
+    const url = new URL(session.url);
+    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Notebook returned an invalid browser URL.");
+    const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer.exe" : "xdg-open";
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(command, [url.href], { stdio: "ignore" });
+      child.once("error", reject);
+      child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Could not open browser; open ${url.href}`)));
+    });
+  }
+
+  private async stopSelectedMarimo() {
+    this.syncCredentialIdentity();
+    const session = this.state.marimo[this.state.selectedIndex];
+    if (!session || session.status !== "ready") return;
+    await removeMarimo(session.id);
+    await this.refreshData({ notifyOnError: true });
+  }
+
+  private async removeSelectedTunnel() {
+    this.syncCredentialIdentity();
+    const tunnel = this.state.tunnels[this.state.selectedIndex];
+    if (!tunnel) return;
+    await removeTunnel(tunnel.id);
     await this.refreshData({ notifyOnError: true });
   }
 
@@ -1406,8 +1667,8 @@ class SimplePanel {
 
 export async function openPanel(
   uiCtx: any,
-  onTrackJob: (job: Job) => void,
-  onSetWidget: (worker: Worker | null, job: Job | null, jobName: string | null) => void,
+  onTrackJob: (job: OwnedJob) => void,
+  onSetWidget: (worker: PublicWorker | null, job: OwnedJob | null, jobName: string | null) => void,
 ): Promise<void> {
   const panel = new SimplePanel();
   await panel.show(uiCtx, onTrackJob, onSetWidget);

@@ -4,146 +4,128 @@ import {
   buildDataCatalog,
   formatDataCatalog,
   formatAvailableGpus,
+  formatDelayEntry,
+  formatOwnedJob,
   formatQueueOverview,
   formatWorkerOverview,
 } from "./agent-output.ts";
-import type { DataPaths, QueuedJob, Worker } from "./types.ts";
+import type { DataPaths, DelayEntry, OwnedJob, PublicWorker, QueueBoard, QueueJob } from "./types.ts";
 
-function worker(patch: Partial<Worker>): Worker {
+function worker(patch: Partial<PublicWorker> = {}): PublicWorker {
   return {
-    id: "aaaaaaaa-0000-0000-0000-000000000001",
-    name: "worker-a",
-    worker_ip: "100.64.0.1",
-    dns_name: "worker-a.hs.example",
-    ssh_user: "root",
-    harness_dir: "/harness",
-    gpu_count: 1,
-    gpu_names: ["NVIDIA A100-SXM4-80GB"],
-    gpu_vram_gb: [80],
-    gpu_used_vram_gb: [0],
-    gpu_busy: [false],
-    cpu_cores: 8,
-    total_ram_gb: 64,
-    used_ram_gb: 8,
-    total_disk_gb: 100,
-    used_disk_gb: 10,
-    status: "online",
-    last_heartbeat_ts: 0,
-    created_at: 0,
-    ...patch,
+    id: "worker-1", name: "worker-a", status: "online",
+    gpu_count: 1, gpu_names: ["NVIDIA A100-SXM4-80GB"],
+    gpu_vram_gb: [80], gpu_used_vram_gb: [0],
+    gpu_utilization_percent: [0], gpu_available: [true],
+    cpu_cores: 8, data_paths: [], ...patch,
   };
 }
 
-function queuedJob(patch: Partial<QueuedJob>): QueuedJob {
+function queueJob(patch: Partial<QueueJob> = {}): QueueJob {
   return {
-    id: "job-1",
-    worker_id: "aaaaaaaa-0000-0000-0000-000000000001",
-    worker_name: "worker-a",
-    name: "experiment",
-    tmux_session: "wh_job-1",
-    command: "python train.py",
-    status: "pending",
-    queue_managed: true,
-    exit_code: null,
-    pty_enabled: true,
-    kind: "ssh",
-    origin_session_id: null,
-    report_revision: 0,
-    expected_seconds: 60,
-    gpu_count: 1,
-    gpu_indices: [],
-    queue_order: 1,
-    position: 1,
-    started_at: 0,
-    finished_at: 0,
-    ...patch,
+    id: "job-1", worker_id: "worker-1", worker_name: "worker-a", name: "experiment",
+    owner_user_id: "owner-1", owner_display_name: "Alice",
+    status: "pending", execution_state: "active", position: 1,
+    submitted_at: 1, submission_sequence: 1, priority: "normal", priority_note: "",
+    deadline_at: null, expected_seconds: 60, gpu_count: 1, started_at: null,
+    termination_reason: null, stop_requested_at: null,
+    estimated_start_at: 120, estimated_finish_at: 180, estimate_status: "known",
+    estimate_explanation: "FIFO resource estimate", delay_history: [], ...patch,
   };
 }
 
-test("formats compact fleet and available-GPU rows", () => {
+function delay(patch: Partial<DelayEntry> = {}): DelayEntry {
+  return {
+    event_id: "event-1", created_at: 100, delay_seconds: 1,
+    moved_job_id: "moved", moved_job_name: "urgent training",
+    moved_job_owner_display_name: "Bob", actor_user_id: "actor-1",
+    actor_display_name: "Carol", reason: "Agreed experiment window", ...patch,
+  };
+}
+
+function board(jobs: QueueJob[], cpu_jobs: QueueJob[] = []): QueueBoard {
+  return {
+    as_of: 100,
+    workers: [{ worker_id: "worker-1", worker_name: "worker-a", revision: 7, jobs, cpu_jobs }],
+  };
+}
+
+test("renders only public fleet fields and excludes unavailable/unknown GPU workers", () => {
   const workers = [
-    worker({}),
-    worker({
-      id: "bbbbbbbb-0000-0000-0000-000000000002",
-      name: "worker-b",
-      dns_name: "worker-b.hs.example",
-      gpu_count: 2,
-      gpu_names: ["NVIDIA RTX A6000", "NVIDIA RTX A6000"],
-      gpu_vram_gb: [48, 48],
-      gpu_used_vram_gb: [30, 30],
-      gpu_busy: [true, true],
-    }),
-    worker({
-      id: "cccccccc-0000-0000-0000-000000000003",
-      name: "worker-c",
-      dns_name: "worker-c.hs.example",
-      status: "offline",
-      gpu_busy: [false],
-    }),
+    worker(),
+    worker({ id: "busy", name: "busy", gpu_available: [false] }),
+    worker({ id: "unknown", name: "unknown", gpu_available: [null] }),
+    worker({ id: "offline", name: "offline", status: "offline" }),
   ];
-
-  expect(formatWorkerOverview(workers)).toContain(
-    "online   | aaaaaaaa-0000-0000-0000-000000000001 | worker-a | worker-a.hs.example | A100 0/1",
-  );
-  expect(formatWorkerOverview(workers)).toContain("RTX A6000 2/2");
-  expect(availableGpuWorkers(workers).map(({ name }) => name)).toEqual(["worker-a"]);
-  expect(formatAvailableGpus(workers)).toContain(
-    "aaaaaaaa-0000-0000-0000-000000000001 | worker-a | worker-a.hs.example | A100 1/1",
-  );
-  expect(formatAvailableGpus(workers)).not.toContain("worker-b");
-  expect(formatAvailableGpus(workers)).not.toContain("worker-c");
+  expect(formatWorkerOverview(workers)).toContain("online | worker-1 | worker-a");
+  expect(formatWorkerOverview(workers)).not.toContain("tailnet_dns");
+  expect(availableGpuWorkers(workers).map(({ id }) => id)).toEqual(["worker-1"]);
+  expect(formatAvailableGpus(workers)).toContain("worker-1 | worker-a | A100 1/1");
+  expect(formatAvailableGpus(workers)).not.toContain("unknown");
 });
 
-test("formats empty and active worker queues", () => {
-  const online = worker({});
-  expect(formatQueueOverview([], [], 100)).toBe("No online workers or active queued jobs.");
-  expect(formatQueueOverview([online], [], 100)).toBe(
-    "aaaaaaaa-0000-0000-0000-000000000001 | worker-a | online | GPUs A100 0/1\n"
-    + "  (queue empty)",
-  );
-});
-
-test("formats parallel active rows, strict pending order, and multi-GPU requests", () => {
-  const gpuWorker = worker({
-    gpu_count: 4,
-    gpu_names: ["NVIDIA A100", "NVIDIA A100", "NVIDIA A100", "NVIDIA A100"],
-    gpu_vram_gb: [80, 80, 80, 80],
-    gpu_used_vram_gb: [1, 1, 1, 1],
-    gpu_busy: [true, true, false, false],
+test("partially available GPU models remain schedulable", () => {
+  const partial = worker({
+    gpu_count: 2, gpu_names: ["NVIDIA A100", "NVIDIA A100"],
+    gpu_available: [false, true], gpu_utilization_percent: [50, 0],
+    gpu_vram_gb: [80, 80], gpu_used_vram_gb: [10, 0],
   });
-  const jobs = [
-    queuedJob({ id: "running", name: "run", status: "running", gpu_indices: [0], started_at: 90, position: 0 }),
-    queuedJob({ id: "starting", name: "start", status: "starting", gpu_indices: [1], started_at: 110, position: 0 }),
-    queuedJob({ id: "head", name: "two-gpu", gpu_count: 2, queue_order: 3, position: 1 }),
-    queuedJob({ id: "later", name: "later", queue_order: 8, position: 2 }),
-  ];
-  const output = formatQueueOverview([gpuWorker], jobs, 100);
-
-  expect(output).toContain("GPUs A100 2/4");
-  expect(output).toContain("running | running | run | GPU indices [0] | elapsed 10s / expected 60s");
-  expect(output).toContain("starting | starting | start | GPU indices [1] | elapsed 0s / expected 60s");
-  expect(output.indexOf("pending #1 | head | two-gpu | GPUs 2")).toBeLessThan(
-    output.indexOf("pending #2 | later | later | GPUs 1"),
-  );
-  expect(output).not.toContain("python train.py");
+  expect(availableGpuWorkers([partial])).toEqual([partial]);
+  expect(formatAvailableGpus([partial])).toContain("A100 1/2");
 });
 
-test("includes offline and orphaned queue owners", () => {
-  const offline = worker({
-    id: "offline-id",
-    name: "offline-worker",
-    status: "offline",
-  });
-  const output = formatQueueOverview(
-    [offline],
-    [
-      queuedJob({ id: "offline-job", worker_id: "offline-id", worker_name: "offline-worker" }),
-      queuedJob({ id: "orphan-job", worker_id: "missing-id", worker_name: "missing-worker" }),
-    ],
-    100,
+test("renders QueueBoard revisions, CPU jobs, ownership, metadata and server ETA explanations", () => {
+  const output = formatQueueOverview(board([
+    queueJob({ id: "active", status: "running", position: 0, started_at: 90, execution_state: "stopping" }),
+    queueJob({ id: "head", name: "two-gpu", gpu_count: 2, priority: "time_critical",
+      priority_note: "Deadline tonight", deadline_at: 300, delay_history: [delay()] }),
+    queueJob({ id: "later", position: 2, expected_seconds: 0, estimate_status: "unknown",
+      estimated_start_at: null, estimated_finish_at: null, estimate_explanation: "Active duration unknown" }),
+  ], [queueJob({ id: "cpu", status: "running", position: 0, gpu_count: 0 })]));
+  expect(output).toContain("worker-1 | worker-a | revision 7");
+  expect(output).toContain("execution_state=stopping");
+  expect(output).toContain("owner Alice | priority time_critical");
+  expect(output).toContain("Priority note: Deadline tonight");
+  expect(output).toContain("Deadline: 1970-01-01T00:05:00.000Z");
+  expect(output).toContain("ETA start 1970-01-01T00:02:00.000Z");
+  expect(output).toContain("known: FIFO resource estimate");
+  expect(output).toContain("ETA start unavailable | finish unavailable | unknown: Active duration unknown");
+  expect(output).toContain("expected unknown");
+  expect(output).not.toContain("expected 0s");
+  expect(output).toContain("CPU/setup jobs:");
+  expect(output).toContain("cpu | experiment | GPUs 0");
+  expect(output.indexOf("pending #1 | head")).toBeLessThan(output.indexOf("pending #2 | later"));
+  expect(output).not.toContain("command");
+});
+
+test("renders positive delay with ceil minutes, actor, owner, reason and time", () => {
+  expect(formatDelayEntry(delay())).toBe(
+    "+1 minutes estimated delay because of urgent training by Bob. Moved by Carol: Agreed experiment window (1970-01-01T00:01:40.000Z)",
   );
-  expect(output).toContain("offline-id | offline-worker | offline");
-  expect(output).toContain("missing-id | missing-worker | absent | GPUs unknown");
+  expect(formatDelayEntry(delay({ delay_seconds: 61 }))).toContain("+2 minutes");
+  expect(formatDelayEntry(delay({ delay_seconds: null }))).toContain("Moved later; delay estimate unavailable");
+  expect(formatDelayEntry(delay({ delay_seconds: 0 }))).toBe("");
+  expect(formatDelayEntry(delay({ delay_seconds: -60 }))).toBe("");
+  expect(formatQueueOverview(board([queueJob({ delay_history: [delay({ delay_seconds: 0 }), delay({ delay_seconds: -60 })] })]))).not.toContain("estimated delay");
+});
+
+test("renders empty boards and CPU-only workers", () => {
+  expect(formatQueueOverview({ workers: [], as_of: 100 })).toBe("No workers or active queued jobs.");
+  expect(formatQueueOverview(board([]))).toContain("(GPU queue empty)");
+  expect(formatQueueOverview(board([], [queueJob({ gpu_count: 0 })]))).toContain("CPU/setup jobs:");
+});
+
+test("owned job output retains execution state and termination reason", () => {
+  const job: OwnedJob = {
+    ...queueJob({ expected_seconds: 0, termination_reason: "gpu_idle_timeout", execution_state: "termination_unknown" }),
+    command: "private training command", exit_code: null, kind: "ssh",
+    submitted_by_actor_id: "actor", gpu_indices: [0], queue_managed: true,
+    finished_at: null, origin_session_id: null,
+  };
+  const output = formatOwnedJob(job);
+  expect(output).toContain("execution_state=termination_unknown");
+  expect(output).toContain("termination_reason=gpu_idle_timeout");
+  expect(output).toContain("expected unknown");
 });
 
 test("deduplicates worker identities and filters paths by query", () => {

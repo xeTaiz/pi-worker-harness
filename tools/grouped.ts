@@ -8,12 +8,11 @@
  * `tools: ["wh_dispatch"]`) instead of having to enumerate every individual
  * operation.
  *
- * Specialised operations that do not fit the RO/RW split remain as their own
- * registered tools (see tools/admin.ts: image deploy + worker restart).
+ * Ordinary keys receive only the shared scheduling and owned-resource surface.
+ * Internal Pi credentials retain their role-scoped orchestration workflows.
  *
  *   wh_read     — role-scoped read-only inspection
- *   wh_dispatch — role-scoped mutations, Marimo, and fleet orchestration
- *   wh_admin_*  — image deploy / worker restart for normal operator sessions
+ *   wh_dispatch — role-scoped mutations and Python-capable Marimo operations
  */
 import { Type, type Static } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
@@ -22,13 +21,14 @@ import { StringEnum } from "../utils.ts";
 import { events } from "../events.ts";
 import { gpuAvailability, workerGpuStatus } from "../gpu-status.ts";
 import type { GpuModelStatus } from "../gpu-status.ts";
-import type { QueuedJob, Worker } from "../types.ts";
+import type { PublicWorker, QueueBoard } from "../types.ts";
 import {
   availableGpuWorkers,
   buildDataCatalog,
   formatDataCatalog,
   formatAvailableGpus,
   formatQueueOverview,
+  formatOwnedJob,
   formatWorkerOverview,
 } from "../agent-output.ts";
 import type { DataCatalog } from "../agent-output.ts";
@@ -42,6 +42,9 @@ import {
   downloadFile,
   enqueueJob,
   getJobLogs,
+  getQueueHistory,
+  getUsage,
+  getCredentialIdentity,
   getMarimo,
   getOrchestratorUrl,
   getPiSession,
@@ -57,6 +60,8 @@ import {
   listWorkers,
   notifyPm,
   pruneWorkers,
+  previewQueueMove,
+  moveQueueJob,
   removeMarimo,
   removeTunnel,
   sendOrchestratorMessage,
@@ -67,6 +72,7 @@ import {
   submitPr,
   teardownTask,
   updateQueuedJob,
+  updateJob,
   uploadFile,
 } from "../api.ts";
 import { subscribeJobLogs } from "../sse.ts";
@@ -86,6 +92,33 @@ function requireField<T>(value: T | undefined, name: string): T {
     throw new Error(`Missing required parameter for action: ${name}`);
   }
   return value;
+}
+
+function positiveInteger(value: number | undefined, name: string): number {
+  const required = requireField(value, name);
+  if (!Number.isInteger(required) || required < 1) throw new Error(`${name} must be a positive integer`);
+  return required;
+}
+
+function nonblank(value: string | undefined, name: string): string {
+  const required = requireField(value, name).trim();
+  if (!required) throw new Error(`${name} must not be blank`);
+  return required;
+}
+
+function validatePriority(params: Static<typeof whDispatchParams>): void {
+  if (params.priority !== undefined && !["flexible", "normal", "blocking", "time_critical"].includes(params.priority)) {
+    throw new Error("Invalid priority");
+  }
+  if (params.priority_note !== undefined && params.priority_note.length > 1000) {
+    throw new Error("priority_note must be at most 1000 characters");
+  }
+  if (params.priority === "time_critical" && !params.priority_note?.trim()) {
+    throw new Error("time_critical requires a nonblank priority_note");
+  }
+  if (params.deadline_at !== undefined && params.deadline_at !== null && !Number.isFinite(params.deadline_at)) {
+    throw new Error("deadline_at must be epoch seconds or null");
+  }
 }
 
 /** Run a local command synchronously (used by grant_git_access for gh API). */
@@ -189,7 +222,7 @@ function dispatchCallSummary(args: Static<typeof whDispatchParams>): string {
       return [
         args.job_id ?? "",
         args.worker_id ? `worker=${args.worker_id}` : "",
-        args.position !== undefined ? `position=${args.position}` : "",
+        args.update_status ? `status=${args.update_status}` : "",
         args.name ? `name=${args.name}` : "",
         args.gpu_count !== undefined ? `gpus=${args.gpu_count}` : "",
         args.expected_seconds !== undefined ? `expected=${args.expected_seconds}s` : "",
@@ -252,7 +285,7 @@ function buildDispatchHeader(args: Static<typeof whDispatchParams>, theme: Theme
   if (summary) text += theme.fg("toolOutput", `  ${summary}`);
   return text;
 }
-function workerStatusEmoji(status: Worker["status"]): string {
+function workerStatusEmoji(status: PublicWorker["status"]): string {
   if (status === "online") return "🟢";
   if (status === "draining") return "🟡";
   return "🔴";
@@ -265,42 +298,13 @@ function gpuStatusColor(status: GpuModelStatus): "success" | "warning" | "error"
   return "error";
 }
 
-export function buildWorkerList(workers: Worker[], theme: Theme): string {
+export function buildWorkerList(workers: PublicWorker[], theme: Theme): string {
   if (workers.length === 0) return theme.fg("dim", "No workers");
-
-  const rows = workers.map((worker) => ({
-    worker,
-    dns: worker.dns_name || worker.worker_ip || "—",
-    gpus: workerGpuStatus(worker),
-  }));
-  const workerWidth = Math.max(...rows.map(({ worker }) => worker.name.length));
-  const dnsWidth = Math.max(...rows.map(({ dns }) => dns.length));
-  const gpuStatuses = rows.flatMap(({ gpus }) => gpus);
-  const modelWidth = Math.max(0, ...gpuStatuses.map(({ model }) => model.length));
-  const ratioWidth = Math.max(
-    0,
-    ...gpuStatuses.map(({ busy, total }) => `${busy}/${total}`.length),
-  );
-  const separator = theme.fg("dim", " │ ");
-
-  return rows.flatMap(({ worker, dns, gpus }) => {
-    let firstPrefix = workerStatusEmoji(worker.status);
-    firstPrefix += separator + theme.fg("toolOutput", worker.name.padEnd(workerWidth));
-    firstPrefix += separator + theme.fg("dim", dns.padEnd(dnsWidth));
-    firstPrefix += separator + theme.fg("dim", "GPUs: ");
-    if (gpus.length === 0) return [firstPrefix + theme.fg("dim", "—")];
-
-    let continuationPrefix = "  ";
-    continuationPrefix += separator + " ".repeat(workerWidth);
-    continuationPrefix += separator + " ".repeat(dnsWidth);
-    continuationPrefix += separator + " ".repeat("GPUs: ".length);
-
-    return gpus.map((status, index) => {
-      const ratio = `${status.busy}/${status.total}`.padStart(ratioWidth);
-      const value = `${status.model.padEnd(modelWidth)}: ${ratio}`;
-      return (index === 0 ? firstPrefix : continuationPrefix)
-        + theme.fg(gpuStatusColor(status), value);
-    });
+  return workers.map((worker) => {
+    const gpus = workerGpuStatus(worker).map((status) =>
+      theme.fg(gpuStatusColor(status), `${status.model}: ${status.busy}/${status.total}`),
+    ).join(" · ") || "—";
+    return `${workerStatusEmoji(worker.status)} ${theme.fg("toolOutput", worker.name)} | GPUs: ${gpus}`;
   }).join("\n");
 }
 
@@ -326,6 +330,8 @@ const whReadParams = Type.Object({
     "list_queue",
     "get_job_logs",
     "list_tunnels",
+    "get_usage",
+    "get_queue_history",
     "pi_sessions",
     "fleet_status",
     "list_projects",
@@ -335,6 +341,9 @@ const whReadParams = Type.Object({
     Type.String({ description: "Case-insensitive substring filter for list_data paths" }),
   ),
   job_id: Type.Optional(Type.String({ description: "Job ID" })),
+  user_id: Type.Optional(Type.String({ description: "Usage owner user ID" })),
+  before_event_id: Type.Optional(Type.String({ description: "Queue history pagination cursor" })),
+  limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200, description: "Queue history page size" })),
   origin_session_id: Type.Optional(
     Type.String({ description: "Child Pi session ID that originated the job" }),
   ),
@@ -359,6 +368,8 @@ const whDispatchParams = Type.Object({
     "stop_job",
     "enqueue",
     "update_queued_job",
+    "preview_queue_move",
+    "move_queued_job",
     "add_tunnel",
     "remove_tunnel",
     "workers_prune",
@@ -400,24 +411,31 @@ const whDispatchParams = Type.Object({
     description: "Block until command finishes, return stdout (exec action). Default: false",
   })),
   sync_timeout: Type.Optional(Type.Number({ description: "Timeout in seconds for sync mode (default 120)" })),
-  expected_seconds: Type.Optional(Type.Number({
+  expected_seconds: Type.Optional(Type.Integer({
     minimum: 1,
-    description: "Expected duration in seconds; scheduling information only",
+    description: "Required positive integer duration for exec/enqueue; scheduling information only",
   })),
-  gpu_count: Type.Optional(Type.Number({
+  gpu_count: Type.Optional(Type.Integer({
     minimum: 1,
-    description: "Number of GPUs requested (default 1 for enqueue)",
+    description: "Required positive integer GPUs for enqueue; forbidden for CPU-only exec",
   })),
-  position: Type.Optional(Type.Number({
-    minimum: 1,
-    description: "One-based pending queue position",
-  })),
+  priority: Type.Optional(StringEnum(["flexible", "normal", "blocking", "time_critical"])),
+  priority_note: Type.Optional(Type.String({ maxLength: 1000, description: "Required nonblank note for time_critical priority" })),
+  deadline_at: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+  update_status: Type.Optional({
+    ...StringEnum(["pending", "active"]),
+    description: "Required for update_queued_job: pending updates queue metadata; active updates starting/running duration, priority, note, deadline only. Never reorders.",
+  }),
+  before_job_id: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  expected_revision: Type.Optional(Type.Integer({ minimum: 0, description: "Queue revision from a freshly fetched board" })),
+  reason: Type.Optional(Type.String({ minLength: 1, maxLength: 1000, description: "Human reason for previewing a queue move" })),
+  preview_id: Type.Optional(Type.String({ description: "Preview to commit; after 409 re-fetch queue and re-preview, never blind-retry" })),
   // stop_job / remove_tunnel
   job_id: Type.Optional(Type.String({ description: "Job ID" })),
   tunnel_id: Type.Optional(Type.String({ description: "Tunnel ID" })),
   // add_tunnel
-  local_port: Type.Optional(Type.Number({ description: "Local port" })),
-  remote_port: Type.Optional(Type.Number({ description: "Remote worker port" })),
+  local_port: Type.Optional(Type.Number({ minimum: 1024, maximum: 65535, description: "Raw TCP listener port on trusted Tailnet. Target service must authenticate." })),
+  remote_port: Type.Optional(Type.Number({ minimum: 1, maximum: 65535, description: "Remote worker service port; authentication is the service owner's responsibility" })),
   // workers_prune
   minutes: Type.Optional(
     Type.Number({ description: "Stale worker threshold in minutes (default 5)" }),
@@ -477,6 +495,8 @@ export function registerGroupedTools(
     "list_jobs",
     "list_queue",
     "get_job_logs",
+    "get_usage",
+    "get_queue_history",
   ];
   const computeDispatchActions = [
     "data_copy",
@@ -484,6 +504,8 @@ export function registerGroupedTools(
     "stop_job",
     "enqueue",
     "update_queued_job",
+    "preview_queue_move",
+    "move_queued_job",
     "list_marimo",
     "get_marimo",
     "start_marimo",
@@ -520,29 +542,16 @@ export function registerGroupedTools(
     dispatchDescription =
       "Run compute or managed Marimo sessions, or contact this task's project manager. A task agent works only in its allocated worktree, never pushes, and never opens a pull request.";
   } else if (role === "") {
-    readActions = [...computeReadActions, "list_tunnels", "pi_sessions"];
+    readActions = [...computeReadActions, "list_tunnels"];
     dispatchActions = [
-      "data_copy",
-      "exec",
-      "stop_job",
-      "enqueue",
-      "update_queued_job",
-      "add_tunnel",
-      "remove_tunnel",
-      "workers_prune",
-      "upload_file",
-      "download_file",
-      "grant_git_access",
-      "list_marimo",
-      "get_marimo",
-      "start_marimo",
-      "stop_marimo",
-      "execute_marimo",
+      "exec", "enqueue", "update_queued_job", "preview_queue_move", "move_queued_job",
+      "stop_job", "add_tunnel", "remove_tunnel",
+      "list_marimo", "get_marimo", "start_marimo", "stop_marimo", "execute_marimo",
     ];
     readDescription =
       "Token-efficient read-only Worker Harness inspection. Inspect list_queue before scheduling GPU work and use the narrowest action.";
     dispatchDescription =
-      "Mutating and capability-bearing Worker Harness operations for jobs, tunnels, file transfer, git access, pruning, data copy, and managed Marimo. Use wh_read for inspection and never invoke the Worker Harness CLI or API directly.";
+      "Owner-scoped CPU jobs, scheduled GPU work, queue moves, tunnels and managed Marimo. Raw TCP forwards are reachable by anyone on the trusted Tailnet: the target service must authenticate. Use wh_read for inspection; never invoke the Worker Harness CLI/API directly.";
   } else {
     console.warn(`[pi-worker-harness] Unknown WH_SESSION_ROLE ${JSON.stringify(role)}; grouped tools disabled`);
     return;
@@ -553,16 +562,26 @@ export function registerGroupedTools(
     : "wh_read (RO): inspect list_queue before scheduling GPU work; use available_gpus for telemetry availability; list_workers only for fleet overview; get_worker only for one chosen worker; list_data(query) for shallow /data/shared, /data/local, and /code discovery. Filter list_jobs/logs. Never invoke the wh CLI/API directly.";
   const dispatchPromptSnippet = role === "orchestrator"
     ? "wh_dispatch: use pm_send to route a request to exactly one configured project's manager."
-    : "wh_dispatch (RW/capability): inspect wh_read list_queue, then enqueue scheduled GPU work; exec bypasses the queue only for short setup, diagnosis, or non-GPU commands, and before immediate GPU work call wh_read available_gpus once and use its full worker ID. Do not alter another agent's job without explicit user direction. Before data_copy call wh_read list_data with a known query. Use only wh_dispatch for managed Marimo list/get/start/stop/execute; no browser is needed to execute. Never invoke the wh CLI/API directly.";
+    : "wh_dispatch: inspect wh_read list_queue before enqueueing GPU work. exec is CPU/setup only (no gpu_count); both require name and expected_seconds, and enqueue requires positive gpu_count. Queue moves require preview then commit; after any 409 re-fetch and re-preview, never blind-retry. Priority/deadline never reorder. Raw TCP tunnels are reachable by anyone on the trusted Tailnet; target-service authentication is your responsibility. Use wh_dispatch for all five managed Marimo actions. Never invoke the wh CLI/API directly.";
 
+  const readProperties = { ...whReadParams.properties };
+  if (role === "") delete (readProperties as Record<string, unknown>).origin_session_id;
+  const dispatchProperties = { ...whDispatchParams.properties };
+  if (role === "") {
+    for (const field of [
+      "src_worker", "src_path", "dst_worker", "dst_path", "ttl_seconds",
+      "minutes", "path", "content_b64", "max_bytes", "question", "note", "branch",
+      "briefing", "task_session_id", "text", "summary", "force", "project", "message", "repo",
+    ]) delete (dispatchProperties as Record<string, unknown>)[field];
+  }
   const roleReadParams = Type.Object({
-    ...whReadParams.properties,
+    ...readProperties,
     action: StringEnum(readActions),
-  });
+  }, { additionalProperties: false });
   const roleDispatchParams = Type.Object({
-    ...whDispatchParams.properties,
+    ...dispatchProperties,
     action: StringEnum(dispatchActions),
-  });
+  }, { additionalProperties: false });
 
   pi.registerTool({
     name: "wh_read",
@@ -578,17 +597,12 @@ export function registerGroupedTools(
     },
     renderResult(result, _options, theme) {
       const details = result.details as {
-        workers?: Worker[];
-        jobs?: QueuedJob[];
-        queue?: boolean;
+        workers?: PublicWorker[];
+        queue?: QueueBoard;
         data?: DataCatalog;
       } | undefined;
-      if (details?.queue && Array.isArray(details.workers) && Array.isArray(details.jobs)) {
-        return new Text(
-          formatQueueOverview(details.workers, details.jobs, Math.floor(Date.now() / 1000)),
-          0,
-          0,
-        );
+      if (details?.queue) {
+        return new Text(formatQueueOverview(details.queue), 0, 0);
       }
       if (Array.isArray(details?.workers)) {
         return new Text(buildWorkerList(details.workers, theme), 0, 0);
@@ -650,6 +664,7 @@ export function registerGroupedTools(
             };
           }
           case "list_jobs": {
+            if (role === "" && origin_session_id !== undefined) throw new Error("origin_session_id is internal-only");
             const jobs = await listJobs({ worker_id, status, origin_session_id });
             return {
               content: [{ type: "text", text: JSON.stringify(jobs, null, 2) }],
@@ -657,20 +672,31 @@ export function registerGroupedTools(
             };
           }
           case "list_queue": {
-            const [workers, jobs] = await Promise.all([
-              listWorkers(),
-              listQueue(worker_id),
-            ]);
+            const queue = await listQueue(worker_id);
             return {
-              content: [{
-                type: "text",
-                text: formatQueueOverview(workers, jobs, Math.floor(Date.now() / 1000)),
-              }],
-              details: { workers, jobs, queue: true },
+              content: [{ type: "text", text: formatQueueOverview(queue) }],
+              details: { queue },
+            };
+          }
+          case "get_usage": {
+            const usage = await getUsage({ worker_id, user_id: params.user_id });
+            return {
+              content: [{ type: "text", text: `${JSON.stringify(usage, null, 2)}\nAllocated wall/GPU time, not utilization or quota.` }],
+              details: { usage },
+            };
+          }
+          case "get_queue_history": {
+            const history = await getQueueHistory({
+              worker_id, job_id, before_event_id: params.before_event_id, limit: params.limit,
+            });
+            return {
+              content: [{ type: "text", text: JSON.stringify(history, null, 2) }],
+              details: { history },
             };
           }
           case "get_job_logs": {
             const id = requireField(job_id, "job_id");
+            const credentialIdentity = getCredentialIdentity();
             if (follow) {
               if (head !== undefined) {
                 throw new Error("head is not supported in follow mode");
@@ -691,10 +717,15 @@ export function registerGroupedTools(
                 tail: tail ?? 50,
                 pollSeconds: 1,
                 onLine: (line) => {
+                  if (getCredentialIdentity() !== credentialIdentity) {
+                    timeoutController.abort();
+                    sub.stop();
+                    return;
+                  }
                   lines.push(line);
                   onUpdate?.({ content: [{ type: "text", text: line + "\n" }] });
                   if (line.trim()) {
-                    events.emit("worker-harness:log-line", { job_id: id, line });
+                    events.emit("worker-harness:log-line", { job_id: id, line, credentialIdentity });
                   }
                 },
               });
@@ -715,6 +746,7 @@ export function registerGroupedTools(
                 sub.stop();
               }
 
+              if (getCredentialIdentity() !== credentialIdentity) throw new Error("Credentials changed while following job logs; discarded old identity output");
               return {
                 content: [
                   {
@@ -727,6 +759,7 @@ export function registerGroupedTools(
             }
 
             const logs = await getJobLogs(id, { tail, head });
+            if (getCredentialIdentity() !== credentialIdentity) throw new Error("Credentials changed while fetching job logs; discarded old identity output");
             const text = typeof logs.logs === "string" ? logs.logs : JSON.stringify(logs, null, 2);
             return {
               content: [{ type: "text", text }],
@@ -800,7 +833,14 @@ export function registerGroupedTools(
         sync_timeout,
         expected_seconds,
         gpu_count,
-        position,
+        priority,
+        priority_note,
+        deadline_at,
+        update_status,
+        before_job_id,
+        expected_revision,
+        reason,
+        preview_id,
         repo,
         marimo_session_id,
         notebook_path,
@@ -840,95 +880,118 @@ export function registerGroupedTools(
             };
           }
           case "exec": {
+            if (gpu_count !== undefined) throw new Error("exec is CPU-only; gpu_count is not allowed. Use enqueue for GPU work.");
+            validatePriority(params);
             const resolvedWorkerId = requireField(worker_id, "worker_id");
             const resolvedCommand = requireField(command, "command");
+            const credentialIdentity = getCredentialIdentity();
             const job = await startJob({
               worker_id: resolvedWorkerId,
               command: resolvedCommand,
-              name,
+              name: nonblank(name, "name"),
+              expected_seconds: positiveInteger(expected_seconds, "expected_seconds"),
+              priority, priority_note, deadline_at,
               no_pty,
               sync,
               sync_timeout,
             });
-            events.emit("worker-harness:job-started", { job });
+            if (getCredentialIdentity() !== credentialIdentity) throw new Error("Credentials changed while starting the job; discarded old identity output");
+            events.emit("worker-harness:job-started", { job, credentialIdentity });
             events.emit("worker-harness:refresh", undefined);
 
             // Sync mode: return the command output directly
             if (sync && job.stdout !== undefined) {
               const text =
                 job.status === "done"
-                  ? job.stdout || "(no output)"
-                  : `[${job.status}] ${job.stdout}`.trim();
+                  ? `${job.stdout || "(no output)"}\n${formatOwnedJob(job)}`
+                  : `[${job.status}] ${job.stdout}\n${formatOwnedJob(job)}`.trim();
               return {
                 content: [{ type: "text", text }],
                 details: { job },
               };
             }
 
-            // Resolve the worker name for a human-readable message. Best-effort:
-            // fall back to whatever the caller passed (name or id) so the message
-            // is still informative even if the lookup fails.
-            let workerLabel = resolvedWorkerId;
-            try {
-              const worker = await getWorker(resolvedWorkerId);
-              workerLabel = worker.name || resolvedWorkerId;
-            } catch {
-              /* keep fallback */
-            }
-
             return {
               content: [
                 {
                   type: "text",
-                  text: `Job started: ${job.id} on ${workerLabel}\nSession: ${job.tmux_session}`,
+                  text: `Job started: ${formatOwnedJob(job)}`,
                 },
               ],
               details: { job },
             };
           }
           case "enqueue": {
+            validatePriority(params);
             const job = await enqueueJob({
               worker_id: requireField(worker_id, "worker_id"),
               command: requireField(command, "command"),
-              name: requireField(name, "name"),
-              expected_seconds: requireField(expected_seconds, "expected_seconds"),
-              gpu_count: gpu_count ?? 1,
+              name: nonblank(name, "name"),
+              expected_seconds: positiveInteger(expected_seconds, "expected_seconds"),
+              gpu_count: positiveInteger(gpu_count, "gpu_count"),
+              priority, priority_note, deadline_at,
               no_pty,
             });
             events.emit("worker-harness:refresh", undefined);
             return {
               content: [{
                 type: "text",
-                text: `Job queued: ${job.id} (${job.name}) on ${job.worker_id} [${job.status}]`,
+                text: `Job queued: ${formatOwnedJob(job)}`,
               }],
               details: { job },
             };
           }
           case "update_queued_job": {
             const resolvedJobId = requireField(job_id, "job_id");
-            if (
-              worker_id === undefined
-              && position === undefined
-              && name === undefined
-              && expected_seconds === undefined
-              && gpu_count === undefined
-            ) {
-              throw new Error("update_queued_job requires at least one queue field");
+            if ("position" in params) throw new Error("position is not supported; use preview_queue_move then move_queued_job");
+            if (update_status !== "pending" && update_status !== "active") throw new Error("update_queued_job requires update_status pending or active");
+            validatePriority(params);
+            if (expected_seconds !== undefined) positiveInteger(expected_seconds, "expected_seconds");
+            if (gpu_count !== undefined) positiveInteger(gpu_count, "gpu_count");
+            if (name !== undefined) nonblank(name, "name");
+            if (update_status === "active" && (worker_id !== undefined || name !== undefined || gpu_count !== undefined)) {
+              throw new Error("Active updates allow only expected_seconds, priority, priority_note and deadline_at");
             }
-            const job = await updateQueuedJob(resolvedJobId, {
-              worker_id,
-              position,
-              name,
-              expected_seconds,
-              gpu_count,
-            });
+            if ([worker_id, name, expected_seconds, gpu_count, priority, priority_note, deadline_at].every((value) => value === undefined)) {
+              throw new Error("update_queued_job requires at least one metadata field");
+            }
+            const metadata = { expected_seconds, priority, priority_note, deadline_at };
+            const job = update_status === "active"
+              ? await updateJob(resolvedJobId, metadata)
+              : await updateQueuedJob(resolvedJobId, { ...metadata, worker_id, name, gpu_count });
             events.emit("worker-harness:refresh", undefined);
             return {
               content: [{
                 type: "text",
-                text: `Queued job updated: ${job.id} (${job.name}) on ${job.worker_id} [${job.status}]`,
+                text: `Job updated: ${formatOwnedJob(job)}`,
               }],
               details: { job },
+            };
+          }
+          case "preview_queue_move": {
+            const revision = requireField(expected_revision, "expected_revision");
+            if (!Number.isInteger(revision) || revision < 0) throw new Error("expected_revision must be a nonnegative integer");
+            if (before_job_id === undefined) throw new Error("before_job_id is required; use null to move to the end");
+            const trimmedReason = nonblank(reason, "reason");
+            if (trimmedReason.length > 1000) throw new Error("reason must be at most 1000 characters");
+            const preview = await previewQueueMove(requireField(job_id, "job_id"), {
+              before_job_id, expected_revision: revision, reason: trimmedReason,
+            });
+            return {
+              content: [{ type: "text", text: JSON.stringify(preview, null, 2) }],
+              details: { preview },
+            };
+          }
+          case "move_queued_job": {
+            const revision = requireField(expected_revision, "expected_revision");
+            if (!Number.isInteger(revision) || revision < 0) throw new Error("expected_revision must be a nonnegative integer");
+            const result = await moveQueueJob(requireField(job_id, "job_id"), {
+              preview_id: nonblank(preview_id, "preview_id"), expected_revision: revision,
+            });
+            events.emit("worker-harness:refresh", undefined);
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+              details: result,
             };
           }
           case "stop_job": {
@@ -940,7 +1003,7 @@ export function registerGroupedTools(
                 {
                   type: "text",
                   text: result.stopped
-                    ? `Job stopped: ${resolvedJobId}`
+                    ? `Job stopped: ${resolvedJobId} | status=${result.status} | execution_state=${result.execution_state}`
                     : `Failed to stop job: ${resolvedJobId}`,
                 },
               ],
@@ -971,9 +1034,10 @@ export function registerGroupedTools(
                 {
                   type: "text",
                   text:
-                    `Tunnel started: localhost:${tunnel.local_port} → ${tunnel.worker_name ?? tunnel.worker_id}:${tunnel.remote_port}\n` +
-                    `Service: ${tunnel.service_name} (PID: ${tunnel.pid})\n` +
-                    `Access: ${orchestratorHost}:${tunnel.local_port}`,
+                    `Tunnel started: ${tunnel.bind_host}:${tunnel.local_port} → ${tunnel.worker_name ?? tunnel.worker_id}:${tunnel.remote_port}\n` +
+                    `Tunnel ID: ${tunnel.id}\n` +
+                    `Service: ${tunnel.service_name}\n` +
+                    `Access: ${orchestratorHost}:${tunnel.local_port}\nRaw TCP is reachable by anyone on the trusted Tailnet. The target service must authenticate; this is your responsibility.`,
                 },
               ],
               details: { tunnel, access: { orchestrator_url: orchestratorUrl, host: orchestratorHost, port: tunnel.local_port } },
@@ -1343,6 +1407,9 @@ export function registerGroupedTools(
             throw new Error(`Unknown action: ${String(action)}`);
         }
       } catch (err) {
+        if (err instanceof ApiError && err.status === 409 && (action === "preview_queue_move" || action === "move_queued_job")) {
+          throw new Error(`${err.message}. Re-fetch list_queue and re-preview the move before committing; never blind-retry.`);
+        }
         throw toToolError(err);
       }
     },

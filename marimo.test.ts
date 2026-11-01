@@ -12,12 +12,13 @@ import type { MarimoSession } from "./types.ts";
 
 const originalFetch = globalThis.fetch;
 const originalOrchestratorUrl = getOrchestratorUrl();
-const environmentKeys = ["WH_ORCHESTRATOR_URL", "WH_SESSION_TOKEN", "WH_SESSION_ROLE", "WH_OPERATOR_TOKEN", "WH_OPERATOR_TOKEN_FILE"];
+const environmentKeys = ["WH_ORCHESTRATOR_URL", "WH_SESSION_TOKEN", "WH_SESSION_ROLE", "WH_API_KEY", "WH_API_KEY_FILE"];
 const originalEnvironment = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
 
 beforeEach(() => {
   for (const key of environmentKeys) delete process.env[key];
   setOrchestratorUrl("http://orchestrator.test");
+  process.env.WH_API_KEY = "whk_marimo_test";
 });
 
 afterEach(() => {
@@ -37,11 +38,8 @@ function lifecycleSession(patch: Partial<MarimoSession> = {}): MarimoSession {
     notebook_path: "/code/notebook.py",
     environment: "/usr/bin/python3",
     job_id: "job-1",
-    tunnel_id: "tunnel-1",
-    local_port: 18001,
-    remote_port: 18002,
-    bind_host: "100.64.0.8",
-    url: "http://100.64.0.8:18001/",
+    owner_user_id: "user-1",
+    url: "https://browser.test/api/v1/marimo/managed-1/proxy/",
     status: "ready",
     created_at: 1,
     ...patch,
@@ -105,6 +103,9 @@ test("lifecycle helpers preserve exact orchestrator methods, encoding, query, an
     environment: "/usr/bin/python3",
     ready_timeout: 75,
   });
+  for (const { init } of calls) {
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer whk_marimo_test");
+  }
 });
 
 test("execution resolves the browser kernel on every call and follows reconnects", async () => {
@@ -126,14 +127,88 @@ test("execution resolves the browser kernel on every call and follows reconnects
   expect(first.kernel_session_id).toBe("kernel-old");
   expect(second.kernel_session_id).toBe("kernel-new");
   expect(requests.map(({ url }) => url)).toEqual([
-    "http://100.64.0.8:18001/api/sessions",
-    "http://100.64.0.8:18001/api/kernel/execute",
-    "http://100.64.0.8:18001/api/sessions",
-    "http://100.64.0.8:18001/api/kernel/execute",
+    "http://orchestrator.test/api/v1/marimo/managed-1/proxy/api/sessions",
+    "http://orchestrator.test/api/v1/marimo/managed-1/proxy/api/kernel/execute",
+    "http://orchestrator.test/api/v1/marimo/managed-1/proxy/api/sessions",
+    "http://orchestrator.test/api/v1/marimo/managed-1/proxy/api/kernel/execute",
   ]);
   expect(new Headers(requests[1].init?.headers).get("Marimo-Session-Id")).toBe("kernel-old");
   expect(new Headers(requests[3].init?.headers).get("Marimo-Session-Id")).toBe("kernel-new");
   expect(requests[3].init?.body).toBe(JSON.stringify({ code: "2" }));
+});
+
+test("credential changes re-discover the kernel and authenticate with the new identity", async () => {
+  const requests: Array<{ url: string; authorization: string | null }> = [];
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    const authorization = new Headers(init?.headers).get("Authorization");
+    requests.push({ url, authorization });
+    if (url.endsWith("/api/sessions")) {
+      const kernelId = authorization === "Bearer whk_marimo_test" ? "kernel-first" : "kernel-second";
+      return jsonResponse({ [kernelId]: { path: "/code/notebook.py" } });
+    }
+    return successfulStream();
+  }) as typeof fetch;
+  const session = lifecycleSession({ url: "https://hostile.test/steal-api-key" });
+
+  expect((await executeMarimoCode(session, "1")).kernel_session_id).toBe("kernel-first");
+  process.env.WH_API_KEY = "whk_rotated_identity";
+  expect((await executeMarimoCode(session, "2")).kernel_session_id).toBe("kernel-second");
+
+  expect(requests.map(({ authorization }) => authorization)).toEqual([
+    "Bearer whk_marimo_test",
+    "Bearer whk_marimo_test",
+    "Bearer whk_rotated_identity",
+    "Bearer whk_rotated_identity",
+  ]);
+  expect(requests.every(({ url }) =>
+    url.startsWith("http://orchestrator.test/api/v1/marimo/managed-1/proxy/")
+  )).toBe(true);
+});
+
+test("internal session credentials authenticate proxy requests instead of the human API key", async () => {
+  process.env.WH_SESSION_ROLE = "task";
+  process.env.WH_SESSION_TOKEN = "session-token";
+  const authorization: Array<string | null> = [];
+  globalThis.fetch = (async (input, init) => {
+    authorization.push(new Headers(init?.headers).get("Authorization"));
+    return String(input).endsWith("/api/sessions")
+      ? jsonResponse({ kernel: { path: "/code/notebook.py" } })
+      : successfulStream();
+  }) as typeof fetch;
+
+  await executeMarimoCode(lifecycleSession(), "1");
+  expect(authorization).toEqual(["Bearer session-token", "Bearer session-token"]);
+});
+
+test("aborting the caller interrupts the authenticated kernel attach stream", async () => {
+  const caller = new AbortController();
+  let attachSignal: AbortSignal | null | undefined;
+  let executed = false;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/api/sessions")) return jsonResponse({});
+    if (url.includes("/sse?")) {
+      expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer whk_marimo_test");
+      attachSignal = init?.signal;
+      return new Response(new ReadableStream({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => {
+            controller.error(new DOMException("attach cancelled", "AbortError"));
+          }, { once: true });
+          queueMicrotask(() => caller.abort());
+        },
+      }), { headers: { "Content-Type": "text/event-stream" } });
+    }
+    executed = true;
+    return successfulStream();
+  }) as typeof fetch;
+
+  await expect(executeMarimoCode(lifecycleSession(), "1", {
+    signal: caller.signal,
+  })).rejects.toThrow("attach cancelled");
+  expect(attachSignal?.aborted).toBe(true);
+  expect(executed).toBe(false);
 });
 
 test("fragmented CRLF and LF events keep stdout, stderr, callbacks, and final output separate", async () => {
@@ -177,12 +252,14 @@ test.each([
   await expect(executeMarimoCode(lifecycleSession(), "1")).rejects.toThrow(message);
 });
 
-test("a notebook nobody opened gets a kernel created headlessly, then executes in it", async () => {
-  const calls: string[] = [];
+test("headless discovery, attach, and execution use authenticated configured proxy, never session.url", async () => {
+  process.env.WH_ORCHESTRATOR_URL = "https://configured.test/base/";
+  const proxyBase = "https://configured.test/base/api/v1/marimo/managed%2Fone%3F%23/proxy";
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
   let executeSessionHeader: string | null = null;
   globalThis.fetch = (async (input, init) => {
     const url = String(input);
-    calls.push(url);
+    calls.push({ url, init });
     if (url.endsWith("/api/sessions")) return jsonResponse({});
     if (url.includes("/sse?")) {
       return streamResponse([`data: ${JSON.stringify({ op: "kernel-ready", data: {} })}\n\n`]);
@@ -191,14 +268,28 @@ test("a notebook nobody opened gets a kernel created headlessly, then executes i
     return successfulStream("ok");
   }) as typeof fetch;
 
-  const result = await executeMarimoCode(lifecycleSession(), "1");
+  const controller = new AbortController();
+  const result = await executeMarimoCode(lifecycleSession({
+    id: "managed/one?#",
+    url: "https://hostile.test/steal-api-key",
+  }), "1", { signal: controller.signal });
 
-  const attach = new URL(calls[1]);
-  expect(attach.pathname).toBe("/sse");
+  expect(calls).toHaveLength(3);
+  expect(calls[0].url).toBe(`${proxyBase}/api/sessions`);
+  const attach = new URL(calls[1].url);
+  expect(`${attach.origin}${attach.pathname}`).toBe(`${proxyBase}/sse`);
   expect(attach.searchParams.get("file")).toBe("/code/notebook.py");
   const createdId = attach.searchParams.get("session_id")!;
   expect(createdId).toMatch(/^s_wh[0-9a-f]{12}$/);
-  expect(calls[2]).toBe("http://100.64.0.8:18001/api/kernel/execute");
+  expect(calls[2].url).toBe(`${proxyBase}/api/kernel/execute`);
+  for (const { url, init } of calls) {
+    expect(url.startsWith(`${proxyBase}/`)).toBe(true);
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer whk_marimo_test");
+  }
+  expect(new Headers(calls[1].init?.headers).get("Accept")).toBe("text/event-stream");
+  expect(calls[0].init?.signal).toBe(controller.signal);
+  expect(calls[2].init?.signal).toBe(controller.signal);
+  expect(calls[1].init?.signal?.aborted).toBe(true);
   expect(executeSessionHeader).toBe(createdId);
   expect(result.kernel_session_id).toBe(createdId);
   expect(result.output).toBe("ok");
@@ -342,12 +433,12 @@ test("done success false fails with captured stdout and stderr", async () => {
   );
 });
 
-test("network and abort failures name the Tailnet URL", async () => {
+test("network and abort failures name the configured proxy, not the browser link", async () => {
   globalThis.fetch = (async () => {
     throw new DOMException("cancelled", "AbortError");
   }) as typeof fetch;
   await expect(executeMarimoCode(lifecycleSession(), "1")).rejects.toThrow(
-    "Failed to reach Marimo Tailnet URL http://100.64.0.8:18001: cancelled",
+    "Failed to reach Marimo proxy http://orchestrator.test/api/v1/marimo/managed-1/proxy: cancelled",
   );
 });
 

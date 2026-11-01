@@ -1,3 +1,4 @@
+import { getAuthorizationHeaders, getOrchestratorUrl } from "./api.ts";
 import { streamTextLines } from "./sse.ts";
 import type {
   MarimoExecutionResult,
@@ -12,6 +13,11 @@ export interface MarimoExecutionOptions {
 }
 
 type SessionMap = Record<string, MarimoKernelSession>;
+
+/** The browser link is display-only; credentials only go to our configured API. */
+function getMarimoProxyBaseUrl(session: MarimoSession): string {
+  return `${getOrchestratorUrl()}/api/v1/marimo/${encodeURIComponent(session.id)}/proxy`;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -67,15 +73,19 @@ function findKernelSession(sessions: SessionMap, lifecycle: MarimoSession): stri
 }
 
 async function fetchKernelSessions(
-  baseUrl: string,
+  lifecycle: MarimoSession,
   signal: AbortSignal | undefined,
 ): Promise<SessionMap> {
+  const baseUrl = getMarimoProxyBaseUrl(lifecycle);
   const sessionsUrl = `${baseUrl}/api/sessions`;
   let response: Response;
   try {
-    response = await fetch(sessionsUrl, { signal });
+    response = await fetch(sessionsUrl, {
+      headers: await getAuthorizationHeaders(),
+      signal,
+    });
   } catch (error) {
-    throw new Error(`Failed to reach Marimo Tailnet URL ${baseUrl}: ${errorMessage(error)}`);
+    throw new Error(`Failed to reach Marimo proxy ${baseUrl}: ${errorMessage(error)}`);
   }
   if (!response.ok) {
     const detail = await describeHttpError(response);
@@ -101,10 +111,10 @@ async function fetchKernelSessions(
  * the notebook.
  */
 async function createKernelSession(
-  baseUrl: string,
   lifecycle: MarimoSession,
   signal: AbortSignal | undefined,
 ): Promise<string> {
+  const baseUrl = getMarimoProxyBaseUrl(lifecycle);
   const kernelSessionId = `s_wh${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const attachUrl = `${baseUrl}/sse?session_id=${encodeURIComponent(kernelSessionId)}` +
     `&file=${encodeURIComponent(lifecycle.notebook_path)}`;
@@ -117,11 +127,11 @@ async function createKernelSession(
     let response: Response;
     try {
       response = await fetch(attachUrl, {
-        headers: { Accept: "text/event-stream" },
+        headers: { ...await getAuthorizationHeaders(), Accept: "text/event-stream" },
         signal: controller.signal,
       });
     } catch (error) {
-      throw new Error(`Failed to reach Marimo Tailnet URL ${baseUrl}: ${errorMessage(error)}`);
+      throw new Error(`Failed to reach Marimo proxy ${baseUrl}: ${errorMessage(error)}`);
     }
     if (!response.ok) {
       const detail = await describeHttpError(response);
@@ -200,10 +210,9 @@ export async function ensureKernelSession(
   if (session.status !== "ready") {
     throw new Error(`Marimo session ${session.id} is stopped`);
   }
-  const baseUrl = session.url.replace(/\/+$/, "");
-  const existing = findKernelSession(await fetchKernelSessions(baseUrl, options.signal), session);
+  const existing = findKernelSession(await fetchKernelSessions(session, options.signal), session);
   if (existing !== null) return { id: existing, created: false };
-  return { id: await createKernelSession(baseUrl, session, options.signal), created: true };
+  return { id: await createKernelSession(session, options.signal), created: true };
 }
 
 function withCapturedOutput(message: string, stdout: string, stderr: string): string {
@@ -218,16 +227,17 @@ export async function executeMarimoCode(
   code: string,
   options: MarimoExecutionOptions = {},
 ): Promise<MarimoExecutionResult> {
-  const baseUrl = session.url.replace(/\/+$/, "");
   const kernel = await ensureKernelSession(session, { signal: options.signal });
   const kernelSessionId = kernel.id;
 
+  const baseUrl = getMarimoProxyBaseUrl(session);
   const executeUrl = `${baseUrl}/api/kernel/execute`;
   let executeResponse: Response;
   try {
     executeResponse = await fetch(executeUrl, {
       method: "POST",
       headers: {
+        ...await getAuthorizationHeaders(),
         "Content-Type": "application/json",
         Accept: "text/event-stream",
         "Marimo-Session-Id": kernelSessionId,
@@ -236,7 +246,7 @@ export async function executeMarimoCode(
       signal: options.signal,
     });
   } catch (error) {
-    throw new Error(`Failed to reach Marimo Tailnet URL ${baseUrl}: ${errorMessage(error)}`);
+    throw new Error(`Failed to reach Marimo proxy ${baseUrl}: ${errorMessage(error)}`);
   }
   if (!executeResponse.ok) {
     const detail = await describeHttpError(executeResponse);

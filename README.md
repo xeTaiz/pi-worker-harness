@@ -39,11 +39,14 @@ The extension uses HTTP endpoints (not CLI subprocesses).
 - `WH_ORCHESTRATOR_URL` overrides the persisted default and runtime URL command.
   API calls, bridge registration/events/command polling/acknowledgements, and log
   streams all use this same normalized base URL.
-- Ordinary operator authentication: `WH_OPERATOR_TOKEN`, or a UTF-8 bearer file
-  named by `WH_OPERATOR_TOKEN_FILE`. Keep the file outside agent-readable roots.
-  Fleet roles use `WH_SESSION_TOKEN` and never fall back to operator credentials.
-  Unauthenticated ordinary sessions only work against an explicitly unconfigured
-  development server; a configured fleet requires an operator credential.
+- Ordinary authentication: `WH_API_KEY`, or a UTF-8 bearer file named by
+  `WH_API_KEY_FILE` (environment key wins). Obtain a personal key from the web UI.
+  Keep credentials outside agent-readable roots; missing credentials fail closed.
+- Internal roles (`WH_SESSION_ROLE=orchestrator|pm|task`) require
+  `WH_SESSION_TOKEN` and never fall back to a human key. Only these sessions
+  register the Pi bridge/relay; ordinary keys never publish Pi discovery.
+- Private caches are cleared on credential changes. Credentials are not persisted
+  in extension configuration.
 - Persisted config file:
   - Pi: `~/.pi/worker-harness/config.json`
   - OMP: `~/.omp/worker-harness/config.json`
@@ -59,17 +62,33 @@ Actions outside `WH_SESSION_ROLE` are omitted at registration and rejected by
 execution handlers. Unknown roles register no harness tools. All Worker Harness
 HTTP requests carry the selected bearer, including bridge traffic and log streams.
 
-### Normal operator session (`WH_SESSION_ROLE` unset)
+### Ordinary API-key session (`WH_SESSION_ROLE` unset)
 
 - `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
   `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`, `get_job_logs`,
-  `list_tunnels`, `pi_sessions`
-- `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
-  `update_queued_job`, `add_tunnel`, `remove_tunnel`, `workers_prune`,
-  `upload_file`, `download_file`, `grant_git_access`, `list_marimo`,
+  `get_usage`, `get_queue_history`, `list_tunnels`
+- `wh_dispatch`: `exec`, `enqueue`, `update_queued_job`, `preview_queue_move`,
+  `move_queued_job`, `stop_job`, `add_tunnel`, `remove_tunnel`, `list_marimo`,
   `get_marimo`, `start_marimo`, `stop_marimo`, `execute_marimo`
-- Administration: `wh_admin_deploy_image`, `wh_admin_deploy_status`,
-  `wh_admin_deploy_cancel`, `wh_admin_restart`
+
+API keys cannot administer workers/users/keys, transfer files, copy data, or
+access Pi sessions. An administrator's key has the same ordinary capabilities.
+Private jobs/logs, tunnels and notebooks are owner-only; shared queue rows
+contain public names, owners, priority, estimates and attributable delay history.
+
+`exec` is CPU-only and requires a public `name` and positive `expected_seconds`.
+`enqueue` additionally requires positive `gpu_count`. Priority, priority note
+and deadline annotate scheduling but never sort FIFO. `update_queued_job` requires
+`update_status=pending|active`: pending edits queue metadata, active edits only
+duration/priority/note/deadline of starting/running work. Neither reorders.
+Reordering requires a reason, preview, and explicit commit with its preview
+ID/revision. After a 409, re-list and re-preview rather than blind retry.
+Positive delays display rounded-up minutes; unknown timing stays explicit.
+Usage is allocated wall/GPU time, not utilization or quota.
+
+Raw TCP tunnels expose their destination service to the trusted Tailnet;
+the destination must provide authentication. Managed notebooks instead use the
+owner-authenticated proxy.
 
 ### Orchestrator
 
@@ -106,15 +125,14 @@ request; it asks or notifies its project manager when coordination is needed.
 
 ### Managed Marimo behavior
 
-Marimo list/get stays on `wh_dispatch` because responses contain a Tailnet URL
-for an unauthenticated notebook server capable of arbitrary Python execution.
-Managed startup returns a direct `100.64.0.0/10` Tailnet URL, attaches once to
-spawn the kernel, waits for `kernel-ready`, detaches, and runs saved cells.
-`execute_marimo` re-resolves the kernel on every call and directly reaches the
-returned notebook URL; it does not use an orchestrator execution proxy.
-
-The launcher uses `--no-token`; Tailnet reachability and Headscale ACLs are the
-Marimo access boundary.
+All five Marimo actions remain on `wh_dispatch` because they expose Python
+execution. Managed startup is CPU-only. GPU notebooks use queued GPU commands.
+Discovery, SSE attachment and execution go through the configured orchestrator's
+`/api/v1/marimo/<lifecycle-id>/proxy/` subtree with the current bearer on every
+request, never through the returned browser link as a transport authority.
+The private native token is managed by the server and is never returned to tools.
+Kernel lookup, saved-cell hydration, output streaming and cancellation are
+preserved; opening the returned browser link requires the owner's web login.
 
 ## UI
 
@@ -122,19 +140,23 @@ The orchestrator (and unknown roles) does not register the compute panel, widget
 or associated commands/shortcut.
 
 ### Status widget
-Pinned above editor. Tracks selected worker/job and updates from streamed log lines.
+Pinned below the editor so the native OMP context-window display remains unobstructed. Shows worker/job/GPU totals when no worker is selected; otherwise tracks the selected worker/job and streamed log lines.
 
 ### Panel (`/worker-harness`)
-Tabs: Workers / Jobs / Tunnels
+Tabs: Workers / Shared queue / My jobs / Tunnels / Marimo
 
 Key bindings:
 - `j` / `↓`: down
 - `k` / `↑`: up
 - tab switching: `Tab`, `Shift+Tab`, `h`/`l`, `←`/`→`, `w`/`b`
-- `f`: follow selected job logs (jobs tab); for finished jobs, loads recent saved logs instead of streaming
-- `s`: stop selected running job (jobs tab)
-- `n`: staged prompt flow on selected worker/job worker (workers/jobs tabs): command (required) → job name (optional) → start
+- Shared queue shows public owner/priority/ETA/delay metadata, never commands or logs.
+- `f`: follow an owned job's logs (My jobs); finished jobs load saved logs.
+- `s`: stop an owned job (My jobs), or stop the selected owned notebook (Marimo).
+- `n`: staged new-job form: command, required public name, positive duration,
+  CPU/GPU mode (CPU default), GPU count only for GPU mode
 - `t`: staged prompt flow on selected worker/job worker (workers/jobs tabs): remote port (required) → local port (optional, blank = random) → tunnel name (optional) → create
+- `d`: remove the selected generic tunnel (Tunnels).
+- `m`: create an owned CPU notebook (Marimo); `o`: open its authenticated browser link.
 - `r`: refresh
 - `q` / `Esc`: close panel
 

@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type {
   AddTunnelRequest,
   ApiErrorBody,
@@ -6,10 +7,14 @@ import type {
   DataPaths,
   FileTransferResult,
   EnqueueJobRequest,
-  Job,
+  OwnedJob,
   MarimoCreateRequest,
   MarimoSession,
-  QueuedJob,
+  QueueBoard,
+  QueuePreview,
+  QueueMoveResult,
+  QueueHistory,
+  UsageResult,
   PiSession,
   Project,
   JobLogsResult,
@@ -18,9 +23,9 @@ import type {
   StartJobRequest,
   StopJobResult,
   UpdateQueuedJobRequest,
+  UpdateJobRequest,
   Tunnel,
-  Worker,
-  WorkerDetail,
+  PublicWorker,
   WorkersPruneResult,
   WorkersSummary,
 } from "./types.ts";
@@ -49,7 +54,7 @@ let orchestratorUrl = "http://orchestrator.hs.d0me.xyz:12889";
 /** Bound a stalled HTTP connection. Server-side lanes prevent worker-level
  * starvation; this protects the agent from a dead/unreachable server itself. */
 const DEFAULT_API_TIMEOUT_MS = 30_000;
-const inFlightJobLists = new Map<string, Promise<Job[]>>();
+const inFlightJobLists = new Map<string, Promise<OwnedJob[]>>();
 
 export function getOrchestratorUrl(): string {
   return (process.env.WH_ORCHESTRATOR_URL?.trim() || orchestratorUrl).replace(/\/+$/, "");
@@ -59,15 +64,45 @@ export function setOrchestratorUrl(url: string): void {
   orchestratorUrl = url.trim().replace(/\/+$/, "");
 }
 
-/** Fleet sessions must never fall back to the operator's broader authority. */
-export async function getAuthorizationHeaders(): Promise<Record<string, string>> {
-  let token = process.env.WH_SESSION_TOKEN?.trim();
-  if (!token && !process.env.WH_SESSION_ROLE?.trim()) {
-    token = process.env.WH_OPERATOR_TOKEN?.trim();
-    const tokenFile = process.env.WH_OPERATOR_TOKEN_FILE?.trim();
-    if (!token && tokenFile) token = (await readFile(tokenFile, "utf8")).trim();
+/** Only explicit fleet roles may register Pi bridges and host relays. */
+export function isInternalSession(): boolean {
+  const role = process.env.WH_SESSION_ROLE?.trim();
+  return role === "orchestrator" || role === "pm" || role === "task";
+}
+
+export function assertInternalSessionToken(): void {
+  if (process.env.WH_SESSION_ROLE?.trim() && !isInternalSession()) {
+    throw new Error("WH_SESSION_ROLE must be orchestrator, pm, or task.");
   }
-  return token ? { Authorization: `Bearer ${token}` } : {};
+  if (isInternalSession() && !process.env.WH_SESSION_TOKEN?.trim()) {
+    throw new Error("WH_SESSION_TOKEN is required for internal Worker Harness sessions; human API keys are never a fallback.");
+  }
+}
+
+function getCredential(): string {
+  assertInternalSessionToken();
+  if (isInternalSession()) return process.env.WH_SESSION_TOKEN!.trim();
+  const key = process.env.WH_API_KEY?.trim();
+  if (key) return key;
+  const keyFile = process.env.WH_API_KEY_FILE?.trim();
+  const fileKey = keyFile ? readFileSync(keyFile, "utf8").trim() : "";
+  if (!fileKey) {
+    throw new Error("WH_API_KEY or a nonempty WH_API_KEY_FILE is required for Worker Harness requests.");
+  }
+  return fileKey;
+}
+
+/** Read on every call so rotating a key file also invalidates private caches. */
+export function getCredentialIdentity(): string {
+  return createHash("sha256")
+    .update(process.env.WH_SESSION_ROLE?.trim() || "user")
+    .update("\0")
+    .update(getCredential())
+    .digest("hex");
+}
+
+export async function getAuthorizationHeaders(): Promise<Record<string, string>> {
+  return { Authorization: `Bearer ${getCredential()}` };
 }
 
 async function parseErrorBody(res: Response): Promise<ApiErrorBody | null> {
@@ -152,9 +187,11 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     const body = await parseErrorBody(res);
     // FastAPI's HTTPException returns {"detail": "..."} (no nested "error"
     // object), so fall back to body.detail for both message and detail.
-    const errCode = body?.error?.code ?? "HTTP_ERROR";
-    const errMsg =
-      body?.error?.message ??
+    const codedDetail = body?.detail && typeof body.detail === "object"
+      ? body.detail as { code?: string; message?: string }
+      : undefined;
+    const errCode = body?.error?.code ?? codedDetail?.code ?? "HTTP_ERROR";
+    const errMsg = body?.error?.message ?? codedDetail?.message ??
       (typeof body?.detail === "string" ? body.detail : res.statusText);
     const errDetail = body?.error?.detail ?? body?.detail ?? null;
     throw new ApiError(res.status, errCode, errMsg, errDetail);
@@ -256,13 +293,13 @@ export async function removeMarimo(id: string): Promise<RemoveMarimoResponse> {
   });
 }
 
-export async function listWorkers(): Promise<Worker[]> {
-  return apiFetch<Worker[]>("/api/v1/workers");
+export async function listWorkers(): Promise<PublicWorker[]> {
+  return apiFetch<PublicWorker[]>("/api/v1/workers");
 }
 
-export async function getWorker(id: string): Promise<WorkerDetail> {
+export async function getWorker(id: string): Promise<PublicWorker> {
   const cleanId = unwrapDoubleStringified(id) as string;
-  return apiFetch<WorkerDetail>("/api/v1/workers/" + encodeURIComponent(cleanId));
+  return apiFetch<PublicWorker>("/api/v1/workers/" + encodeURIComponent(cleanId));
 }
 
 export async function pruneWorkers(minutes?: number): Promise<WorkersPruneResult> {
@@ -291,75 +328,110 @@ export async function copyData(params: {
   });
 }
 
-export async function startJob(params: StartJobRequest): Promise<Job> {
-  const body: Record<string, unknown> = {
-    worker_id: params.worker_id,
-    command: params.command,
-    no_pty: params.no_pty ?? false,
-  };
-  if (params.name) body.name = params.name;
-  if (params.sync) body.sync = true;
-  if (params.sync_timeout) body.sync_timeout = params.sync_timeout;
-  return apiFetch<Job>("/api/v1/jobs", { method: "POST", body: JSON.stringify(body) });
+export async function startJob(params: StartJobRequest): Promise<OwnedJob> {
+  const { worker_id, command, name, expected_seconds, priority, priority_note,
+    deadline_at, no_pty = false, sync, sync_timeout } = params;
+  return apiFetch<OwnedJob>("/api/v1/jobs", {
+    method: "POST",
+    body: JSON.stringify({ worker_id, command, name, expected_seconds, priority,
+      priority_note, deadline_at, no_pty, sync, sync_timeout }),
+  });
 }
 
-export async function listQueue(workerId?: string): Promise<QueuedJob[]> {
+export async function listQueue(workerId?: string): Promise<QueueBoard> {
   const cleanWorkerId = workerId === undefined
     ? undefined
     : unwrapDoubleStringified(workerId) as string;
   const query = cleanWorkerId
     ? "?worker_id=" + encodeURIComponent(cleanWorkerId)
     : "";
-  return apiFetch<QueuedJob[]>("/api/v1/jobs/queue" + query);
+  return apiFetch<QueueBoard>("/api/v1/jobs/queue" + query);
 }
 
-export async function enqueueJob(params: EnqueueJobRequest): Promise<Job> {
-  return apiFetch<Job>("/api/v1/jobs/queue", {
+export async function enqueueJob(params: EnqueueJobRequest): Promise<OwnedJob> {
+  const { worker_id, command, name, expected_seconds, gpu_count, priority,
+    priority_note, deadline_at, no_pty = false } = params;
+  return apiFetch<OwnedJob>("/api/v1/jobs/queue", {
     method: "POST",
-    body: JSON.stringify({
-      worker_id: params.worker_id,
-      command: params.command,
-      name: params.name,
-      expected_seconds: params.expected_seconds,
-      gpu_count: params.gpu_count ?? 1,
-      no_pty: params.no_pty ?? false,
-    }),
+    body: JSON.stringify({ worker_id, command, name, expected_seconds, gpu_count,
+      priority, priority_note, deadline_at, no_pty }),
   });
 }
 
 export async function updateQueuedJob(
   id: string,
   params: UpdateQueuedJobRequest,
-): Promise<QueuedJob> {
+): Promise<OwnedJob> {
   const cleanId = unwrapDoubleStringified(id) as string;
-  const body: Record<string, unknown> = {};
-  if (params.worker_id !== undefined) body.worker_id = params.worker_id;
-  if (params.position !== undefined) body.position = params.position;
-  if (params.name !== undefined) body.name = params.name;
-  if (params.expected_seconds !== undefined) body.expected_seconds = params.expected_seconds;
-  if (params.gpu_count !== undefined) body.gpu_count = params.gpu_count;
-  return apiFetch<QueuedJob>(
+  const { worker_id, name, expected_seconds, gpu_count, priority, priority_note, deadline_at } = params;
+  return apiFetch<OwnedJob>(
     "/api/v1/jobs/" + encodeURIComponent(cleanId) + "/queue",
-    { method: "PATCH", body: JSON.stringify(body) },
+    { method: "PATCH", body: JSON.stringify({ worker_id, name, expected_seconds,
+      gpu_count, priority, priority_note, deadline_at }) },
   );
+}
+
+export async function updateJob(id: string, params: UpdateJobRequest): Promise<OwnedJob> {
+  const { expected_seconds, priority, priority_note, deadline_at } = params;
+  return apiFetch<OwnedJob>("/api/v1/jobs/" + encodeURIComponent(unwrapDoubleStringified(id) as string), {
+    method: "PATCH", body: JSON.stringify({ expected_seconds, priority, priority_note, deadline_at }),
+  });
+}
+
+export async function getJob(id: string): Promise<OwnedJob> {
+  return apiFetch<OwnedJob>("/api/v1/jobs/" + encodeURIComponent(unwrapDoubleStringified(id) as string));
+}
+
+export async function previewQueueMove(id: string, params: {
+  before_job_id: string | null; expected_revision: number; reason: string;
+}): Promise<QueuePreview> {
+  return apiFetch<QueuePreview>("/api/v1/jobs/" + encodeURIComponent(unwrapDoubleStringified(id) as string) + "/queue/preview", {
+    method: "POST", body: JSON.stringify(params),
+  });
+}
+
+export async function moveQueueJob(id: string, params: {
+  preview_id: string; expected_revision: number;
+}): Promise<QueueMoveResult> {
+  return apiFetch<QueueMoveResult>("/api/v1/jobs/" + encodeURIComponent(unwrapDoubleStringified(id) as string) + "/queue/move", {
+    method: "POST", body: JSON.stringify(params),
+  });
+}
+
+export async function getQueueHistory(filters: {
+  worker_id?: string; job_id?: string; before_event_id?: string; limit?: number;
+} = {}): Promise<QueueHistory> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined) query.set(key, String(value));
+  }
+  return apiFetch<QueueHistory>("/api/v1/jobs/queue/history" + (query.size ? "?" + query : ""));
+}
+
+export async function getUsage(filters: { worker_id?: string; user_id?: string } = {}): Promise<UsageResult> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined) query.set(key, value);
+  }
+  return apiFetch<UsageResult>("/api/v1/usage" + (query.size ? "?" + query : ""));
 }
 
 export async function listJobs(filters?: {
   worker_id?: string;
   status?: string;
   origin_session_id?: string;
-}): Promise<Job[]> {
+}): Promise<OwnedJob[]> {
   const params = new URLSearchParams();
   if (filters?.worker_id) params.set("worker_id", filters.worker_id);
   if (filters?.status) params.set("status", filters.status);
   if (filters?.origin_session_id) params.set("origin_session_id", filters.origin_session_id);
   const qs = params.toString() ? "?" + params.toString() : "";
   const path = "/api/v1/jobs" + qs;
-  const key = getOrchestratorUrl() + "\n" + path;
+  const key = getCredentialIdentity() + "\n" + getOrchestratorUrl() + "\n" + path;
   const existing = inFlightJobLists.get(key);
   if (existing) return existing;
 
-  const request = apiFetch<Job[]>(path);
+  const request = apiFetch<OwnedJob[]>(path);
   inFlightJobLists.set(key, request);
   try {
     return await request;

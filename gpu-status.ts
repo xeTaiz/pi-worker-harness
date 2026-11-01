@@ -1,4 +1,4 @@
-import type { Worker } from "./types.ts";
+import type { PublicWorker } from "./types.ts";
 
 export type GpuAvailability = "free" | "partial" | "full";
 
@@ -8,8 +8,6 @@ export interface GpuModelStatus {
   total: number;
 }
 
-const FALLBACK_FREE_VRAM_FRACTION = 0.90;
-const FALLBACK_IGNORED_VRAM_GB = 0.5;
 export function normalizeGpuModel(name: string): string {
   return name
     .trim()
@@ -22,22 +20,14 @@ export function normalizeGpuModel(name: string): string {
 }
 
 
-export function gpuIsBusy(worker: Worker, index: number): boolean {
+export function gpuIsBusy(worker: PublicWorker, index: number): boolean {
   if (worker.status !== "online") return true;
 
-  const reported = worker.gpu_busy?.[index];
-  if (typeof reported === "boolean") return reported;
-
-  const total = worker.gpu_vram_gb[index] ?? 0;
-  const used = worker.gpu_used_vram_gb[index] ?? 0;
-  const mostlyFreeLimit = Math.max(
-    FALLBACK_IGNORED_VRAM_GB,
-    total * (1 - FALLBACK_FREE_VRAM_FRACTION),
-  );
-  return used > mostlyFreeLimit;
+  // Missing or invalid telemetry is not evidence that a GPU can be allocated.
+  return worker.gpu_available[index] !== true;
 }
 
-export function workerGpuStatus(worker: Worker): GpuModelStatus[] {
+export function workerGpuStatus(worker: PublicWorker): GpuModelStatus[] {
   const byModel = new Map<string, GpuModelStatus>();
   for (let index = 0; index < worker.gpu_count; index += 1) {
     const rawModel = worker.gpu_names[index]?.trim() || `GPU ${index}`;
@@ -53,7 +43,7 @@ export function workerGpuStatus(worker: Worker): GpuModelStatus[] {
   return [...byModel.values()].sort((left, right) => left.model.localeCompare(right.model));
 }
 
-export function aggregateGpuStatus(workers: Worker[]): GpuModelStatus[] {
+export function aggregateGpuStatus(workers: PublicWorker[]): GpuModelStatus[] {
   const byModel = new Map<string, GpuModelStatus>();
   for (const worker of workers) {
     if (worker.status !== "online") continue;

@@ -5,8 +5,8 @@
 `pi-worker-harness` integrates the worker-harness orchestrator into pi via the orchestrator's HTTP API.
 It provides:
 - Tooling for workers, jobs, and tunnels
-- A bottom overlay panel (`/worker-harness`) with Workers / Jobs / Tunnels tabs
-- A status/widget line tracking selected worker/job/log context
+- A bottom overlay panel (`/worker-harness`) with Workers / Shared queue / My jobs / Tunnels / Marimo tabs
+- A status/widget line below the editor, separate from the native OMP context-window display, showing fleet GPU totals or selected worker/job/log context
 
 This spec intentionally reflects the current HTTP-based architecture (not CLI subprocess execution).
 
@@ -28,9 +28,9 @@ No worker-harness CLI invocation is required by this extension.
 pi session
 ├── API clients
 │   ├── api.ts: orchestrator `/api/v1/*` lifecycle and fleet requests
-│   └── marimo.ts: direct Tailnet `/api/sessions` and `/api/kernel/execute`
+│   └── marimo.ts: owner-authorized orchestrator Marimo proxy transport
 ├── Role-scoped grouped tools
-│   ├── normal operator: complete worker, queue, tunnel, file, git, and Marimo surface
+│   ├── ordinary API key: shared worker/queue/usage and owned jobs/tunnels/Marimo
 │   ├── orchestrator: fleet_status, list_projects, pm_send
 │   ├── project manager: compute/Marimo plus task lifecycle and escalation
 │   └── task agent: compute/Marimo plus ask_pm and notify_pm
@@ -41,10 +41,10 @@ pi session
 
 `WH_SESSION_ROLE` is read at grouped-tool registration and actions outside the
 role are omitted from the schemas and rejected at execution. Unknown roles
-register no harness tools. Normal sessions with the variable unset keep the
-complete established surface and `wh_admin_*`; fleet roles do not receive
-administrative tools. Orchestrators also omit the compute panel/widget and its
-commands and shortcut.
+register no harness tools. Ordinary sessions receive no admin, Pi, file-transfer
+or data-copy actions. Only verified internal role sessions with a session token
+register bridge/relay hooks. Missing internal credentials fail without human-key
+fallback. Orchestrators omit the compute panel/widget, commands and shortcut.
 
 ---
 
@@ -53,28 +53,31 @@ commands and shortcut.
 Base URL is configured in `api.ts` (`getOrchestratorUrl` / `setOrchestratorUrl`).
 `WH_ORCHESTRATOR_URL` wins over both persisted defaults and runtime URL changes.
 All control-plane calls, bridge traffic, and log streams use that same base URL.
-Bearer selection is `WH_SESSION_TOKEN` first; only unscoped operator sessions
-may fall back to `WH_OPERATOR_TOKEN`, then the file at `WH_OPERATOR_TOKEN_FILE`.
-Configured but unreadable token files fail closed. Fleet launchers must scrub
-both operator variables and keep the credential file outside sandbox paths.
+Internal roles (`orchestrator`, `pm`, `task`) use only `WH_SESSION_TOKEN`.
+Ordinary sessions use `WH_API_KEY`, else the UTF-8 file `WH_API_KEY_FILE`.
+Missing credentials and configured unreadable files fail closed. Credentials
+are never persisted. Credential-dependent caches clear when identity changes.
 Bridge registration reports `resume_path` from the agent's session manager;
 the service persists it for subsequent PM/orchestrator relaunches.
 
 ### Workers
-- `GET /api/v1/workers` → `Worker[]`
-- `GET /api/v1/workers/:id` → `WorkerDetail`
+- `GET /api/v1/workers` → `PublicWorker[]`
+- `GET /api/v1/workers/:id` → `PublicWorker` (no addresses/processes/paths except shared data roots)
 - `GET /api/v1/workers/summary` → `WorkersSummary`
-- `DELETE /api/v1/workers/prune?minutes=:n` → `WorkersPruneResult`
 
-### Jobs
-- `POST /api/v1/jobs` with `{ worker_id, command, name? }` → `Job`
-- `GET /api/v1/jobs` (optional `worker_id`, `status`) → `Job[]`
-- `GET /api/v1/jobs/queue?worker_id=:id` → active `QueuedJob[]` in authoritative queue order
-- `POST /api/v1/jobs/queue` with `{ worker_id, command, name, expected_seconds, gpu_count?, no_pty? }` → `Job`
-- `PATCH /api/v1/jobs/:id/queue` with at least one mutable queue field → `QueuedJob`
-- `GET /api/v1/jobs/:id/logs?tail=&head=` → `JobLogsResult`
-- `GET /api/v1/jobs/:id/logs/stream?tail=&poll_seconds=` (text stream) → live log lines
-- `DELETE /api/v1/jobs/:id` → `StopJobResult`
+### Jobs, queue and usage
+- `POST /api/v1/jobs` → CPU-only `OwnedJob`; requires worker, command, public name and positive expected_seconds, rejects gpu_count.
+- `POST /api/v1/jobs/queue` → GPU `OwnedJob`; additionally requires positive gpu_count.
+- `GET /api/v1/jobs` and `GET /api/v1/jobs/:id` → caller-owned details only.
+- `PATCH /api/v1/jobs/:id/queue` → owner-only pending metadata edit; never accepts position.
+- `PATCH /api/v1/jobs/:id` → owner-only active estimate/priority/note/deadline edit.
+- Submissions and edits accept priority (`flexible|normal|blocking|time_critical`), priority_note and deadline_at. Time-critical needs a note; these fields never reorder.
+- `GET /api/v1/jobs/queue` → `QueueBoard {workers:[{worker_id,worker_name,revision,jobs,cpu_jobs}],as_of}`. Public rows contain owner, public name, priority, estimates and delay history, never commands/logs.
+- `POST /api/v1/jobs/:id/queue/preview` accepts before_job_id (null=end), expected_revision, reason; returns changed=false or a 60-second preview with ID/revision/impacts.
+- `POST /api/v1/jobs/:id/queue/move` requires preview_id/expected_revision; 409 requires re-list and re-preview, never blind retry.
+- `GET /api/v1/jobs/queue/history` returns attributable public events.
+- `GET /api/v1/usage` returns owner/worker allocated wall/GPU totals (not utilization or quotas).
+- Log GET/stream and DELETE stop are owner-only. Unconfirmed stop returns 503 and retains allocation; results show execution_state and termination_reason.
 
 ### Tunnels
 - `POST /api/v1/tunnels` with `{ worker_id, local_port, remote_port, name? }` → `Tunnel`
@@ -100,15 +103,13 @@ the service persists it for subsequent PM/orchestrator relaunches.
 - `POST /api/v1/pi/projects/:project/tasks` with `{ branch, briefing }`
 - `POST /api/v1/pi/orchestrator:send` with `{ message }` — lazy-starting PM escalation
 
-Kernel execution does not use the orchestrator API. `marimo.ts` fetches
-`/api/sessions`, creates a kernel when none matches the notebook by attaching to
-`/sse?session_id=…&file=…` until `kernel-ready` and then detaching, and posts to
-`/api/kernel/execute` at the lifecycle resource's returned Tailnet URL. A
-detached session stays alive in edit mode (marimo closes it on disconnect only
-under an explicit `--session-ttl`) and is resumed by the first browser that
-opens the notebook; staying attached would make that browser a viewer instead of
-the editor. The launcher uses `--no-token`; Tailnet reachability and Headscale
-ACLs are the access boundary.
+Kernel discovery, `/sse` attachment and `/api/kernel/execute` are transported
+through `${WH_ORCHESTRATOR_URL}/api/v1/marimo/<encoded-lifecycle-id>/proxy`.
+Every request carries the selected bearer, including SSE and discovery.
+The lifecycle `url` is only an authenticated browser link, never an authority
+to receive a key. The server owns the private native token and loopback listener.
+Kernel attachment detaches after kernel-ready so a browser can become editor;
+AbortSignal and output streaming remain supported. Managed startup is CPU-only.
 
 A newly created kernel is empty: `/api/kernel/execute` calls
 `session.instantiate(auto_run=False)`, so saved cells enter the graph unexecuted.
@@ -124,20 +125,18 @@ because marimo's skew-protection middleware exempts only `/api/kernel/execute`,
 
 ## Tools
 
-Tools use `api.ts` helpers, not direct fetch or CLI subprocesses. Orchestrator
-API, log-stream, and session-bridge requests include
-`Authorization: Bearer $WH_SESSION_TOKEN` when the token is set.
+Tools use authenticated `api.ts` helpers; Marimo proxy fetches use the same bearer.
 
 ### Registered actions
 
-- Unset:
+- Ordinary API key:
   - `wh_read`: `list_workers`, `available_gpus`, `get_worker`,
     `get_worker_summary`, `list_data`, `list_jobs`, `list_queue`,
-    `get_job_logs`, `list_tunnels`, `pi_sessions`
-  - `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
-    `update_queued_job`, `add_tunnel`, `remove_tunnel`, `workers_prune`,
-    `upload_file`, `download_file`, `grant_git_access`, `list_marimo`,
-    `get_marimo`, `start_marimo`, `stop_marimo`, `execute_marimo`
+    `get_job_logs`, `get_usage`, `get_queue_history`, `list_tunnels`
+  - `wh_dispatch`: `exec`, `enqueue`, `update_queued_job`,
+    `preview_queue_move`, `move_queued_job`, `stop_job`, `add_tunnel`,
+    `remove_tunnel`, `list_marimo`, `get_marimo`, `start_marimo`,
+    `stop_marimo`, `execute_marimo`
 - Orchestrator:
   - `wh_read`: `fleet_status`, `list_projects`
   - `wh_dispatch`: `pm_send`
@@ -154,9 +153,10 @@ API, log-stream, and session-bridge requests include
   - `wh_dispatch`: `data_copy`, `exec`, `stop_job`, `enqueue`,
     `update_queued_job`, all five Marimo actions, `ask_pm`, `notify_pm`
 
-Marimo list/get remains on `wh_dispatch` because its direct URL grants Python
+All five Marimo actions remain on `wh_dispatch` because they expose Python
 execution. A task agent never pushes or opens a pull request; a project manager
-reviews the worktree diff before `submit_pr`.
+reviews the worktree diff before `submit_pr`. Raw TCP tunnels are trusted-Tailnet
+exposures whose target service must authenticate.
 
 ### Required tool behaviors
 - Successful Marimo start/stop emits `worker-harness:refresh`; list/get/execute does not
@@ -168,12 +168,14 @@ reviews the worktree diff before `submit_pr`.
 ### Queueing contract
 
 - One strict FIFO queue exists per worker. The submitting agent selects the worker.
-- Consecutive queue heads may run concurrently when their GPU requests fit. A multi-GPU head blocks all later work when it cannot fit; no backfill, priority, reservation, preemption, retry, deadline, or timeout policy exists.
-- `expected_seconds` is required positive scheduling information only. The harness assigns physical GPU indices and exports them through `CUDA_VISIBLE_DEVICES`.
-- `wh_read list_queue` is the shared scheduling board and must be inspected before scheduling a GPU experiment.
-- `wh_dispatch enqueue` schedules GPU work. `wh_dispatch exec` remains an immediate bypass for short setup, diagnosis, and non-GPU commands.
-- Any agent can move, reorder, edit, cancel, or stop any job. Tools must warn agents not to change another queued job or stop running work unless the user explicitly asks for faster scheduling, queue reorganization, cancellation, or termination.
-- Queue mutations emit `worker-harness:refresh`. The panel and above-editor widget do not expose queue controls; their existing new-job actions continue to use immediate `POST /api/v1/jobs`.
+- Consecutive heads may run when their requests fit; a blocked head blocks all later work (no backfill or priority sorting).
+- Positive expected_seconds is a soft estimate, not a limit; internal unknown estimates display as unknown. Physical assignments set CUDA_VISIBLE_DEVICES.
+- CPU work uses immediate `exec` with an empty GPU allocation; GPU work uses `enqueue` and strict FIFO.
+- Metadata/logs/stop are owner-only (administrators have no ownership override).
+- Any ordinary user may reorder same-worker pending jobs only through reasoned preview/commit, audited atomically by revision.
+- Public delay entries show `+ceil(delay_seconds/60) minutes estimated delay because of JOB by OWNER`, actor, reason and time. Null delay is unavailable; zero/negative values are not delay claims.
+- A running GPU allocation can be idle-stopped after 600 seconds of valid display-exempt idle observations only when GPU work waits; release requires confirmed process exit and a fresh idle sample.
+- Queue changes emit refresh events; shared rows never expose command text. The panel has CPU-default submission with required name/duration and a separate shared queue.
 
 ---
 
@@ -192,23 +194,22 @@ Panel is opened by `/worker-harness` and should always render even when API call
 - Tab switching: `Tab`, `Shift+Tab`, `h/l`, `←/→`, `w/b`
 - Refresh: `r`
 - Close: `q` or `Esc`
-- Jobs tab actions:
-  - `f`: follow running/pending job logs via stream
-  - `f` on terminal jobs: load saved logs via logs endpoint
-  - `s`: stop running job
-- Workers/Jobs tab actions:
-  - `n`: start new job via inline prompt mode
-  - `t`: create tunnel via inline prompt mode
+- Shared queue is public metadata only (owner, priority, ETA/unknown reason and delay history).
+- My jobs actions are owner-only: `f` streams active logs or loads saved terminal logs; `s` stops/cancels.
+- Workers/My jobs: `n` opens the CPU-default form; `t` creates a tunnel.
+- Tunnels: `d` removes an owned generic forward; help warns about trusted-Tailnet exposure.
+- Marimo: `m` creates a CPU notebook; `o` opens its protected browser link; `s` stops it.
 
 ### Inline input modes (no env-var dependency)
 
-The panel must not require environment variables for interactive actions.
+Credentials are configured as above; interactive action inputs need no extra
+environment variables.
 
 #### New job (`n`)
-- Prompt inline for shell command (required)
-- Prompt inline for optional job name (optional; blank = none)
-- Submit via `POST /api/v1/jobs`
-- Optimistically insert job into panel state and reconcile with API list refresh
+- Prompt inline for shell command, public name and positive expected duration.
+- Choose CPU (default) or GPU; ask for positive GPU count only for GPU mode.
+- Submit CPU via `/api/v1/jobs`, GPU via `/api/v1/jobs/queue`.
+- Reconcile with owner-scoped job refresh; foreign shared queue rows cannot invoke logs/stop.
 
 #### New tunnel (`t`)
 - Prompt inline for remote worker port (required)

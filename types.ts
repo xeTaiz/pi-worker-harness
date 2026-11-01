@@ -2,72 +2,168 @@
 
 export type WorkerStatus = "online" | "offline" | "draining";
 export type JobStatus = "pending" | "starting" | "running" | "done" | "failed";
+export type JobPriority = "flexible" | "normal" | "blocking" | "time_critical";
+export type ExecutionState = "active" | "stopping" | "termination_unknown";
+export type TerminationReason = "user_cancelled" | "gpu_idle_timeout" | "user_disabled" | null;
 
-export interface Worker {
+/** Explicit shared projection: never includes worker addresses or process details. */
+export interface PublicWorker {
   id: string;
   name: string;
-  worker_ip: string;
-  dns_name: string;
-  ssh_user: string;
-  harness_dir: string;
+  status: WorkerStatus;
   gpu_count: number;
   gpu_names: string[];
   gpu_vram_gb: number[];
   gpu_used_vram_gb: number[];
-  gpu_busy?: Array<boolean | null>;
+  gpu_utilization_percent: Array<number | null>;
+  gpu_available: Array<boolean | null>;
   cpu_cores: number;
-  total_ram_gb: number;
-  used_ram_gb: number;
-  total_disk_gb: number;
-  used_disk_gb: number;
-  status: WorkerStatus;
-  last_heartbeat_ts: number;
-  created_at: number;
+  data_paths: string[];
 }
 
-export interface GpuInfo {
-  name: string;
-  vram_total_gb: number;
-  vram_used_gb: number;
-}
-
-export interface WorkerDetail extends Worker {
-  gpus: GpuInfo[];
-  active_ports: Array<{ local: number; remote: number; service: string }>;
-  active_jobs: Array<{ job_id: string; tmux_session: string; status: string }>;
-}
-
-export interface Job {
+export interface OwnedJob {
   id: string;
   worker_id: string | null;
-  worker_name?: string | null;
+  worker_name: string | null;
   name: string;
-  tmux_session: string;
   command: string;
   status: JobStatus;
-  queue_managed: boolean;
+  execution_state: ExecutionState;
   exit_code: number | null;
-  pty_enabled: boolean;
-  kind: "ssh";
-  origin_session_id: string | null;
-  report_revision: number;
+  kind: string;
+  owner_user_id: string;
+  owner_display_name: string;
+  submitted_by_actor_id: string;
+  submitted_at: number;
+  submission_sequence: number;
+  priority: JobPriority;
+  priority_note: string;
+  deadline_at: number | null;
   expected_seconds: number;
   gpu_count: number;
   gpu_indices: number[];
-  queue_order: number;
-  started_at: number;
+  queue_managed: boolean;
+  started_at: number | null;
   finished_at: number | null;
-  stdout?: string; // only present in sync mode
+  termination_reason: TerminationReason;
+  stop_requested_at: number | null;
+  origin_session_id: string | null;
+  delay_history?: DelayEntry[];
+  stdout?: string;
 }
+
+export interface DelayEntry {
+  event_id: string;
+  created_at: number;
+  delay_seconds: number | null;
+  moved_job_id: string;
+  moved_job_name: string;
+  moved_job_owner_display_name: string;
+  actor_user_id: string;
+  actor_display_name: string;
+  reason: string;
+}
+
+export interface QueueJob {
+  id: string;
+  name: string;
+  owner_user_id: string;
+  owner_display_name: string;
+  worker_id: string;
+  worker_name: string;
+  status: JobStatus;
+  execution_state: ExecutionState;
+  position: number;
+  submitted_at: number;
+  submission_sequence: number;
+  priority: JobPriority;
+  priority_note: string;
+  deadline_at: number | null;
+  expected_seconds: number;
+  gpu_count: number;
+  started_at: number | null;
+  termination_reason: TerminationReason;
+  stop_requested_at: number | null;
+  estimated_start_at: number | null;
+  estimated_finish_at: number | null;
+  estimate_status: "known" | "unknown";
+  estimate_explanation: string;
+  delay_history: DelayEntry[];
+}
+
+export interface QueueBoard {
+  workers: Array<{
+    worker_id: string;
+    worker_name: string;
+    revision: number;
+    jobs: QueueJob[];
+    cpu_jobs: QueueJob[];
+  }>;
+  as_of: number;
+}
+
+export interface Impact {
+  job_id: string;
+  name: string;
+  owner_user_id: string;
+  owner_display_name: string;
+  before_position: number;
+  after_position: number;
+  before_start_at: number | null;
+  after_start_at: number | null;
+  delay_seconds: number | null;
+}
+
+export interface QueueEvent {
+  id: string;
+  event_type: "reorder" | "worker_move" | "job_updated";
+  worker_id: string;
+  job_id: string;
+  job_name: string;
+  job_owner_user_id: string;
+  job_owner_display_name: string;
+  actor_user_id: string;
+  actor_display_name: string;
+  actor_id: string;
+  reason: string;
+  created_at: number;
+  old_revision: number;
+  new_revision: number;
+  old_order: string[];
+  new_order: string[];
+  impacts: Impact[];
+}
+
+export type QueuePreview =
+  | { changed: false }
+  | { changed: true; preview_id: string; revision: number; expires_at: number;
+      before_order: string[]; after_order: string[]; impacts: Impact[] };
+export interface QueueMoveResult { event: QueueEvent; revision: number }
+export interface QueueHistory { events: QueueEvent[]; next_before_event_id: string | null }
+
+export interface UsageRow {
+  owner_user_id: string;
+  owner_display_name: string;
+  worker_id: string;
+  worker_name: string;
+  job_seconds: number;
+  cpu_job_seconds: number;
+  allocated_gpu_seconds: number;
+  running_jobs: number;
+  provisional: boolean;
+  historical_estimate: boolean;
+}
+export interface UsageResult { rows: UsageRow[]; as_of: number; provisional: boolean }
 
 export interface Tunnel {
   id: string;
   worker_id: string;
-  worker_name?: string;
+  worker_name: string;
   local_port: number;
   remote_port: number;
   service_name: string;
-  pid: number;
+  bind_host: string;
+  owner_user_id: string;
   created_at: number;
 }
 
@@ -83,33 +179,34 @@ export interface WorkersPruneResult {
   minutes: number;
 }
 
-export interface StartJobRequest {
-  worker_id: string;
-  command: string;
-  name?: string;
-  no_pty?: boolean;
-  sync?: boolean;
-  sync_timeout?: number;
+export interface PriorityFields {
+  priority?: JobPriority;
+  priority_note?: string;
+  deadline_at?: number | null;
 }
-
-export interface QueuedJob extends Job {
-  position: number;
-}
-
-export interface EnqueueJobRequest {
+export interface StartJobRequest extends PriorityFields {
   worker_id: string;
   command: string;
   name: string;
   expected_seconds: number;
-  gpu_count?: number;
+  no_pty?: boolean;
+  sync?: boolean;
+  sync_timeout?: number;
+}
+export interface EnqueueJobRequest extends PriorityFields {
+  worker_id: string;
+  command: string;
+  name: string;
+  expected_seconds: number;
+  gpu_count: number;
   no_pty?: boolean;
 }
-
-export interface UpdateQueuedJobRequest {
-  worker_id?: string;
-  position?: number;
-  name?: string;
+export interface UpdateJobRequest extends PriorityFields {
   expected_seconds?: number;
+}
+export interface UpdateQueuedJobRequest extends UpdateJobRequest {
+  worker_id?: string;
+  name?: string;
   gpu_count?: number;
 }
 
@@ -125,6 +222,7 @@ export interface StopJobResult {
   stopped: boolean;
   already_terminal: boolean;
   status: string | null;
+  execution_state: ExecutionState;
 }
 
 export interface AddTunnelRequest {
@@ -146,10 +244,7 @@ export interface MarimoSession {
   notebook_path: string;
   environment: string;
   job_id: string;
-  tunnel_id: string;
-  local_port: number;
-  remote_port: number;
-  bind_host: string;
+  owner_user_id: string;
   url: string;
   status: "ready" | "stopped";
   created_at: number;

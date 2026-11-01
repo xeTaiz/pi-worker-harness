@@ -1,5 +1,5 @@
 import { workerGpuStatus } from "./gpu-status.ts";
-import type { DataPaths, QueuedJob, Worker } from "./types.ts";
+import type { DataPaths, DelayEntry, OwnedJob, PublicWorker, QueueBoard, QueueJob } from "./types.ts";
 
 export interface DataCatalogWorker {
   id: string;
@@ -11,120 +11,93 @@ export interface DataCatalog {
   paths: Record<string, string[]>;
 }
 
-function workerDns(worker: Worker): string {
-  return worker.dns_name || worker.worker_ip || "—";
-}
-
-function columnWidths(workers: Worker[]): { name: number; dns: number } {
-  return {
-    name: Math.max(0, ...workers.map((worker) => worker.name.length)),
-    dns: Math.max(0, ...workers.map((worker) => workerDns(worker).length)),
-  };
-}
-
-export function formatWorkerOverview(workers: Worker[]): string {
+export function formatWorkerOverview(workers: PublicWorker[]): string {
   if (workers.length === 0) return "No workers registered.";
-
-  const widths = columnWidths(workers);
-  const header = "status   | worker_id                            | worker".padEnd(55 + widths.name)
-    + " | tailnet_dns".padEnd(15 + widths.dns)
-    + " | GPUs (busy/total)";
   const rows = workers.map((worker) => {
     const gpuSummary = workerGpuStatus(worker)
       .map(({ model, busy, total }) => `${model} ${busy}/${total}`)
       .join(" · ") || "—";
-    return `${worker.status.padEnd(8)} | ${worker.id} | ${worker.name.padEnd(widths.name)} | ${workerDns(worker).padEnd(widths.dns)} | ${gpuSummary}`;
+    return `${worker.status} | ${worker.id} | ${worker.name} | GPUs ${gpuSummary}`;
   });
-  return [header, ...rows].join("\n");
+  return ["status | worker_id | worker | GPUs (busy/total)", ...rows].join("\n");
 }
 
-export function availableGpuWorkers(workers: Worker[]): Worker[] {
+export function availableGpuWorkers(workers: PublicWorker[]): PublicWorker[] {
   return workers.filter((worker) =>
     worker.status === "online"
     && workerGpuStatus(worker).some(({ busy, total }) => busy < total)
   );
 }
 
-export function formatQueueOverview(
-  workers: Worker[],
-  jobs: QueuedJob[],
-  nowSeconds: number,
-): string {
-  const workersById = new Map(workers.map((worker) => [worker.id, worker]));
-  const jobsByWorker = new Map<string, QueuedJob[]>();
-  const orderedWorkerIds: string[] = [];
-  const seen = new Set<string>();
-  for (const worker of workers) {
-    if (worker.status === "online") {
-      orderedWorkerIds.push(worker.id);
-      seen.add(worker.id);
-    }
-  }
-  for (const job of jobs) {
-    const workerId = job.worker_id ?? "(unassigned)";
-    const workerJobs = jobsByWorker.get(workerId);
-    if (workerJobs) workerJobs.push(job);
-    else jobsByWorker.set(workerId, [job]);
-    if (!seen.has(workerId)) {
-      orderedWorkerIds.push(workerId);
-      seen.add(workerId);
-    }
-  }
+/** Empty means the event did not delay this job and must not be rendered as a delay. */
+export function formatDelayEntry(entry: DelayEntry): string {
+  if (entry.delay_seconds !== null && entry.delay_seconds <= 0) return "";
+  const delay = entry.delay_seconds === null
+    ? "Moved later; delay estimate unavailable"
+    : `+${Math.ceil(entry.delay_seconds / 60)} minutes estimated delay because of ${entry.moved_job_name} by ${entry.moved_job_owner_display_name}`;
+  return `${delay}. Moved by ${entry.actor_display_name}: ${entry.reason} (${new Date(entry.created_at * 1000).toISOString()})`;
+}
 
-  if (orderedWorkerIds.length === 0) return "No online workers or active queued jobs.";
+function formatExpected(seconds: number): string {
+  return seconds > 0 ? `${seconds}s` : "unknown";
+}
 
+/** Compact owner-only output retains execution supervision fields. */
+export function formatOwnedJob(job: OwnedJob): string {
+  return `${job.id} (${job.name}) on ${job.worker_name ?? job.worker_id ?? "unassigned"}`
+    + ` | ${job.status} | execution_state=${job.execution_state}`
+    + ` | termination_reason=${job.termination_reason ?? "none"}`
+    + ` | owner ${job.owner_display_name} | priority ${job.priority}`
+    + ` | expected ${formatExpected(job.expected_seconds)}`;
+}
+
+function formatQueueJob(job: QueueJob, nowSeconds: number): string[] {
+  const state = job.status === "pending" ? `pending #${job.position}` : job.status;
+  const elapsed = job.started_at === null ? "" : ` | elapsed ${Math.max(0, nowSeconds - job.started_at)}s`;
+  const start = job.estimated_start_at === null ? "unavailable" : new Date(job.estimated_start_at * 1000).toISOString();
+  const finish = job.estimated_finish_at === null ? "unavailable" : new Date(job.estimated_finish_at * 1000).toISOString();
+  const lines = [
+    `  ${state} | ${job.id} | ${job.name} | GPUs ${job.gpu_count}`
+      + ` | owner ${job.owner_display_name} | priority ${job.priority}`
+      + ` | execution_state=${job.execution_state} | termination_reason=${job.termination_reason ?? "none"}`
+      + ` | expected ${formatExpected(job.expected_seconds)}${elapsed}`,
+    `    ETA start ${start} | finish ${finish} | ${job.estimate_status}: ${job.estimate_explanation}`,
+  ];
+  if (job.priority_note) lines.push(`    Priority note: ${job.priority_note}`);
+  if (job.deadline_at !== null) lines.push(`    Deadline: ${new Date(job.deadline_at * 1000).toISOString()}`);
+  for (const entry of job.delay_history) {
+    const text = formatDelayEntry(entry);
+    if (text) lines.push(`    ${text}`);
+  }
+  return lines;
+}
+
+export function formatQueueOverview(board: QueueBoard): string {
+  if (board.workers.length === 0) return "No workers or active queued jobs.";
   const lines: string[] = [];
-  for (const workerId of orderedWorkerIds) {
-    const worker = workersById.get(workerId);
-    const workerJobs = jobsByWorker.get(workerId) ?? [];
-    const workerName = worker?.name ?? workerJobs[0]?.worker_name ?? "unknown";
-    const workerStatus = worker?.status ?? "absent";
-    const gpuSummary = worker
-      ? workerGpuStatus(worker)
-        .map((gpu) => `${gpu.model} ${gpu.busy}/${gpu.total}`)
-        .join(", ") || "none"
-      : "unknown";
-    lines.push(`${workerId} | ${workerName} | ${workerStatus} | GPUs ${gpuSummary}`);
-
-    if (workerJobs.length === 0) {
-      lines.push("  (queue empty)");
-      continue;
-    }
-    for (const job of workerJobs) {
-      if (job.status === "pending") {
-        lines.push(
-          `  pending #${job.position} | ${job.id} | ${job.name}`
-          + ` | GPUs ${job.gpu_count} | expected ${job.expected_seconds}s`,
-        );
-      } else {
-        const elapsed = Math.max(0, nowSeconds - job.started_at);
-        lines.push(
-          `  ${job.status} | ${job.id} | ${job.name}`
-          + ` | GPU indices [${job.gpu_indices.join(",")}]`
-          + ` | elapsed ${elapsed}s / expected ${job.expected_seconds}s`,
-        );
-      }
+  for (const worker of board.workers) {
+    lines.push(`${worker.worker_id} | ${worker.worker_name} | revision ${worker.revision}`);
+    if (worker.jobs.length === 0) lines.push("  (GPU queue empty)");
+    for (const job of worker.jobs) lines.push(...formatQueueJob(job, board.as_of));
+    if (worker.cpu_jobs.length) {
+      lines.push("  CPU/setup jobs:");
+      for (const job of worker.cpu_jobs) lines.push(...formatQueueJob(job, board.as_of));
     }
   }
   return lines.join("\n");
 }
 
-export function formatAvailableGpus(workers: Worker[]): string {
+export function formatAvailableGpus(workers: PublicWorker[]): string {
   const available = availableGpuWorkers(workers);
   if (available.length === 0) return "No available GPUs.";
-
-  const widths = columnWidths(available);
-  const header = "worker_id                            | worker".padEnd(45 + widths.name)
-    + " | tailnet_dns".padEnd(15 + widths.dns)
-    + " | GPUs (free/total)";
   const rows = available.map((worker) => {
     const gpuSummary = workerGpuStatus(worker)
       .filter(({ busy, total }) => busy < total)
       .map(({ model, busy, total }) => `${model} ${total - busy}/${total}`)
       .join(" · ");
-    return `${worker.id} | ${worker.name.padEnd(widths.name)} | ${workerDns(worker).padEnd(widths.dns)} | ${gpuSummary}`;
+    return `${worker.id} | ${worker.name} | ${gpuSummary}`;
   });
-  return [header, ...rows].join("\n");
+  return ["worker_id | worker | GPUs (free/total)", ...rows].join("\n");
 }
 
 function uniqueWorkerRefs(ids: string[]): Map<string, string> {

@@ -1,7 +1,8 @@
 import { Container, Text } from "@earendil-works/pi-tui";
 import { events } from "./events.ts";
-import type { Worker, Job } from "./types.ts";
+import type { PublicWorker, OwnedJob } from "./types.ts";
 import { aggregateGpuStatus } from "./gpu-status.ts";
+import { getCredentialIdentity } from "./api.ts";
 
 export interface WidgetState {
   trackedWorker: string | null;
@@ -9,8 +10,8 @@ export interface WidgetState {
   trackedJobName: string | null;
   lastLogLine: string;
   following: boolean;
-  workers: Worker[];
-  jobs: Job[];
+  workers: PublicWorker[];
+  jobs: OwnedJob[];
 }
 
 export interface WidgetHandle {
@@ -65,23 +66,54 @@ export function setupWidget(
   initialState: WidgetState
 ): WidgetHandle {
   let state: WidgetState = { ...initialState };
+  let credentialIdentity: string | null;
+  try {
+    credentialIdentity = getCredentialIdentity();
+  } catch {
+    credentialIdentity = null;
+  }
+
+  function clearChangedCredentials(): boolean {
+    let identity: string | null;
+    try {
+      identity = getCredentialIdentity();
+    } catch {
+      identity = null;
+    }
+    if (identity !== null && identity === credentialIdentity) return false;
+    credentialIdentity = identity;
+    state = { ...state, trackedWorker: null, trackedJob: null, trackedJobName: null, lastLogLine: "", following: false, jobs: [] };
+    return true;
+  }
 
   function makeComponent(_theme: any): Container {
+    clearChangedCredentials();
     const c = new Container();
-    c.addChild(new Text(buildStatusLine(state), 1, 0));
+    const text = new Text(buildStatusLine(state), 1, 0);
+    c.addChild(text);
+    const render = c.render.bind(c);
+    c.render = (width: number) => {
+      clearChangedCredentials();
+      text.setText(buildStatusLine(state));
+      return render(width);
+    };
     return c;
   }
 
   function renderWidget() {
-    ui.setWidget("worker-harness", makeComponent, { placement: "aboveEditor" });
+    ui.setWidget("worker-harness", makeComponent, { placement: "belowEditor" });
   }
 
   renderWidget();
 
-  const unsubscribeLogLine = events.on<{ job_id: string; line: string }>(
+  const unsubscribeLogLine = events.on<{ job_id: string; line: string; credentialIdentity: string }>(
     "worker-harness:log-line",
     (data) => {
-      if (data.job_id === state.trackedJob && data.line.trim()) {
+      if (clearChangedCredentials()) {
+        renderWidget();
+        return;
+      }
+      if (data.credentialIdentity === credentialIdentity && data.job_id === state.trackedJob && data.line.trim()) {
         state = { ...state, lastLogLine: data.line, following: true };
         renderWidget();
       }
@@ -90,15 +122,20 @@ export function setupWidget(
 
   return {
     updateState(patch: Partial<WidgetState>) {
+      if (clearChangedCredentials()) {
+        renderWidget();
+        return;
+      }
       state = { ...state, ...patch };
       renderWidget();
     },
     get state() {
+      clearChangedCredentials();
       return state;
     },
     teardown() {
       unsubscribeLogLine();
-      ui.setWidget("worker-harness", undefined, { placement: "aboveEditor" });
+      ui.setWidget("worker-harness", undefined, { placement: "belowEditor" });
     },
   };
 }

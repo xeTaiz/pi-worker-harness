@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { hostname as systemHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
-import { getAuthorizationHeaders, getOrchestratorUrl } from "./api.ts";
+import { assertInternalSessionToken, getAuthorizationHeaders, getOrchestratorUrl, isInternalSession } from "./api.ts";
 import { harnessAgent } from "./config.ts";
 
 type BridgeState = "working" | "idle" | "stopped";
@@ -63,6 +63,8 @@ const homeHostRelays = [".pi", ".omp"].map((dir) => join(process.env.HOME || "",
 const HOST_RELAY_SCRIPT = [configuredHostRelay, adjacentHostRelay, ...homeHostRelays].find((path) => path && existsSync(path)) || adjacentHostRelay;
 
 export function registerSessionBridge(pi: ExtensionAPI): void {
+  assertInternalSessionToken();
+  if (!isInternalSession()) return;
   // Headless Pi processes (subagents, planners, and one-shot automation) are
   // not operator sessions and would otherwise clutter discovery with
   // short-lived copies.

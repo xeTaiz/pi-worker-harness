@@ -1,18 +1,18 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-  registerGroupedTools,
-  registerAdminTools,
-} from "./tools/index.ts";
+import { registerGroupedTools } from "./tools/index.ts";
 import { openPanel } from "./panel/index.ts";
 import { initWidget } from "./widget.ts";
 import {
+  assertInternalSessionToken,
+  isInternalSession,
+  getCredentialIdentity,
   getOrchestratorUrl,
   listJobs,
   listWorkers,
   setOrchestratorUrl,
 } from "./api.ts";
 import { events } from "./events.ts";
-import type { Job } from "./types.ts";
+import type { OwnedJob, PublicWorker } from "./types.ts";
 import { registerSessionBridge } from "./session-bridge.ts";
 import {
   getWorkerHarnessConfigPath,
@@ -21,6 +21,8 @@ import {
 } from "./config.ts";
 
 export default async function (pi: ExtensionAPI) {
+  // Fail before installing hooks or tools: internal sessions never borrow a user key.
+  assertInternalSessionToken();
   // The persisted config is a user default. WH_ORCHESTRATOR_URL is set by the
   // harness when it launches a fleet agent and names the control plane that
   // agent must report to, so it must win over whatever this machine happens to
@@ -37,15 +39,11 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  // Interactive TTY sessions register over the control plane. Harness-launched
-  // sessions use WH_SESSION_ID so they bind to their preallocated fleet row.
-  registerSessionBridge(pi);
+  // Only fleet sessions may create Pi bridge rows or bootstrap a host relay.
+  if (isInternalSession()) registerSessionBridge(pi);
 
-  // Grouped action schemas are role-scoped at registration time. Normal
-  // operator sessions retain administrative tools; sandboxed fleet roles do
-  // not receive host administration capabilities.
+  // Ordinary API-key sessions receive only the public read/dispatch surface.
   registerGroupedTools(pi);
-  if (!process.env.WH_SESSION_ROLE?.trim()) registerAdminTools(pi);
   const role = process.env.WH_SESSION_ROLE?.trim();
   // The worker panel and widget issue compute API calls and expose exec controls.
   if (role && role !== "pm" && role !== "task") return;
@@ -56,17 +54,26 @@ export default async function (pi: ExtensionAPI) {
   let refreshUnsubscribe: (() => void) | null = null;
 
   async function refreshWidgetState(): Promise<void> {
-    if (!widgetHandle) return;
+    const handle = widgetHandle;
+    if (!handle) return;
+    const credentialIdentity = getCredentialIdentity();
+    let workers: PublicWorker[];
+    let jobs: OwnedJob[];
+    try {
+      [workers, jobs] = await Promise.all([listWorkers(), listJobs()]);
+    } catch (error) {
+      if (handle !== widgetHandle || credentialIdentity !== getCredentialIdentity()) return;
+      throw error;
+    }
+    if (handle !== widgetHandle || credentialIdentity !== getCredentialIdentity()) return;
+    handle.updateState({ workers, jobs });
 
-    const [workers, jobs] = await Promise.all([listWorkers(), listJobs()]);
-    widgetHandle.updateState({ workers, jobs });
-
-    // Stop following if tracked job finished
-    const { trackedJob } = widgetHandle.state;
+    // Stop following if tracked job finished.
+    const { trackedJob } = handle.state;
     if (trackedJob) {
       const job = jobs.find((j) => j.id === trackedJob);
       if (job && !["pending", "starting", "running"].includes(job.status)) {
-        widgetHandle.updateState({ following: false });
+        handle.updateState({ following: false });
       }
     }
   }
@@ -124,7 +131,7 @@ export default async function (pi: ExtensionAPI) {
         await openPanel(
           activeCtx.ui as any,
           // onTrackJob: set as tracked job when user selects a job in panel
-          (job: Job) => {
+          (job: OwnedJob) => {
             if (widgetHandle) widgetHandle.updateState({ trackedJob: job.id });
           },
           // onSetWidget: update the pinned status bar
@@ -154,7 +161,7 @@ export default async function (pi: ExtensionAPI) {
       try {
         await openPanel(
           activeCtx.ui as any,
-          (job: Job) => {
+          (job: OwnedJob) => {
             if (widgetHandle) widgetHandle.updateState({ trackedJob: job.id });
           },
           (worker, job, jobName) => {

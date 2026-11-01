@@ -1,3 +1,4 @@
+import "./test-host.ts";
 import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,8 +7,8 @@ import { registerSessionBridge } from "./session-bridge.ts";
 import { listQueue } from "./api.ts";
 import { streamJobLogs } from "./sse.ts";
 
-test.each(["task", "operator"])("%s bearer reaches bridge registration, polling, events, acknowledgements, API and logs", async (role) => {
-  const keys = ["WH_SESSION_ID", "WH_SESSION_ROLE", "WH_SESSION_TOKEN", "WH_OPERATOR_TOKEN", "WH_OPERATOR_TOKEN_FILE", "WH_ORCHESTRATOR_URL", "WH_PI_SESSION_ID", "TMUX", "TMUX_PANE", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"];
+test.each(["orchestrator", "pm", "task"])("%s bearer reaches bridge registration, polling, events, acknowledgements, API and logs", async (role) => {
+  const keys = ["WH_SESSION_ID", "WH_SESSION_ROLE", "WH_SESSION_TOKEN", "WH_API_KEY", "WH_API_KEY_FILE", "WH_ORCHESTRATOR_URL", "WH_PI_SESSION_ID", "TMUX", "TMUX_PANE", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"];
   const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
   const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -23,13 +24,11 @@ test.each(["task", "operator"])("%s bearer reaches bridge registration, polling,
   try {
     for (const key of keys) delete process.env[key];
     process.env.WH_ORCHESTRATOR_URL = " http://fleet.test/// ";
-    process.env.WH_OPERATOR_TOKEN_FILE = join(directory, "token");
-    await writeFile(process.env.WH_OPERATOR_TOKEN_FILE, "operator-secret\n");
-    if (role === "task") {
-      process.env.WH_SESSION_ROLE = role;
-      process.env.WH_SESSION_ID = "allocated-task";
-      process.env.WH_SESSION_TOKEN = "task-secret";
-    }
+    process.env.WH_API_KEY_FILE = join(directory, "key");
+    await writeFile(process.env.WH_API_KEY_FILE, "whk_user\n");
+    process.env.WH_SESSION_ROLE = role;
+    process.env.WH_SESSION_ID = `allocated-${role}`;
+    process.env.WH_SESSION_TOKEN = `${role}-secret`;
     Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -69,7 +68,7 @@ test.each(["task", "operator"])("%s bearer reaches bridge registration, polling,
     await streamJobLogs("job", { onLine: (line) => lines.push(line) });
     expect(delivered).toEqual([["Please answer", { deliverAs: "followUp" }]]);
     expect(lines).toEqual(["finished"]);
-    const sessionId = role === "task" ? "allocated-task" : "ordinary-session";
+    const sessionId = `allocated-${role}`;
     const registration = requests.find(({ url }) => url.pathname.endsWith("/register"))?.body;
     expect(registration?.session_id).toBe(sessionId);
     expect(registration?.resume_path).toBe(join(directory, "conversation.jsonl"));
@@ -83,7 +82,7 @@ test.each(["task", "operator"])("%s bearer reaches bridge registration, polling,
     ]));
     for (const { url, headers } of requests) {
       expect(url.origin).toBe("http://fleet.test");
-      expect(headers.get("Authorization")).toBe(`Bearer ${role === "task" ? "task" : "operator"}-secret`);
+      expect(headers.get("Authorization")).toBe(`Bearer ${role}-secret`);
     }
   } finally {
     await handlers.get("session_shutdown")?.({ reason: "test" });
@@ -97,5 +96,115 @@ test.each(["task", "operator"])("%s bearer reaches bridge registration, polling,
     if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
     else delete process.stdout.isTTY;
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ordinary API keys never register bridge hooks or host relays, even in a TTY", async () => {
+  const keys = ["WH_SESSION_ROLE", "WH_SESSION_TOKEN", "WH_API_KEY", "WH_API_KEY_FILE"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const directory = await mkdtemp(join(tmpdir(), "wh-bridge-gate-"));
+  const hooks: string[] = [];
+  const pi = { on: (name: string) => hooks.push(name) } as never;
+  try {
+    for (const key of keys) delete process.env[key];
+    Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    process.env.WH_API_KEY = "whk_ordinary";
+    registerSessionBridge(pi);
+    expect(hooks).toEqual([]);
+    delete process.env.WH_API_KEY;
+    process.env.WH_API_KEY_FILE = join(directory, "key");
+    await writeFile(process.env.WH_API_KEY_FILE, "whk_file\n");
+    registerSessionBridge(pi);
+    expect(hooks).toEqual([]);
+    // An unscoped token must not turn a human session into an internal one.
+    process.env.WH_SESSION_TOKEN = "unscoped-token";
+    registerSessionBridge(pi);
+    expect(hooks).toEqual([]);
+  } finally {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    if (stdinTTY) Object.defineProperty(process.stdin, "isTTY", stdinTTY);
+    else delete process.stdin.isTTY;
+    if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
+    else delete process.stdout.isTTY;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test.each(["orchestrator", "pm", "task"])("%s bridge without its token fails before registering hooks", (role) => {
+  const keys = ["WH_SESSION_ROLE", "WH_SESSION_TOKEN", "WH_API_KEY"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const hooks: string[] = [];
+  try {
+    process.env.WH_SESSION_ROLE = role;
+    process.env.WH_API_KEY = "whk_never-inherited";
+    delete process.env.WH_SESSION_TOKEN;
+    expect(() => registerSessionBridge({ on: (name: string) => hooks.push(name) } as never))
+      .toThrow("WH_SESSION_TOKEN is required");
+    expect(hooks).toEqual([]);
+  } finally {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+});
+
+test("ordinary extension startup exposes grouped tools without bridge or admin registration", async () => {
+  // Load the entrypoint only after the shared Pi host mocks are installed.
+  const { default: registerExtension } = await import("./index.ts");
+  const keys = ["WH_SESSION_ROLE", "WH_SESSION_TOKEN", "WH_API_KEY", "WH_ORCHESTRATOR_URL"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const hooks: string[] = [];
+  const tools: string[] = [];
+  try {
+    delete process.env.WH_SESSION_ROLE;
+    delete process.env.WH_SESSION_TOKEN;
+    process.env.WH_API_KEY = "whk_user";
+    process.env.WH_ORCHESTRATOR_URL = "http://registration.test";
+    await registerExtension({
+      on: (name: string) => hooks.push(name),
+      registerTool: (tool: { name: string }) => tools.push(tool.name),
+      registerCommand: () => {},
+      registerShortcut: () => {},
+    } as never);
+    expect(tools).toEqual(["wh_read", "wh_dispatch"]);
+    // Only the panel/widget lifecycle is installed; bridge-only hooks are absent.
+    expect(hooks).toEqual(["session_start", "session_shutdown"]);
+  } finally {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+});
+
+test("internal extension startup without a token fails before installing anything", async () => {
+  // Load the entrypoint only after the shared Pi host mocks are installed.
+  const { default: registerExtension } = await import("./index.ts");
+  const keys = ["WH_SESSION_ROLE", "WH_SESSION_TOKEN", "WH_API_KEY"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const registrations: string[] = [];
+  try {
+    process.env.WH_SESSION_ROLE = "task";
+    process.env.WH_API_KEY = "whk_never-inherited";
+    delete process.env.WH_SESSION_TOKEN;
+    await expect(registerExtension({
+      on: () => registrations.push("hook"),
+      registerTool: () => registrations.push("tool"),
+      registerCommand: () => registrations.push("command"),
+      registerShortcut: () => registrations.push("shortcut"),
+    } as never)).rejects.toThrow("WH_SESSION_TOKEN is required");
+    expect(registrations).toEqual([]);
+  } finally {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
   }
 });
