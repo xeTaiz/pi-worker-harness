@@ -52,6 +52,7 @@ class WizardUI implements SetupUI {
   readonly prompts: Prompt[] = [];
   readonly notices: { message: string; type?: string }[] = [];
   readonly published: string[] = [];
+  readonly editorTexts: string[] = [];
   readonly scriptErrors: string[] = [];
   private readonly counts = new Map<string, number>();
   private readonly replies: Record<string, Reply>;
@@ -61,7 +62,6 @@ class WizardUI implements SetupUI {
       "SSH destination": "researcher@192.0.2.17",
       "Cluster name": id,
       "Description (optional)": "Research cluster; site utilization limits apply",
-      "Authorize the public key": "Key installed — test connection",
       "WH shared filesystem": "/data/shared/research-storage",
       "WH shared path": "/data/shared/research-storage",
       "Same filesystem root": "/cluster//research group/",
@@ -107,8 +107,21 @@ class WizardUI implements SetupUI {
   }
   notify(message: string, type?: string): void { this.notices.push({ message, type }); }
   publish = (content: string): void => { this.published.push(content); };
+  setEditorText: ((text: string) => void) | undefined = (text) => { this.editorTexts.push(text); };
 
   run(args = this.id): Promise<ClusterProfile | undefined> { return runClusterAdd(this, this.publish, args, env, { ...offlineSetup(), ...this.options.setup }); }
+  async pauseAndResume(): Promise<ClusterProfile | undefined> {
+    expect(await this.run()).toBeUndefined();
+    expect((await drafts()).find(({ id }) => id === this.id)?.phase).toBe("ssh");
+    const resumed = new WizardUI(this.id, this.options);
+    const result = await resumed.run();
+    this.prompts.push(...resumed.prompts);
+    this.notices.push(...resumed.notices);
+    this.published.push(...resumed.published);
+    this.editorTexts.push(...resumed.editorTexts);
+    this.scriptErrors.push(...resumed.scriptErrors);
+    return result;
+  }
   matching(prefix: string): Prompt[] { return this.prompts.filter((prompt) => prompt.title.startsWith(prefix)); }
   expectScriptUsed(): void { expect(this.scriptErrors).toEqual([]); }
 }
@@ -202,9 +215,29 @@ async function expectBootstrapAuthentication(profile: ClusterProfile, legacyKey?
   }
 }
 
+function bootstrapCommands(output: string, count: number): string[] {
+  const blocks = [...output.matchAll(/```sh\n([\s\S]*?)\n```/g)];
+  expect(blocks).toHaveLength(count);
+  expect(output.replace(/```sh\n[\s\S]*?\n```/g, "").trim()).toBe("");
+  return blocks.map(([, body]) => {
+    const lines = body!.split("\n");
+    expect(lines).toHaveLength(1);
+    return lines[0]!;
+  });
+}
+
+function expectedBootstrapCommands(profile: Pick<ClusterProfile, "ssh_host" | "ssh_config_file">): string[] {
+  const bootstrap = join(dirname(profile.ssh_config_file!), "bootstrap_config");
+  const key = join(dirname(configPath), "id_ed25519");
+  return [
+    `ssh-copy-id -f -F ${shellQuote(bootstrap)} -i ${shellQuote(key + ".pub")} -o StrictHostKeyChecking=ask ${shellQuote(profile.ssh_host)}`,
+    `ssh -F ${shellQuote(bootstrap)} -o StrictHostKeyChecking=ask ${shellQuote(profile.ssh_host)} true`,
+  ];
+}
+
 async function expectSafePublication(ui: WizardUI, profile: ClusterProfile): Promise<void> {
   await expectBootstrapAuthentication(profile);
-  expect(ui.published.length).toBeGreaterThanOrEqual(1);
+  expect(bootstrapCommands(ui.published[0]!, 2)).toEqual(expectedBootstrapCommands(profile));
   const output = ui.published.join("\n");
   const key = join(dirname(configPath), "id_ed25519");
   const publicKey = (await readFile(key + ".pub", "utf8")).trim();
@@ -212,18 +245,9 @@ async function expectSafePublication(ui: WizardUI, profile: ClusterProfile): Pro
   expect(output.includes(privateKey)).toBe(false);
   expect(output).not.toContain("BEGIN OPENSSH PRIVATE KEY");
   expect(output).not.toContain(enrollmentSecret);
-  expect(output).toContain(publicKey);
-  expect(output).toContain(`cluster:${profile.id}`);
-  const bootstrap = join(dirname(profile.ssh_config_file!), "bootstrap_config");
-  expect(output).toContain(`ssh-copy-id -F ${shellQuote(bootstrap)} -i ${shellQuote(key + ".pub")} ${shellQuote(profile.ssh_host)}`);
-  expect(output).toContain(`ssh -F ${shellQuote(bootstrap)} ${shellQuote(profile.ssh_host)}`);
-  expect(output).toContain(`ssh -F ${shellQuote(profile.ssh_config_file!)} -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 ${shellQuote(profile.ssh_host)} 'true'`);
+  expect(output).not.toContain(publicKey);
   expect(output).not.toContain("StrictHostKeyChecking=no");
-  expect(output).toContain("authorized_keys");
-  expect(output).toContain("fingerprint");
-  expect(output).toMatch(/no allocation/i);
-  expect(output).toContain(`ssh-keygen -p -f ${shellQuote(key)}`);
-  expect(output).toContain(`ssh-add ${shellQuote(key)}`);
+  for (const obsolete of ["authorized_keys", "ssh-keygen -p", "ssh-add ", "SSH_AUTH_SOCK", "manual fallback"]) expect(output).not.toContain(obsolete);
   // Check real key correspondence, not merely plausible public-key wording.
   const derived = await local(["ssh-keygen", "-y", "-f", key]);
   expect(publicKey.split(" ").slice(0, 2).join(" ")).toBe(derived.trim().split(" ").slice(0, 2).join(" "));
@@ -296,34 +320,54 @@ for (const withBaseline of [false, true]) {
   }
 }
 
-test("consent saves a real key and private draft; a fresh invocation resumes without duplicate keys or targets", async () => {
-  const paused = new WizardUI("resume-me", { replies: { "Authorize the public key": "Save and exit" } });
+test("consent pauses with only two shell commands, no SSH or overlay, and a fresh invocation resumes", async () => {
+  const calls: string[] = [];
+  let consented = false;
+  const paused = new WizardUI("resume-me", {
+    setup: {
+      transport: async () => { calls.push("ssh"); return ""; },
+      verifyMappings: async () => { calls.push("verify"); },
+      discover: async () => { calls.push("discover"); return discovery(); },
+    },
+    beforePrompt: ({ kind }) => {
+      expect(consented).toBe(false);
+      if (kind === "confirm") consented = true;
+    },
+  });
   expect(await paused.run()).toBeUndefined();
   paused.expectScriptUsed();
+  expect(consented).toBe(true);
+  expect(calls).toEqual([]);
+  expect(paused.prompts.map(({ kind }) => kind)).toEqual(["input", "input", "input", "confirm"]);
+  expect(paused.editorTexts).toEqual(["/cluster-add resume-me"]);
   expect(await loadClusterProfiles(env)).toEqual([]);
-  expect((await drafts())[0]).toMatchObject({ id: "resume-me", phase: "ssh", mappings: [] });
+  const draft = (await drafts())[0]!;
+  expect(draft).toMatchObject({ id: "resume-me", phase: "ssh", mappings: [] });
+  expect(paused.published).toHaveLength(1);
+  expect(bootstrapCommands(paused.published[0]!, 2)).toEqual(expectedBootstrapCommands(draft.ssh));
   const key = join(dirname(configPath), "id_ed25519");
   const bytes = await readFile(key);
   expect((await stat(key)).mode & 0o777).toBe(0o600);
   expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe("");
-  expect(paused.notices.some(({ message }) => /shared SSH key.*private draft retained/i.test(message))).toBe(true);
   const resumed = new WizardUI("resume-me");
   const profile = await resumed.run();
   resumed.expectScriptUsed();
   expect(profile).toBeDefined();
-  for (const prompt of ["SSH destination", "Cluster name", "Create shared SSH connection"]) expect(resumed.matching(prompt)).toEqual([]);
+  for (const prompt of ["SSH destination", "Cluster name", "Create shared SSH connection", "Authorize the public key"]) expect(resumed.matching(prompt)).toEqual([]);
+  expect(resumed.published.join("\n")).not.toContain("```sh");
+  expect(resumed.editorTexts).toEqual([]);
   expect(await readFile(key)).toEqual(bytes);
   expect(await drafts()).toEqual([]);
   expect(await loadClusterProfiles(env)).toEqual([profile!]);
   expect(await readdir(join(dirname(configPath), "ssh"))).toEqual(["resume-me"]);
-  await expectSafePublication(resumed, profile!);
+  await expectSafePublication(paused, profile!);
 });
 
 test("direct registration preserves old entries and uses minimal questions and safe defaults", async () => {
   const old = baseline();
   await saveBaseline([old]);
   const ui = new WizardUI("cpu-direct");
-  const result = await ui.run();
+  const result = await ui.pauseAndResume();
   ui.expectScriptUsed();
   expect(result).toMatchObject({
     id: discoveredTargetId("cpu-direct", target()), description: "Research cluster; site utilization limits apply",
@@ -354,7 +398,7 @@ test("existing aliases retain effective host, jump, port and multiplexing withou
     replies: { "SSH destination": "site-login" },
     setup: { discover: async () => discovery({ targets: [target("gpu-partition", "a100_80gb")] }) },
   });
-  const profile = await ui.run();
+  const profile = await ui.pauseAndResume();
   ui.expectScriptUsed();
   expect(profile).toMatchObject({ compute_kind: "gpu", gpu_type: "a100_80gb", max_gpus: 4, ssh_host: "site-login" });
   expect(await readFile(join(home, ".ssh", "config"), "utf8")).toBe(original);
@@ -364,23 +408,188 @@ test("existing aliases retain effective host, jump, port and multiplexing withou
   await expectSafePublication(ui, profile!);
 });
 
-test("strict SSH succeeds before mapping identity verification and discovery", async () => {
+test("a fresh invocation makes one strict true probe before mapping verification and discovery", async () => {
   const order: string[] = [];
-  let attempts = 0;
-  const ui = new WizardUI("ordered", { setup: {
-    transport: async () => {
+  const controller = new AbortController();
+  const setup: SetupOptions = {
+    signal: controller.signal,
+    transport: async (connection, command, stdin, options) => {
       order.push("ssh");
-      if (++attempts === 1) throw new Error("host fingerprint not trusted");
+      expect(connection).toEqual((await drafts())[0]!.ssh);
+      expect(command).toBe("true");
+      expect(stdin).toBeUndefined();
+      expect(options).toMatchObject({ timeout_ms: 15_000, signal: controller.signal });
       return "";
     },
     verifyMappings: async () => { order.push("verify"); },
     discover: async () => { order.push("discover"); return discovery(); },
-  } });
-  expect(await ui.run()).toBeDefined();
+  };
+  const paused = new WizardUI("ordered", { setup });
+  expect(await paused.run()).toBeUndefined();
+  expect(order).toEqual([]);
+  const resumed = new WizardUI("ordered", { setup });
+  expect(await resumed.run()).toBeDefined();
+  paused.expectScriptUsed();
+  resumed.expectScriptUsed();
+  expect(order).toEqual(["ssh", "verify", "discover"]);
+  expect(resumed.matching("WH shared path")).toHaveLength(1);
+  expect(resumed.matching("Authorize the public key")).toEqual([]);
+  expect(resumed.published.join("\n")).not.toContain("```sh");
+});
+
+test("a saved connection phase prepares files and pauses without probing or opening an overlay", async () => {
+  const initial = new WizardUI("connection-resume");
+  expect(await initial.run()).toBeUndefined();
+  const saved = await drafts();
+  saved[0]!.phase = "connection";
+  await writeFile(join(dirname(configPath), "setup-drafts.json"), JSON.stringify({ version: 1, drafts: saved }), { mode: 0o600 });
+  const key = await readFile(join(dirname(configPath), "id_ed25519"));
+  let calls = 0;
+  const resumed = new WizardUI("connection-resume", { setup: { transport: async () => { calls++; return ""; } } });
+  expect(await resumed.run()).toBeUndefined();
+  initial.expectScriptUsed();
+  resumed.expectScriptUsed();
+  expect(calls).toBe(0);
+  expect(resumed.prompts).toEqual([]);
+  expect(resumed.editorTexts).toEqual(["/cluster-add connection-resume"]);
+  expect((await drafts())[0]).toMatchObject({ phase: "ssh", mappings: [] });
+  expect(await readFile(join(dirname(configPath), "id_ed25519"))).toEqual(key);
+  expect(resumed.published).toHaveLength(1);
+  expect(bootstrapCommands(resumed.published[0]!, 2)).toEqual(expectedBootstrapCommands(saved[0]!.ssh));
+  expect(await loadClusterProfiles(env)).toEqual([]);
+});
+
+test("editor prefill is optional for both the bootstrap pause and a later successful resume", async () => {
+  const paused = new WizardUI("no-editor-prefill");
+  paused.setEditorText = undefined;
+  expect(await paused.run()).toBeUndefined();
+  paused.expectScriptUsed();
+  expect(paused.editorTexts).toEqual([]);
+  expect((await drafts())[0]!.phase).toBe("ssh");
+  expect(bootstrapCommands(paused.published[0]!, 2)).toEqual(expectedBootstrapCommands((await drafts())[0]!.ssh));
+  const resumed = new WizardUI("no-editor-prefill");
+  resumed.setEditorText = undefined;
+  expect(await resumed.run()).toBeDefined();
+  resumed.expectScriptUsed();
+  expect(resumed.editorTexts).toEqual([]);
+  expect(resumed.published.join("\n")).not.toContain("```sh");
+});
+
+for (const phase of ["ssh", "mappings", "discovery", "review"] as const) {
+  test(`one failed strict probe retains an existing ${phase} draft and publishes commands without an overlay`, async () => {
+    const paused = new WizardUI(`failed-${phase}`);
+    expect(await paused.run()).toBeUndefined();
+    const saved = await drafts();
+    saved[0]!.phase = phase;
+    if (phase !== "ssh") saved[0]!.mappings = [{ storage_id: "research-storage", shared_root: "/cluster/research group" }];
+    await writeFile(join(dirname(configPath), "setup-drafts.json"), JSON.stringify({ version: 1, drafts: saved }), { mode: 0o600 });
+    const before = await tree();
+    const calls: string[] = [];
+    const resumed = new WizardUI(`failed-${phase}`, { setup: {
+      transport: async (_connection, command) => { calls.push(command); throw new Error("Permission denied (publickey)"); },
+      verifyMappings: async () => { calls.push("verify"); },
+      discover: async () => { calls.push("discover"); return discovery(); },
+      readiness: async () => { calls.push("readiness"); return []; },
+    } });
+    expect(await resumed.run()).toBeUndefined();
+    paused.expectScriptUsed();
+    resumed.expectScriptUsed();
+    expect(calls).toEqual(["true"]);
+    expect(resumed.prompts).toEqual([]);
+    expect(resumed.editorTexts).toEqual([`/cluster-add failed-${phase}`]);
+    expect(resumed.published).toHaveLength(1);
+    expect(bootstrapCommands(resumed.published[0]!, 2)).toEqual(expectedBootstrapCommands(saved[0]!.ssh));
+    expect(resumed.notices.some(({ type, message }) => type === "warning" && /^Strict SSH failed:/.test(message) && /draft retained/.test(message) && message.includes(`/cluster-add failed-${phase}`))).toBe(true);
+    expect(await drafts()).toEqual(saved);
+    expect(await tree()).toEqual(before);
+    expect(await loadClusterProfiles(env)).toEqual([]);
+  });
+}
+
+async function seedSharedTrust(lookup: string, hashed = false): Promise<string> {
+  const directory = dirname(configPath);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const key = join(directory, "id_ed25519");
+  await local(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key]);
+  await chmod(key + ".pub", 0o600);
+  const hostKey = join(root, "fixture-host-key");
+  await local(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", hostKey]);
+  const trust = join(directory, "known_hosts");
+  await writeFile(trust, `${lookup} ${(await readFile(hostKey + ".pub", "utf8")).trim()}\n`, { mode: 0o600 });
+  if (hashed) await local(["ssh-keygen", "-H", "-f", trust]);
+  return readFile(trust, "utf8");
+}
+
+for (const fixture of [
+  { label: "plain default-port hostname", destination: "researcher@192.0.2.17", lookup: "192.0.2.17" },
+  { label: "hashed nondefault-port hostname", destination: "researcher@site-login", lookup: "[192.0.2.42]:2202", hashed: true },
+  { label: "hashed alias effective hostname and port", destination: "site-login", lookup: "[192.0.2.42]:2202", hashed: true },
+  { label: "HostKeyAlias verbatim on a nondefault port", destination: "site-login", lookup: "site-trust-name", hostKeyAlias: "site-trust-name", hashed: true },
+]) {
+  test(`verified ${fixture.label} omits the separate trust command and preserves trust bytes`, async () => {
+    if (fixture.hostKeyAlias) await writeFile(join(home, ".ssh", "config"), (await readFile(join(home, ".ssh", "config"), "utf8")) + `Host site-login\n  HostKeyAlias ${fixture.hostKeyAlias}\n`);
+    const trust = await seedSharedTrust(fixture.lookup, fixture.hashed);
+    let probes = 0;
+    const ui = new WizardUI("known-host", {
+      replies: { "SSH destination": fixture.destination },
+      setup: { transport: async () => { probes++; return ""; } },
+    });
+    expect(await ui.run()).toBeUndefined();
+    ui.expectScriptUsed();
+    expect(probes).toBe(0);
+    expect(ui.prompts.every(({ kind }) => kind === "input" || kind === "confirm")).toBe(true);
+    const draft = (await drafts())[0]!;
+    expect(bootstrapCommands(ui.published[0]!, 1)).toEqual(expectedBootstrapCommands(draft.ssh).slice(0, 1));
+    expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe(trust);
+  });
+}
+
+for (const lookup of ["192.0.2.42", "site-login", "[site-trust-name]:2202"]) {
+  test(`a known_hosts entry for the wrong effective lookup ${lookup} does not suppress the trust command`, async () => {
+    if (lookup.includes("site-trust-name")) await writeFile(join(home, ".ssh", "config"), (await readFile(join(home, ".ssh", "config"), "utf8")) + "Host site-login\n  HostKeyAlias site-trust-name\n");
+    const trust = await seedSharedTrust(lookup, true);
+    const ui = new WizardUI("wrong-known-host", { replies: { "SSH destination": "site-login" } });
+    expect(await ui.run()).toBeUndefined();
+    ui.expectScriptUsed();
+    expect(bootstrapCommands(ui.published[0]!, 2)).toEqual(expectedBootstrapCommands((await drafts())[0]!.ssh));
+    expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe(trust);
+  });
+}
+
+for (const hostKeyFailure of [false, true]) {
+  test(`an old saved ssh phase ${hostKeyFailure ? "host-key failure restores" : "authentication failure omits"} the trust command for a known host`, async () => {
+    const trust = await seedSharedTrust("192.0.2.17", true);
+    const paused = new WizardUI("old-ssh");
+    expect(await paused.run()).toBeUndefined();
+    expect(bootstrapCommands(paused.published[0]!, 1)).toEqual(expectedBootstrapCommands((await drafts())[0]!.ssh).slice(0, 1));
+    const before = await tree();
+    let probes = 0;
+    const resumed = new WizardUI("old-ssh", { setup: { transport: async () => {
+      probes++;
+      throw new Error(hostKeyFailure ? "Host key verification failed." : "Permission denied (publickey)");
+    } } });
+    if (!hostKeyFailure) resumed.setEditorText = undefined;
+    expect(await resumed.run()).toBeUndefined();
+    resumed.expectScriptUsed();
+    expect(probes).toBe(1);
+    expect(resumed.prompts).toEqual([]);
+    expect(bootstrapCommands(resumed.published[0]!, hostKeyFailure ? 2 : 1)).toEqual(expectedBootstrapCommands((await drafts())[0]!.ssh).slice(0, hostKeyFailure ? 2 : 1));
+    expect(resumed.editorTexts).toEqual(hostKeyFailure ? ["/cluster-add old-ssh"] : []);
+    expect((await drafts())[0]!.phase).toBe("ssh");
+    expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe(trust);
+    expect(await tree()).toEqual(before);
+  });
+}
+
+test("unprovable effective SSH settings retain the explicit trust command", async () => {
+  const trust = await seedSharedTrust("192.0.2.17");
+  await writeFile(join(home, ".ssh", "config"), "UnsupportedFixtureOption yes\n", { mode: 0o600 });
+  const ui = new WizardUI("unprovable-trust");
+  expect(await ui.run()).toBeUndefined();
   ui.expectScriptUsed();
-  expect(order).toEqual(["ssh", "ssh", "verify", "discover"]);
-  expect(ui.matching("Authorize the public key")).toHaveLength(2);
-  expect(ui.notices.some(({ message }) => /Strict SSH test failed/.test(message))).toBe(true);
+  expect((await drafts())[0]!.phase).toBe("ssh");
+  expect(bootstrapCommands(ui.published[0]!, 2)).toEqual(expectedBootstrapCommands((await drafts())[0]!.ssh));
+  expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe(trust);
 });
 
 test("the exact two-mapping catalogue loop keeps primary identity and forwards both mappings", async () => {
@@ -397,7 +606,7 @@ test("the exact two-mapping catalogue loop keeps primary identity and forwards b
       discover: async (_connection, input) => { expect(input.mappings).toEqual(mappings); return discovery(); },
     },
   });
-  expect(await ui.run()).toMatchObject({ ...mappings[0], additional_shared_roots: [mappings[1]] });
+  expect(await ui.pauseAndResume()).toMatchObject({ ...mappings[0], additional_shared_roots: [mappings[1]] });
   ui.expectScriptUsed();
   expect(ui.matching("WH shared filesystem").map(({ options }) => options)).toEqual([
     ["/data/shared/research-storage", "/data/shared/datasets", "Enter /data/shared/<id>"],
@@ -417,7 +626,7 @@ test("manual path and URL corrections retain earlier answers", async () => {
     "Local Tailnet enrollment KEY FILE": ["relative/key", join(home, "tailnet enrollment key")],
     "Tailnet login server": ["https://user:secret@control.example.test", "https://control.example.test"],
   } });
-  expect(await ui.run()).toMatchObject({ shared_root: "/cluster/corrected shared" });
+  expect(await ui.pauseAndResume()).toMatchObject({ shared_root: "/cluster/corrected shared" });
   ui.expectScriptUsed();
   expect(ui.matching("SSH destination")).toHaveLength(1);
   expect(ui.notices.filter(({ type }) => type === "error").length).toBeGreaterThanOrEqual(5);
@@ -426,7 +635,7 @@ test("manual path and URL corrections retain earlier answers", async () => {
 test("automatic CPU/GPU IDs are collision-safe; ceilings are seven days or lower partition caps", async () => {
   const targets = [target("cpu.part"), target("cpu-part"), target("short", undefined, 3600), target("gpu", "a100.80gb"), target("gpu", "a100-80gb")];
   const ui = new WizardUI("all-targets", { setup: { discover: async () => discovery({ targets }) } });
-  expect(await ui.run()).toBeDefined();
+  expect(await ui.pauseAndResume()).toBeDefined();
   ui.expectScriptUsed();
   const profiles = (await document()).clusters;
   expect(profiles).toHaveLength(5);
@@ -500,7 +709,7 @@ for (const invalid of ["{not valid JSON", JSON.stringify({ version: 2, clusters:
 
 test("global integration prompts once and is reused by later clusters without publishing secrets", async () => {
   const firstUI = new WizardUI("first-integration");
-  const first = await firstUI.run();
+  const first = await firstUI.pauseAndResume();
   firstUI.expectScriptUsed();
   expect(first).toMatchObject({ tailnet_key_file: join(home, "tailnet enrollment key"), tailnet_login_server: "https://control.example.test", orchestrator_host: defaultRegistrationHost(), orchestrator_registration_port: 12888 });
   expect(firstUI.matching("Local Tailnet enrollment KEY FILE")).toHaveLength(1);
@@ -515,7 +724,7 @@ test("global integration prompts once and is reused by later clusters without pu
   expect(settings).not.toContain(enrollmentSecret);
   expect((await stat(settingsPath)).mode & 0o777).toBe(0o600);
   const secondUI = new WizardUI("second-integration");
-  expect(await secondUI.run()).toBeDefined();
+  expect(await secondUI.pauseAndResume()).toBeDefined();
   secondUI.expectScriptUsed();
   expect(secondUI.matching("Local Tailnet enrollment KEY FILE")).toEqual([]);
   expect(secondUI.matching("Tailnet login server")).toEqual([]);
@@ -524,12 +733,12 @@ test("global integration prompts once and is reused by later clusters without pu
 });
 
 test("unambiguous aliases automatically reuse stable mappings without copying credentials", async () => {
-  const source = await new WizardUI("source-alias", { replies: { "SSH destination": "site-login" } }).run();
+  const source = await new WizardUI("source-alias", { replies: { "SSH destination": "site-login" } }).pauseAndResume();
   expect(source).toBeDefined();
   const sourceFiles = await tree(dirname(source!.ssh_config_file!));
   const key = await readFile(join(dirname(configPath), "id_ed25519"));
   const ui = new WizardUI("reused-alias", { replies: { "SSH destination": "site-login" } });
-  expect(await ui.run()).toMatchObject({ storage_id: source!.storage_id, shared_root: source!.shared_root, ssh_host: "site-login" });
+  expect(await ui.pauseAndResume()).toMatchObject({ storage_id: source!.storage_id, shared_root: source!.shared_root, ssh_host: "site-login" });
   ui.expectScriptUsed();
   expect(ui.matching("WH shared path")).toEqual([]);
   expect(ui.matching("Same filesystem root")).toEqual([]);
@@ -540,7 +749,7 @@ test("unambiguous aliases automatically reuse stable mappings without copying cr
 for (const invalidPublicFile of ["private-key", "invalid-ed25519-blob"] as const) {
   test(`shared identity rejects ${invalidPublicFile} in the public-key file without publishing or committing it`, async () => {
     const sourceUI = new WizardUI("public-key-source");
-    const source = await sourceUI.run();
+    const source = await sourceUI.pauseAndResume();
     sourceUI.expectScriptUsed();
     expect(source).toBeDefined();
     const key = join(dirname(configPath), "id_ed25519");
@@ -578,7 +787,7 @@ for (const missing of ["runtime", "image"] as const) {
         return discovery();
       } },
     });
-    expect(await ui.run()).toBeDefined();
+    expect(await ui.pauseAndResume()).toBeDefined();
     ui.expectScriptUsed();
     expect(calls).toBe(2);
     expect(ui.matching("Trusted runtime shell prelude")).toHaveLength(missing === "runtime" ? 1 : 0);
@@ -597,7 +806,7 @@ test("billing is conditional and an explicitly chosen account is rediscovered", 
       return discovery({ account: "project-b", account_source: "explicit" });
     } },
   });
-  expect(await ui.run()).toMatchObject({ account: "project-b" });
+  expect(await ui.pauseAndResume()).toMatchObject({ account: "project-b" });
   ui.expectScriptUsed();
   expect(calls).toBe(2);
   expect(ui.matching("Billing default unresolved")[0]?.options).toEqual(["Use scheduler default", "Account project-a", "Account project-b"]);
@@ -613,7 +822,7 @@ for (const missing of ["image", "key-file", "private-key-file", "key-file-symlin
       ...(missing === "image" ? { discover: async () => discovery({ sif_path: undefined, unresolved: [{ kind: "image", blocking: true, message: "Compatible image missing" }] }) } : {}),
       readiness: async () => missing === "live-openapi" ? ["Control deployment lacks POST /api/v1/workers/reservations and GET /api/v1/job-events"] : [],
     } });
-    expect(await ui.run()).toBeUndefined();
+    expect(await ui.pauseAndResume()).toBeUndefined();
     ui.expectScriptUsed();
     expect(await loadClusterProfiles(env)).toEqual([]);
     expect((await drafts())[0]).toMatchObject({ phase: "blocked" });
@@ -630,17 +839,16 @@ test("failed mapping verification blocks before discovery/readiness with mapping
     discover: async () => { calls.push("discovery"); return discovery(); },
     readiness: async () => { calls.push("readiness"); return []; },
   } });
-  expect(await ui.run()).toBeUndefined();
+  expect(await ui.pauseAndResume()).toBeUndefined();
   ui.expectScriptUsed();
   expect(calls).toEqual([]);
   expect(await loadClusterProfiles(env)).toEqual([]);
   expect((await drafts())[0]).toMatchObject({ phase: "blocked", mappings: [{ storage_id: "research-storage", shared_root: "/cluster/research group" }] });
 });
 
-for (const stage of ["ssh", "mapping", "mapping-loop", "runtime-editor", "image-input", "review-escape", "review-save", "advanced", "edit-review", "final-confirm"] as const) {
+for (const stage of ["mapping", "mapping-loop", "runtime-editor", "image-input", "review-escape", "review-save", "advanced", "edit-review", "final-confirm"] as const) {
   test(`cancellation at ${stage} retains honest resumable state with no targets`, async () => {
     const replies: Record<string, Reply> = {};
-    if (stage === "ssh") replies["Authorize the public key"] = undefined;
     if (stage === "mapping") replies["Same filesystem root"] = undefined;
     if (stage === "mapping-loop") replies["Add another filesystem mapping?"] = undefined;
     if (stage === "runtime-editor" || stage === "image-input") {
@@ -657,7 +865,7 @@ for (const stage of ["ssh", "mapping", "mapping-loop", "runtime-editor", "image-
         discover: async () => discovery({ unresolved: [{ kind: stage === "runtime-editor" ? "runtime" : "image", blocking: true, message: "Missing prerequisite" }] }),
       } : {},
     });
-    expect(await ui.run()).toBeUndefined();
+    expect(await ui.pauseAndResume()).toBeUndefined();
     ui.expectScriptUsed();
     expect(await loadClusterProfiles(env)).toEqual([]);
     expect(await drafts()).toHaveLength(1);
@@ -669,7 +877,7 @@ for (const stage of ["ssh", "mapping", "mapping-loop", "runtime-editor", "image-
 
 test("resuming a partial mapping repeats the extra-filesystem question without duplicating primary", async () => {
   const paused = new WizardUI("partial-mapping", { replies: { "Add another filesystem mapping?": undefined } });
-  expect(await paused.run()).toBeUndefined();
+  expect(await paused.pauseAndResume()).toBeUndefined();
   paused.expectScriptUsed();
   expect((await drafts())[0]!.mappings).toHaveLength(1);
   const resumed = new WizardUI("partial-mapping");
@@ -691,7 +899,7 @@ test("aborting discovery passes the signal and preserves the saved discovery-sta
       return discovery();
     },
   } });
-  expect(await ui.run()).toBeUndefined();
+  expect(await ui.pauseAndResume()).toBeUndefined();
   ui.expectScriptUsed();
   expect((await drafts())[0]!.phase).toBe("discovery");
   expect(await loadClusterProfiles(env)).toEqual([]);
@@ -706,7 +914,7 @@ test("advanced failure grace requires idle-policy opt-in while the partition rem
     },
     setup: { discover: async () => discovery({ targets: [target("short", undefined, 7200)] }) },
   });
-  expect(await ui.run()).toMatchObject({ failure_grace_seconds: 300, max_walltime_seconds: 7200 });
+  expect(await ui.pauseAndResume()).toMatchObject({ failure_grace_seconds: 300, max_walltime_seconds: 7200 });
   ui.expectScriptUsed();
   expect(ui.matching("Opt in to failure diagnosis idle holding?")[0]?.current).toMatch(/idle allocations.*site.*utilization policy/i);
 });
@@ -719,7 +927,7 @@ test("concurrent config edits at final confirmation survive atomic registration 
     setup: { discover: async () => discovery({ targets: [target("cpu"), target("gpu", "a100")] }) },
     beforePrompt: async ({ title }) => { if (title === "Register discovered cluster targets?") await saveBaseline([initial, concurrent]); },
   });
-  expect(await ui.run()).toBeDefined();
+  expect(await ui.pauseAndResume()).toBeDefined();
   ui.expectScriptUsed();
   const saved = (await document()).clusters;
   expect(saved.slice(0, 2)).toEqual([initial, concurrent]);
@@ -737,7 +945,7 @@ test("concurrent draft revision blocks all targets without changing existing con
       await writeFile(join(dirname(configPath), "setup-drafts.json"), JSON.stringify({ version: 1, drafts: saved }), { mode: 0o600 });
     },
   });
-  expect(await ui.run()).toBeUndefined();
+  expect(await ui.pauseAndResume()).toBeUndefined();
   ui.expectScriptUsed();
   expect(await readFile(configPath, "utf8")).toBe(before);
   expect(ui.notices.some(({ message }) => /changed concurrently/.test(message))).toBe(true);
@@ -751,7 +959,7 @@ test("commit rename failure leaves existing config byte-exact and the full targe
     discover: async () => discovery({ targets }),
     replaceConfig: async (_source, destination) => { replacements++; await rename(join(root, "missing-staged-file"), destination); },
   } });
-  expect(await ui.run()).toBeUndefined();
+  expect(await ui.pauseAndResume()).toBeUndefined();
   ui.expectScriptUsed();
   expect(replacements).toBe(1);
   expect(await readFile(configPath, "utf8")).toBe(before);
@@ -765,7 +973,7 @@ test("commit rename failure leaves existing config byte-exact and the full targe
 
 test("successful atomic commit reports retained draft if only draft cleanup fails", async () => {
   const paused = new WizardUI("cleanup-failure", { replies: { "Review cluster": "Save and exit" } });
-  expect(await paused.run()).toBeUndefined();
+  expect(await paused.pauseAndResume()).toBeUndefined();
   paused.expectScriptUsed();
   const draft = (await drafts())[0]!;
   const profiles = buildDiscoveredProfiles(draft, draft.discovery!);
@@ -787,7 +995,7 @@ test("resuming after discovered partitions and GPU types change replaces stale s
     replies: { "Review cluster": "Save and exit" },
     setup: { discover: async () => discovery({ targets: oldTargets }) },
   });
-  expect(await paused.run()).toBeUndefined();
+  expect(await paused.pauseAndResume()).toBeUndefined();
   paused.expectScriptUsed();
   expect((await drafts())[0]!.selected_targets).toEqual(oldTargets.map((candidate) => discoveredTargetId("changed-discovery", candidate)));
   expect(await loadClusterProfiles(env)).toEqual([]);
@@ -810,7 +1018,7 @@ test("resuming after discovered partitions and GPU types change replaces stale s
 
 test("an explicit user on a fixture alias preserves its resolved port, jump and original Host context", async () => {
   const ui = new WizardUI("explicit-alias-user", { replies: { "SSH destination": "researcher@site-login" } });
-  const profile = await ui.run();
+  const profile = await ui.pauseAndResume();
   ui.expectScriptUsed();
   expect(profile).toMatchObject({ ssh_host: "site-login" });
   const ssh = await effectiveSSH(profile!);
@@ -823,14 +1031,14 @@ test("an explicit user on a fixture alias preserves its resolved port, jump and 
 
 test("cluster name defaults to the requested argument or short SSH hostname without extra connection questions", async () => {
   const requested = new WizardUI("unused", {
-    replies: { "Cluster name": "", "Authorize the public key": "Save and exit" },
+    replies: { "Cluster name": "" },
   });
   expect(await requested.run("requested-name")).toBeUndefined();
   requested.expectScriptUsed();
   expect(requested.matching("Cluster name")[0]?.current).toBe("requested-name");
   const hostname = new WizardUI("unused", { replies: {
     "SSH destination": "researcher@login.example.test", "Cluster name": "",
-    "Authorize the public key": "Save and exit", "Resume cluster setup?": "New cluster",
+    "Resume cluster setup?": "New cluster",
   } });
   expect(await hostname.run("")).toBeUndefined();
   hostname.expectScriptUsed();
@@ -849,7 +1057,7 @@ test("review editing registers only the selected discovered target and corrected
     },
     setup: { discover: async () => discovery({ targets }) },
   });
-  expect(await ui.run()).toMatchObject({ id: selected, description: "Selected GPU research target", compute_kind: "gpu" });
+  expect(await ui.pauseAndResume()).toMatchObject({ id: selected, description: "Selected GPU research target", compute_kind: "gpu" });
   ui.expectScriptUsed();
   expect((await document()).clusters).toHaveLength(1);
   expect(ui.matching("Review cluster")[1]?.title).toContain("Selected GPU research target");
@@ -860,7 +1068,7 @@ test("simultaneous commits of one reviewed draft register exactly one complete t
     replies: { "Review cluster": "Save and exit" },
     setup: { discover: async () => discovery({ targets: [target("cpu"), target("gpu", "a100")] }) },
   });
-  expect(await paused.run()).toBeUndefined();
+  expect(await paused.pauseAndResume()).toBeUndefined();
   paused.expectScriptUsed();
   const draft = (await drafts())[0]!;
   const profiles = buildDiscoveredProfiles(draft, draft.discovery!);
@@ -885,7 +1093,7 @@ test("UI reports registration success and retained-draft guidance when only clea
       await mkdir(draftPath, { mode: 0o700 });
     },
   } });
-  const profile = await ui.run();
+  const profile = await ui.pauseAndResume();
   ui.expectScriptUsed();
   expect(profile).toBeDefined();
   expect(await loadClusterProfiles(env)).toEqual([profile!]);
@@ -936,7 +1144,7 @@ test("native system SSH config policy permits safe user alias resolution without
     expect(system.includePath).toBeUndefined();
   }
   const ui = new WizardUI("native-system-policy", { replies: { "SSH destination": "site-login" } });
-  const profile = await ui.run();
+  const profile = await ui.pauseAndResume();
   ui.expectScriptUsed();
   expect(profile).toBeDefined();
   const effective = await effectiveSSH(profile!);
@@ -947,11 +1155,8 @@ test("native system SSH config policy permits safe user alias resolution without
     expect(values.get("proxyjump")).toBe("gateway.example.test");
     expect(values.get("controlmaster")).toBe("auto");
   }
-  const message = ui.published.join("\n");
-  if (system.warning) {
-    expect(message).toContain(system.warning);
-    expect(message).toContain("required site settings in your normal ~/.ssh/config");
-  } else expect(message).not.toContain("system SSH defaults from /etc/ssh/ssh_config were not inherited");
+  if (system.warning) expect(ui.notices).toContainEqual({ message: system.warning, type: "warning" });
+  expect(bootstrapCommands(ui.published[0]!, 2)).toEqual(expectedBootstrapCommands(profile!));
   // A bad user config must still fail normally; it is never silently omitted.
   await chmod(join(home, ".ssh", "config"), 0o666);
   const child = Bun.spawn(["ssh", "-G", "-F", profile!.ssh_config_file!, profile!.ssh_host], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -987,18 +1192,17 @@ async function legacyProfiles(encrypted = false, ids = ["legacy-cpu", "legacy-se
 }
 
 test("independent profiles share exactly one key and preserve every verified known_hosts byte", async () => {
-  const first = await new WizardUI("first").run();
+  const first = await new WizardUI("first").pauseAndResume();
   expect(first).toBeDefined();
   const ssh = dirname(configPath);
   const originalKey = await readFile(join(ssh, "id_ed25519"));
   const trust = "|1|verified-hash|verified-host ssh-ed25519 site-public-key\n# retain exactly\n";
   await writeFile(join(ssh, "known_hosts"), trust, { mode: 0o600 });
   const secondUI = new WizardUI("second", { replies: { "SSH destination": "researcher@192.0.2.18" } });
-  const second = await secondUI.run();
+  const second = await secondUI.pauseAndResume();
   expect(second).toBeDefined();
   expect(await readFile(join(ssh, "id_ed25519"))).toEqual(originalKey);
   expect(await readFile(join(ssh, "known_hosts"), "utf8")).toBe(trust);
-  expect(secondUI.matching("Create shared SSH connection")[0]?.current).toContain("Reuse the shared key");
   await expectBootstrapAuthentication(first!);
   await expectBootstrapAuthentication(second!);
   expect(await readdir(dirname(second!.ssh_config_file!))).toEqual(["bootstrap_config", "config"]);
@@ -1033,14 +1237,37 @@ for (const encrypted of [false, true]) {
     expect(await readFile(externalFile, "utf8")).toBe("Host *\n  HostName external.example.test\n");
     expect(ui.published[0]).toContain("external-cpu");
     expect(ui.published[0]).toContain("NOT migrated");
-    expect(ui.published[0]).toContain("EACH distinct login host");
-    expect(ui.published[0]).toContain("No host trust was imported automatically");
-    expect(ui.published[0]).toContain("SSH_AUTH_SOCK");
-    if (encrypted) expect(ui.published[0]).toContain("encrypted; original bytes preserved");
-    for (const profile of profiles) expect(ui.published[0]).toContain(`ssh-copy-id -F ${shellQuote(join(dirname(profile.ssh_config_file!), "bootstrap_config"))}`);
+    expect(ui.published[0]).toContain("No SSH connection, key installation or allocation was performed");
+    const blocks = ui.published[0]!.match(/```sh\n[\s\S]*?\n```/g) ?? [];
+    expect(bootstrapCommands(blocks.join("\n\n"), profiles.length * 2)).toEqual(profiles.flatMap(expectedBootstrapCommands));
+    for (const obsolete of ["SSH_AUTH_SOCK", "ssh-keygen -p", "ssh-add ", "authorized_keys"]) expect(ui.published[0]).not.toContain(obsolete);
+    for (const pair of originals) expect(ui.published[0]).not.toContain(pair[1]!.toString("utf8").trim());
     for (const pair of originals) expect(ui.published[0]).not.toContain(pair[0]!.toString("utf8"));
+    expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe("");
   });
 }
+
+test("migration uses the same commands and omits only the already verified hashed host trust step", async () => {
+  const { profiles, keys } = await legacyProfiles();
+  const trust = await seedSharedTrust("[192.0.2.17]:2222", true);
+  const userConfig = await readFile(join(home, ".ssh", "config"));
+  const sharedKey = await readFile(join(dirname(configPath), "id_ed25519"));
+  const originalKeys = await Promise.all(keys.map((key) => readFile(key)));
+  const ui = new WizardUI("migration-known-host");
+  expect(await runClusterSshMigrate(ui, ui.publish, env)).toEqual(profiles.map(({ id }) => id));
+  ui.expectScriptUsed();
+  expect(ui.matching("Select existing")).toEqual([]);
+  const blocks = ui.published.join("\n").match(/```sh\n[\s\S]*?\n```/g) ?? [];
+  expect(bootstrapCommands(blocks.join("\n\n"), 3)).toEqual([
+    expectedBootstrapCommands(profiles[0]!)[0]!,
+    ...expectedBootstrapCommands(profiles[1]!),
+  ]);
+  expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe(trust);
+  expect(await readFile(join(dirname(configPath), "id_ed25519"))).toEqual(sharedKey);
+  expect(await readFile(join(home, ".ssh", "config"))).toEqual(userConfig);
+  expect(await Promise.all(keys.map((key) => readFile(key)))).toEqual(originalKeys);
+  for (const [index, profile] of profiles.entries()) await expectBootstrapAuthentication(profile, keys[index]);
+});
 
 test("migration cancellation is completely read-only and add refuses to silently replace legacy authorization", async () => {
   await legacyProfiles();
@@ -1091,7 +1318,7 @@ test("manually modified wizard-shaped config is explicitly left outside migratio
 
 for (const unsafe of ["shared-key-symlink", "public-key-symlink", "trust-symlink", "trust-world-readable", "mismatched-public", "fake-private-with-valid-public"] as const) {
   test(`shared SSH rejects ${unsafe} without replacing user files`, async () => {
-    const profile = await new WizardUI("source").run();
+    const profile = await new WizardUI("source").pauseAndResume();
     expect(profile).toBeDefined();
     const ssh = dirname(configPath);
     const key = join(ssh, "id_ed25519");
@@ -1145,7 +1372,7 @@ test("legacy profile IDs matching shared filenames migrate without namespace col
   expect(await runClusterSshMigrate(again, again.publish, env)).toEqual(["id_ed25519", "known_hosts"]);
   expect(await Promise.all(profiles.map((profile) => readFile(join(dirname(profile.ssh_config_file!), "bootstrap_config"), "utf8")))).toEqual(bootstrapBefore);
   const added = new WizardUI("new-after-migration");
-  expect(await added.run()).toBeDefined();
+  expect(await added.pauseAndResume()).toBeDefined();
   expect(await readFile(join(dirname(configPath), "id_ed25519"))).toEqual(originalKey);
 });
 

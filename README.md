@@ -200,11 +200,14 @@ submits an allocation, deploys a server, or installs software remotely.
    managed connection, review the suggested short cluster name, and optionally
    supply a description.
 2. Explicitly consent to managed shared-key/trust setup before credential
-   creation. Bootstrap first-connect/fingerprint verification, public-key
-   copy-id and manual installation instructions appear immediately.
-3. Select **“Key installed — test connection”** for a real strict BatchMode
-   probe, or **“Save and exit”**. Failure remains a resumable prerequisite,
-   never pretend login success.
+   creation. Setup saves its SSH phase and returns with only fenced shell
+   commands (one command per block, no comments): install the shared public key,
+   then verify/add host trust if needed.
+   No test/select dialog covers these instructions.
+3. Run the commands in your terminal, independently verifying any host fingerprint.
+   Then submit `/cluster-add <name>` again (prefilled where the UI supports it).
+   This fresh invocation makes one strict BatchMode probe. Failure republishes
+   the relevant commands and retains the draft without opening another dialog.
 4. After SSH works, select a WH shared path from `list_data` or type
    `/data/shared/<storage_id>`, then its existing cluster-host root. The explicit
    **“Add another filesystem mapping?”** loop repeats those same two fields.
@@ -280,7 +283,7 @@ Existing shared key/trust files are reused, never overwritten. The profile's
 
 Alias mode retains ordinary user SSH/ProxyJump/ControlMaster policy.
 `/etc/ssh/ssh_config` is included only if readable/regular, root/current-UID
-owned, and not group/world writable; otherwise a durable warning directs
+owned, and not group/world writable; otherwise a UI warning directs
 required site options into user config. Strict OpenSSH checks are not weakened.
 Direct destinations retain the resolved user/port/jump policy. All generated
 targets share the managed connection and stable storage mappings. Profiles
@@ -294,22 +297,28 @@ example for a full CPU/GPU pair.
 
 Both dedicated and bootstrap configs explicitly select the shared
 `UserKnownHostsFile`. An empty 0600 configuration-parent `known_hosts` is created only if absent;
-existing trust is not replaced, cleared or automatically imported. Verify the
-host's fingerprint against an independent site source before accepting it with
-the printed bootstrap first-connect command. Copy existing entries only after
-reviewing their independent verification; `ssh-keyscan` alone is not proof.
-Install **only the shared public key** with the printed
-`ssh-copy-id -F <bootstrap_config> -i <shared-public-key> <alias>` or manual
-authorized_keys alternative. A new profile's bootstrap preserves existing
+existing trust is not replaced, cleared or automatically imported. The first
+printed command installs **only the shared public key**:
+`ssh-copy-id -f -F <bootstrap_config> -i <shared-public-key> -o StrictHostKeyChecking=ask <alias>`.
+`-f` ensures installation is not skipped when bootstrap authenticates with an
+existing key; rerunning it can append a duplicate shared public-key entry.
+If the effective host is missing from shared trust, a second command is printed:
+`ssh -F <bootstrap_config> -o StrictHostKeyChecking=ask <alias> true`.
+Verify any fingerprint against an independent site source before accepting it.
+Both interactive commands explicitly request confirmation even if normal SSH
+configuration requires strict checking. Trust lookup evaluates the managed
+config's hostname, port and HostKeyAlias and supports hashed/non-default-port
+entries; an unprovable lookup or host-key probe failure shows the trust command.
+`ssh-keyscan` alone is not proof. A new profile's bootstrap preserves existing
 key/agent/password/MFA authentication and target/includes without imposing the
 shared IdentityFile/IdentitiesOnly restriction. A migrated profile's bootstrap
 retains its **old per-profile IdentityFile without IdentitiesOnly**, allowing
 old-key-only hosts to authorize the shared public key. The final probe uses
 dedicated `config`, shared identity and `IdentitiesOnly`, with `BatchMode=yes`,
 `StrictHostKeyChecking=yes`, and `ConnectTimeout=10`. Bootstrap/copy-id commands
-are printed only; **“Key installed — test connection”** executes the real probe
-and then read-only discovery through the existing bounded SSH transport.
-Never bypass missing/changed host trust.
+are printed only; rerunning `/cluster-add <name>` executes the strict probe
+and, on success, continues mapping and read-only discovery through the existing
+bounded SSH transport. Missing/changed host trust is never bypassed.
 
 A newly generated shared private key initially has no passphrase; an existing
 shared key (including an encrypted one) is preserved. Add a passphrase in your
@@ -329,10 +338,10 @@ unrecognized configs are explicitly skipped, not guessed. Review the report.
 
 Migration retains destination/alias policy, shared host trust and each old
 profile's IdentityFile in bootstrap without IdentitiesOnly; dedicated configs
-select only the shared identity. It prints bootstrap first-connect,
-shared-public-key installation and strict dedicated-config probes for each
-distinct migrated host. Install this **shared public key** on each affected
-account that previously accepted a different profile key.
+select only the shared identity. It prints the same fenced shared-public-key
+installation command and, when needed, interactive trust command for each
+migrated profile. Install this **shared public key** on each affected account
+that previously accepted a different profile key.
 Host trust is not imported automatically; manually review verified entries or
 verify each host interactively into the shared known_hosts. New mounts alone
 cannot migrate old profiles or authorize the shared identity remotely.
@@ -509,8 +518,29 @@ Key bindings:
 
 ### Current integration evidence (2026-11-01)
 
-Current extension **`bun test` passed: 439 tests, zero failures**, **2,938
-assertions/16 files, 3.93 seconds**, run by the parent in the extension checkout.
+Current extension **`bun test` passed: 455 tests, zero failures**, **3,510
+assertions/16 files, 4.98 seconds**, run by the parent in the extension checkout.
+The earlier minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds)
+is historical evidence, not the current bootstrap build.
+
+The parent's **actual OMP 18.14.2/native-PTY plus private local OpenSSH bootstrap
+proof passed in 14.29 seconds**, using normal linked-plugin discovery and the
+default SSH authentication-attempt limit. Native `/export` retained the original
+custom messages: two one-command-only fences initially, two after one failed
+strict unknown-host probe, and one for an already trusted nondefault-port host.
+The first call had no probe or covering overlay and prefilled resume; failure
+retained the draft; successful resume reached mapping. The generated trust
+command verified the fixture fingerprint and appended shared trust without
+changing unrelated entries. Generated `ssh-copy-id -f` actually deposited the WH
+public key despite an already-authorized bootstrap identity; the server then
+accepted the WH fingerprint for the strict probe.
+
+There were zero model turns/model HTTP requests/forwarded external connections;
+seven provider-startup CONNECT attempts were denied locally with 403. The private
+API received only GETs for workers/jobs/data. Host SSH files were unchanged and
+private fixtures were removed. This was a local SSH proof, not live-cluster
+access or allocation. No GUI copy-button click was tested. Ephemeral evidence:
+`/tmp/wh-bootstrap-evidence-gp1kowo9`.
 
 
 The parent completed the full **isolated root Python suite: 339 passed**, one
@@ -531,7 +561,7 @@ failed before reservation; explicit job600s was unchanged; staged credentials
 were removed and wrapper/workload exited0. SSH/local-bash, scheduler/control
 API and SIF-daemon boundaries were fixtures; no network or real cluster job.
 
-The **actual installed OMP 18.14.2 onboarding proof passed in 32.13 seconds**
+The **historical prior-workflow OMP 18.14.2 onboarding proof passed in 32.13 seconds**
 with private HOME, normal linked-plugin discovery and real PTY. Printed key
 instructions/pause survived a fresh OMP process and resume; ordinary WH writes/
 SSH reads/cleanup verified primary plus additional storage. Discovery generated

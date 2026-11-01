@@ -17,6 +17,7 @@ export interface SetupUI {
   editor(title: string, prefill?: string): Promise<string | undefined>;
   confirm(title: string, message: string): Promise<boolean>;
   notify(message: string, type?: "info" | "warning" | "error" | "success"): void;
+  setEditorText?(text: string): void;
 }
 type Connection = { kind: "alias"; alias: string } | { kind: "direct"; hostname: string; user: string; port: number; jump?: string };
 class Cancelled extends Error {}
@@ -312,12 +313,8 @@ export interface SetupOptions {
   replaceConfig?: typeof rename;
 }
 
-/** Local config evaluation only: no connection, trust import or authentication. */
-export async function resolveSetupSsh(destination: string, _env: Environment): Promise<{ connection: SetupDraft["connection"]; alias: string }> {
-  if (!/^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(destination)) throw new Error("Use an SSH alias or user@hostname; put ports and jump hosts in normal SSH configuration.");
-  // Match the operator's ordinary terminal: -F would suppress system defaults,
-  // and HOME does not redirect OpenSSH's passwd-based user-config lookup.
-  const args = ["-G", destination];
+/** Bounded local config evaluation; never opens an SSH transport. */
+async function localSshSettings(args: string[]): Promise<Record<string, string>> {
   const output = await new Promise<string>((resolve, reject) => {
     const child = spawn("ssh", args, { stdio: ["ignore", "pipe", "ignore"] });
     let text = "";
@@ -331,6 +328,15 @@ export async function resolveSetupSsh(destination: string, _env: Environment): P
     const space = line.indexOf(" ");
     if (space > 0 && settings[line.slice(0, space)] === undefined) settings[line.slice(0, space)] = line.slice(space + 1);
   }
+  return settings;
+}
+
+/** Local config evaluation only: no connection, trust import or authentication. */
+export async function resolveSetupSsh(destination: string, _env: Environment): Promise<{ connection: SetupDraft["connection"]; alias: string }> {
+  if (!/^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(destination)) throw new Error("Use an SSH alias or user@hostname; put ports and jump hosts in normal SSH configuration.");
+  // Match the operator's ordinary terminal: -F would suppress system defaults,
+  // and HOME does not redirect OpenSSH's passwd-based user-config lookup.
+  const settings = await localSshSettings(["-G", destination]);
   if (!settings.hostname || !settings.user || !/^\d+$/.test(settings.port ?? "")) throw new Error("ssh -G did not resolve a hostname, user and port");
   if (!destination.includes("@")) return { connection: { kind: "alias", alias: destination }, alias: destination };
   const hostname = settings.hostname;
@@ -516,26 +522,30 @@ export async function runClusterAdd(ui: SetupUI, publish: (content: string) => v
       }
       if (await exists(sshLayout(env).trust)) await privateRead(sshLayout(env).trust);
       if (await exists(join(directory, "ssh", id))) throw new Error("SSH destination already exists; no credential or draft was written");
-      const consent = `${await exists(key) ? `Reuse the shared key ${key}; never replace it.` : `Generate ONE shared, initially UNENCRYPTED Ed25519 key at ${key}. Protect it with ssh-keygen -p in your own terminal if desired.`} Create a private resumable setup and managed SSH config? Verified shared known_hosts is preserved; missing trust starts empty. No credentials, trust, environment files or secrets will be copied from another machine. After strict SSH succeeds, verify each mapping using one temporary shared-filesystem probe through an existing WH worker, with cleanup on every outcome. No Slurm allocation, deployment or remote credential installation will be performed.`;
+      const consent = `${await exists(key) ? `Reuse the shared SSH key at ${key}; never replace it.` : `Generate one shared, initially UNENCRYPTED Ed25519 key at ${key}.`} Save private resumable state and managed SSH files with user-only permissions? Existing shared host trust is preserved; no keys or trust are installed remotely. After strict SSH succeeds, mapping verification may write and clean up one temporary shared-filesystem probe through an existing WH worker; no allocation or deployment.`;
       if (!await ui.confirm("Create shared SSH connection and save resumable setup?", consent)) throw new Cancelled();
       consented = true;
       await saveDraft(draft, env);
     } else consented = true;
     const credential = await prepareConnection(draft, env);
     if (credential.warning) ui.notify(credential.warning, "warning");
-    await publish([`Cluster setup ${draft.id}: saved resumable connection; no target registered.`, ...(credential.warning ? [credential.warning] : []), ...sshInstructions([{ id: draft.id, ...draft.ssh }], credential, env)].join("\n\n"));
-    draft.phase = "ssh";
-    await saveDraft(draft, env);
-    for (;;) {
-      const action = await choose("Authorize the public key and verify the host fingerprint in your terminal", ["Key installed — test connection", "Save and exit"]);
-      if (action === "Save and exit") throw new Cancelled();
-      try {
-        await transport(draft.ssh, "true", undefined, { timeout_ms: 15_000, signal });
-        break;
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        ui.notify(`Strict SSH test failed: ${error instanceof Error ? error.message : "connection unavailable"}. Key and draft retained; no Slurm discovery has run.`, "warning");
-      }
+    if (draft.phase === "connection") {
+      draft.phase = "ssh";
+      await saveDraft(draft, env);
+      await publish((await sshInstructions([{ id: draft.id, ...draft.ssh }], credential, env)).join("\n\n"));
+      ui.setEditorText?.(`/cluster-add ${draft.id}`);
+      return undefined;
+    }
+    try {
+      await transport(draft.ssh, "true", undefined, { timeout_ms: 15_000, signal });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const message = error instanceof Error ? error.message : "connection unavailable";
+      const hostKeyFailure = /host.?key|known_hosts|host identification/i.test(message);
+      await publish((await sshInstructions([{ id: draft.id, ...draft.ssh }], credential, env, hostKeyFailure)).join("\n\n"));
+      ui.notify(`Strict SSH failed: ${message}. Run the commands, then resume /cluster-add ${draft.id}. Key and draft retained.`, "warning");
+      ui.setEditorText?.(`/cluster-add ${draft.id}`);
+      return undefined;
     }
     const collectMapping = async (): Promise<void> => {
       let choices: string[] = [];
@@ -767,31 +777,44 @@ export async function runClusterAdd(ui: SetupUI, publish: (content: string) => v
   }
 }
 
-function sshInstructions(profiles: Pick<ClusterProfile, "id" | "ssh_host" | "ssh_config_file">[], result: { key: string; publicKey: string; encrypted: boolean }, env: Environment): string[] {
+/** Check the actual managed destination, including hashed entries and custom ports. */
+async function hasSharedHostTrust(profile: Pick<ClusterProfile, "ssh_host" | "ssh_config_file">, trust: string): Promise<boolean> {
+  try {
+    const settings = await localSshSettings(["-G", "-F", profile.ssh_config_file!, profile.ssh_host]);
+    const hostname = settings.hostname;
+    const port = Number(settings.port);
+    if (!hostname || !Number.isInteger(port) || port < 1 || port > 65535) return false;
+    // OpenSSH uses HostKeyAlias verbatim rather than adding the port to it.
+    const alias = settings.hostkeyalias;
+    const lookup = alias && alias !== "none" ? alias : port === 22 ? hostname : `[${hostname}]:${port}`;
+    return Boolean(await keyOutput(["-F", lookup, "-f", trust]));
+  } catch {
+    // An unprovable lookup must not hide the explicit fingerprint-verification step.
+    return false;
+  }
+}
+
+async function sshInstructions(profiles: Pick<ClusterProfile, "id" | "ssh_host" | "ssh_config_file">[], result: { key: string }, env: Environment, forceTrust = false): Promise<string[]> {
   const { trust } = sshLayout(env);
-  return [
-    `Shared SSH key: ${result.key}${result.encrypted ? " (encrypted; original bytes preserved)" : " (unencrypted)"}`,
-    `Shared verified host trust: ${trust}. Existing contents are never replaced; a missing file starts empty.`,
-    "No host trust was imported automatically. In your own terminal first connect and verify each host fingerprint against a trusted site source. Alternatively manually copy only independently verified known_hosts entries into this file (keep mode 0600). Never use ssh-keyscan output as automatic trust.",
-    "The shared public key must be authorized on EACH distinct login host, especially hosts that previously used another per-profile key. No remote authorized_keys or host trust changes were performed.",
-    ...profiles.flatMap((profile) => {
-      const config = profile.ssh_config_file!;
-      const bootstrap = join(dirname(config), "bootstrap_config");
-      return [
-        `${profile.id}: SSH config: ${config}\nBootstrap SSH config (ordinary original authentication): ${bootstrap}`,
-        `ssh -F ${quote(bootstrap)} ${quote(profile.ssh_host)}`,
-        "Install the shared public key yourself (original keys / agent / password / keyboard-interactive authentication remain available through bootstrap; never auto-executed):",
-        `ssh-copy-id -F ${quote(bootstrap)} -i ${quote(result.key + ".pub")} ${quote(profile.ssh_host)}`,
-        "After installation and fingerprint verification, verify strict noninteractive access:",
-        `ssh -F ${quote(config)} -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 ${quote(profile.ssh_host)} 'true'`,
-      ];
-    }),
-    "If ssh-copy-id is unavailable, use the first-connect command, then paste only the PUBLIC key below into ~/.ssh/authorized_keys on that login host (mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys). Never copy the private key.",
-    "Public key:", result.publicKey,
-    ...(result.encrypted ? [] : ["Protect the shared key with a passphrase in your own terminal:", `ssh-keygen -p -f ${quote(result.key)}`]),
-    `ssh-add ${quote(result.key)}`,
-    "Encrypted keys require a running ssh-agent accessible to the process doing BatchMode SSH. agent-sandbox deliberately unsets SSH_AUTH_SOCK: loading a key into the host agent alone does not make it accessible inside the sandbox. Use an explicitly authorized dedicated-agent arrangement or a protected unencrypted managed key according to your policy; the extension does not change sandbox agent policy.",
-  ];
+  const instructions: string[] = [];
+  for (const profile of profiles) {
+    const bootstrap = join(dirname(profile.ssh_config_file!), "bootstrap_config");
+    instructions.push([
+      "```sh",
+      // Bootstrap may authenticate with an old key: copy-id's default filter
+      // would mistake that success for the shared key already being installed.
+      `ssh-copy-id -f -F ${quote(bootstrap)} -i ${quote(result.key + ".pub")} -o StrictHostKeyChecking=ask ${quote(profile.ssh_host)}`,
+      "```",
+    ].join("\n"));
+    if (forceTrust || !await hasSharedHostTrust(profile, trust)) {
+      instructions.push([
+        "```sh",
+        `ssh -F ${quote(bootstrap)} -o StrictHostKeyChecking=ask ${quote(profile.ssh_host)} true`,
+        "```",
+      ].join("\n"));
+    }
+  }
+  return instructions;
 }
 
 /** Explicit local cutover only: never connect, authorize keys, or import trust. */
@@ -888,7 +911,7 @@ export async function runClusterSshMigrate(ui: SetupUI, publish: (content: strin
       `Shared SSH migration complete for: ${recognized.map(({ profile }) => profile.id).join(", ")}.`,
       "All original per-profile key files were preserved. No SSH connection, key installation or allocation was performed.",
       `External or unrecognized profiles NOT migrated: ${skipped.join(", ") || "(none)"}.`,
-      ...sshInstructions(recognized.map(({ profile }) => profile), result, env),
+      ...await sshInstructions(recognized.map(({ profile }) => profile), result, env),
     ].join("\n\n"));
     events.emit("worker-harness:refresh", undefined);
     return recognized.map(({ profile }) => profile.id);

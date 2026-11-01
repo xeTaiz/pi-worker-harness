@@ -162,12 +162,16 @@ Prompt/progress order:
 1. SSH alias or `user@host`; local OpenSSH `-G` resolves user/port/jump. Ask a
    separate username only if needed; reuse an unambiguous managed connection.
    Suggest the short cluster name (or argument), then optional description.
-2. Explicit shared-key/draft consent before credential creation. Immediately
-   publish bootstrap first-connect, independent fingerprint verification,
-   public-only copy-id and manual installation instructions.
-3. **“Key installed — test connection”** executes a real strict BatchMode probe;
-   **“Save and exit”** retains a resumable phase instead. Never autoaccept host
-   trust or execute bootstrap/key-install commands.
+2. Explicit shared-key/draft consent before credential creation. Prepare managed
+   SSH files, save phase `ssh`, publish only fenced `sh` blocks containing one
+   command each with no comments or prose,
+   and return without a test/select overlay or remote probe. New and resumed
+   `connection` drafts take this path. No model turn or text-only custom renderer.
+3. Optionally prefill `/cluster-add <name>` through UI `setEditorText`; the user
+   submits it after running the commands. A fresh invocation of phase `ssh` or
+   later attempts one strict BatchMode probe with no bootstrap modal. Failure
+   republishes relevant commands, warns, retains the draft and returns without
+   a retry loop. Old released `ssh` drafts follow this same resume behavior.
 4. After strict login succeeds, select `list_data` WH storage or type
    `/data/shared/<storage_id>`, then the exact existing cluster-host root.
    Explicit **“Add another filesystem mapping?”** repeats the two mapping
@@ -252,7 +256,7 @@ Without this field ordinary manual-profile SSH behavior is unchanged.
 
 Managed configs retain ordinary user config without editing `~/.ssh/config`.
 `/etc/ssh/ssh_config` is included only when readable, regular, root/current-UID
-owned and not group/world writable; otherwise a durable warning directs
+owned and not group/world writable; otherwise a UI warning directs
 required site settings into user config. User config remains subject to strict
 OpenSSH checks. Alias/ProxyJump/ControlMaster policy is preserved where safely
 available; direct destinations retain resolved user/port/jump policy. Generated
@@ -261,22 +265,32 @@ partition or compute kind.
 
 Both dedicated and bootstrap configs explicitly select shared `UserKnownHostsFile`.
 Its empty 0600 file is created exclusively if absent; existing host trust is
-never overwritten, cleared or imported automatically. The printed bootstrap
-first-connect requires independent fingerprint verification before interactive
-acceptance into this file; ssh-keyscan alone is not verification. Manually
-copying existing entries requires reviewing their independent verification.
+never overwritten, cleared or imported automatically. The interactive commands
+require independent fingerprint verification before acceptance into this file;
+ssh-keyscan alone is not verification. No trust bootstrap command is executed
+by setup, and no normal user trust file is edited.
 A new profile's bootstrap retains destination/includes and original
 key/agent/password/MFA authentication without the shared IdentityFile/IdentitiesOnly
 restriction. A migrated bootstrap explicitly retains the old per-profile
 IdentityFile **without** IdentitiesOnly, enabling old-key-only host access while
 installing the shared public key.
-Printed `ssh-copy-id -F <bootstrap_config> -i <shared-public-key> <alias>` and the
-manual authorized_keys alternative install only the public key. The dedicated
-probe selects shared IdentityFile/IdentitiesOnly with BatchMode=yes,
-StrictHostKeyChecking=yes and ConnectTimeout=10. Bootstrap/copy-id commands
-remain printed only; the explicit installed-key action executes the strict
-probe and subsequent read-only discovery through the existing bounded
-`sshTransport` seam. Missing/changed trust is never bypassed.
+The first fenced command is
+`ssh-copy-id -f -F <bootstrap_config> -i <shared-public-key> -o StrictHostKeyChecking=ask <alias>`.
+Force mode bypasses copy-id's authentication filter: existing bootstrap keys
+must not make it falsely conclude the shared key is installed. Repeated runs
+can append duplicate public-key entries.
+The second, only when trust is absent/unprovable, is
+`ssh -F <bootstrap_config> -o StrictHostKeyChecking=ask <alias> true`.
+Both override normal strict policy only for the operator's interactive,
+fingerprint-confirmed command. Read-only managed `ssh -G` evaluation determines
+the effective hostname/port/HostKeyAlias; bounded `ssh-keygen -F -f <shared-trust>`
+checks the actual lookup, including hashed and non-default-port entries.
+A host-key probe failure always republishes the trust command.
+The dedicated probe remains shared IdentityFile/IdentitiesOnly with BatchMode=yes,
+StrictHostKeyChecking=yes and ConnectTimeout=10, using the existing bounded
+`sshTransport` seam. No public-key dump, passphrase/agent instructions, manual
+fallback, metadata wall or strict test command appears in bootstrap messages.
+Missing/changed trust is never bypassed.
 
 A newly generated shared key is initially unencrypted; existing encrypted keys
 are preserved. The user can add a passphrase in their own terminal and unlock
@@ -292,8 +306,8 @@ key is reused. Legacy keys are not removed. Migration preserves alias/direct
 destination policy, shared host trust, and the old per-profile bootstrap
 IdentityFile without IdentitiesOnly; dedicated configs select the shared identity.
 External/unrecognized configs are explicitly skipped rather than guessed or
-overwritten. It prints bootstrap first-connect, shared-public-key
-installation and strict probe commands for each distinct migrated host.
+overwritten. It prints the same fenced public-key installation command and
+conditional interactive trust command for each migrated profile.
 Different previously authorized profile keys require installing the shared
 public key remotely; config/path changes alone cannot grant access.
 
@@ -629,8 +643,28 @@ Widget should gracefully handle:
 
 ## Current integration evidence (2026-11-01)
 
-Current extension **`bun test`: 439 passed, zero failures**, **2,938 assertions
-across 16 files, 3.93 seconds**, executed by the parent in the extension checkout.
+Current extension **`bun test`: 455 passed, zero failures**, **3,510 assertions
+across 16 files, 4.98 seconds**, executed by the parent in the extension checkout.
+The earlier minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds)
+predates the current bootstrap build.
+
+The parent executed **actual OMP 18.14.2/native PTY and private local OpenSSH
+bootstrap proof: passed in 14.29 seconds**, with normal plugin linking and the
+default SSH authentication-attempt limit. Native `/export` preserved the original
+custom messages and rejected prose/comments: each fence contained one command,
+with initial/failed-missing-trust/known-nondefault-port counts of 2/2/1.
+Initial setup had no probe or covering overlay and prefilled resume; failure
+made exactly one strict probe and retained the draft. Generated interactive
+trust verified the fixture fingerprint, preserved unrelated shared trust, and
+generated `ssh-copy-id -f` deposited the actual WH public key despite a working
+bootstrap identity. Server logs proved the subsequent strict probe accepted
+the WH fingerprint; OMP resume reached mapping.
+
+Zero model turns/model HTTP requests/forwarded external connections occurred;
+seven startup provider CONNECT attempts were denied locally with 403. Only
+private API GETs for workers/jobs/data occurred. Host SSH files were unchanged
+and private fixtures removed. No live cluster/allocation or GUI copy-button
+click was exercised. Ephemeral evidence: `/tmp/wh-bootstrap-evidence-gp1kowo9`.
 
 
 Parent full **isolated root Python suite: 339 passed**, one existing Starlette
@@ -652,7 +686,7 @@ unchanged; staged credentials were removed and wrapper/workload exited0.
 Fixtures replaced SSH with local bash, scheduler/control API and SIF daemon;
 this proves neither network/real SIF-daemon behavior nor actual Slurm jobs.
 
-**Actual installed OMP 18.14.2 onboarding proof passed in 32.13 seconds**, with
+**Historical prior-workflow OMP 18.14.2 onboarding proof passed in 32.13 seconds**, with
 private HOME, normal linked-plugin discovery and real PTY. Printed key setup/
 pause survived a fresh OMP process/resume. Ordinary WH writes, SSH reads and
 cleanup verified primary/additional mapping identity. Generated CPU/A100(max4)/
