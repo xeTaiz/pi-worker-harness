@@ -164,37 +164,62 @@ QoS, constraint, CPU/RAM caps, warning, registration port and polling; software
 defaults are 120 seconds/12888/15 seconds and `-` clears an optional field. No
 IBEX CPU partition, module command, account, capacity or site policy is guessed.
 
-The destination is `WH_CLUSTER_CONFIG` or the normal XDG file. Managed new
-connections live beside that file under `ssh/<id>/`: `id_ed25519`, its public
-key, `config`, and `bootstrap_config`; directories are 0700 and generated files 0600. Optional
-`ssh_config_file` is an absolute profile path, passed through discovery,
-submission, recovery, polling, cancellation and log SSH as argv `-F <path>`.
-Without the field the established ordinary SSH behavior remains unchanged.
-Managed config includes ordinary user configuration without editing `~/.ssh/config`.
-It includes `/etc/ssh/ssh_config` only when readable, regular, root/current-UID
-owned, and without group/world write permission. Unsafe, absent or inaccessible
-system config is omitted with a durable warning directing required site options
-into user config. The user's configuration remains subject to strict OpenSSH
-checks; no ownership/permission checks are weakened. This preserves
-alias/ProxyJump/ControlMaster policy where safely available. Direct-host
-setup uses a unique `wh-<id>` alias with supplied user/port/optional ProxyJump.
-Reusing a profile reuses its connection/key and offers shared storage,
-SIF/runtime/enrollment defaults with explicit retained-path confirmation.
+The destination is `WH_CLUSTER_CONFIG` or the normal XDG file. A single managed
+Ed25519 login identity is shared across onboarded profiles:
+`dirname(clusters.json)/id_ed25519` and `id_ed25519.pub`, plus
+`dirname(clusters.json)/known_hosts` (default `~/.config/worker-harness`).
+Shared files are directly in the configuration parent, not `ssh/`, avoiding
+collisions with valid legacy profile IDs. Per-connection
+`config` and `bootstrap_config` remain under `ssh/<id>/`; reuse can retain the
+original profile's config path. Directories are 0700/generated files 0600;
+existing shared identity/trust files are preserved. Optional absolute
+`ssh_config_file` is passed as argv `-F <path>` through all cluster SSH actions.
+Without this field ordinary manual-profile SSH behavior is unchanged.
 
-After local creation the command prints the paths, manual fingerprint-verifying
-SSH command, `ssh-copy-id -F <bootstrap_config> -i <public-key> <alias>`, public text/manual
-authorized_keys alternative, `ssh-keygen -p -f <private-key>`, `ssh-add`, and a
-strict BatchMode/StrictHostKeyChecking/ConnectTimeout probe. It does not execute
-these commands or connect remotely. Host trust must be independently verified;
-the generated initially unencrypted key can be passphrase-protected in the
-user's own terminal and unlocked via an agent inherited through SSH_AUTH_SOCK.
-No key/passphrase/token is put in Git, workload argv, or an allocation.
+Managed configs retain ordinary user config without editing `~/.ssh/config`.
+`/etc/ssh/ssh_config` is included only when readable, regular, root/current-UID
+owned and not group/world writable; otherwise a durable warning directs
+required site settings into user config. User config remains subject to strict
+OpenSSH checks. Alias/ProxyJump/ControlMaster policy is preserved where safely
+available; direct mode creates `wh-<id>` with supplied user/port/ProxyJump.
+Reusing a connection offers shared-storage/SIF/runtime/enrollment defaults with
+explicit retained-path confirmation.
 
-First-connect and key-install commands use `bootstrap_config`, which retains the
-target/user config and the safe conditional system Include without dedicated IdentityFile/IdentitiesOnly
-restriction. This preserves existing default-file/agent/password/MFA bootstrap
-authentication before the new key is authorized. Only the final strict BatchMode
-probe uses the dedicated profile `config`.
+Both dedicated and bootstrap configs explicitly select shared `UserKnownHostsFile`.
+Its empty 0600 file is created exclusively if absent; existing host trust is
+never overwritten, cleared or imported automatically. The printed bootstrap
+first-connect requires independent fingerprint verification before interactive
+acceptance into this file; ssh-keyscan alone is not verification. Manually
+copying existing entries requires reviewing their independent verification.
+A new profile's bootstrap retains destination/includes and original
+key/agent/password/MFA authentication without the shared IdentityFile/IdentitiesOnly
+restriction. A migrated bootstrap explicitly retains the old per-profile
+IdentityFile **without** IdentitiesOnly, enabling old-key-only host access while
+installing the shared public key.
+Printed `ssh-copy-id -F <bootstrap_config> -i <shared-public-key> <alias>` and the
+manual authorized_keys alternative install only the public key. The final
+dedicated-config probe selects shared IdentityFile/IdentitiesOnly with
+BatchMode=yes, StrictHostKeyChecking=yes and ConnectTimeout=10. No command is
+executed by onboarding, and missing/changed trust is never bypassed.
+
+A newly generated shared key is initially unencrypted; existing encrypted keys
+are preserved. The user can add a passphrase in their own terminal and unlock
+it through an accessible dedicated agent. BatchMode never captures/unlocks a
+passphrase or completes MFA. The current sandbox launcher unsets SSH_AUTH_SOCK;
+ordinary host ssh-add is not sufficient (see the restart gate below).
+No private key/passphrase/token enters Git, workload argv or an allocation.
+
+`/cluster-ssh-migrate` explicitly migrates existing recognized wizard-generated
+profiles. If no shared key exists, the user selects one legacy wizard key and
+confirms an exclusive byte-copy preserving its encryption; an existing shared
+key is reused. Legacy keys are not removed. Migration preserves alias/direct
+destination policy, shared host trust, and the old per-profile bootstrap
+IdentityFile without IdentitiesOnly; dedicated configs select the shared identity.
+External/unrecognized configs are explicitly skipped rather than guessed or
+overwritten. It prints bootstrap first-connect, shared-public-key
+installation and strict probe commands for each distinct migrated host.
+Different previously authorized profile keys require installing the shared
+public key remotely; config/path changes alone cannot grant access.
 
 Local profile creation is not connectivity or scheduler readiness proof. The
 login SSH key, restricted ephemeral Tailnet enrollment file, operator/session
@@ -207,6 +232,42 @@ prerequisites. CPU preparation is ordinary zero-GPU enqueue on a second profile
 sharing storage/SIF, followed by explicit completion/import checks before GPU work.
 The standalone root `specs/local-slurm.md` contains transfer/deployment instructions,
 complete CPU/GPU example config, environment hashing/flock rules, and live gates.
+
+### Sandbox persistence and verification boundary
+
+The agent-sandbox allowlist at
+`~/dotfiles/agent-sandbox/.config/agent-sandbox/paths` must persist both
+`~/.config/worker-harness` and `~/.local/state/worker-harness`, preserving all
+unrelated entries. Before relaunch, an operator creates these directories with
+0700 permissions **outside the current masked sandbox HOME**; absent source
+directories are skipped by the launcher. This session's filesystem visibility
+does not establish whether host profiles or state already exist.
+For relaunch, explicitly set host `AGENT_SANDBOX_PATHS` to the edited dotfiles
+file or verify the active host paths-file/symlink resolves to it; that host
+configuration has not been observed from this sandbox.
+
+Custom `XDG_CONFIG_HOME`/`WH_CLUSTER_CONFIG` and
+`XDG_STATE_HOME`/`WH_CLUSTER_STATE_DIR` require allowlisting and creating the
+actual host configuration/managed-SSH and state locations. Config persistence
+alone loses recovery journals/cursors; state persistence alone loses login
+identity/trust. Existing profiles require explicit `/cluster-ssh-migrate`;
+adding mounts cannot repair legacy paths or authorize the shared key remotely.
+
+Mount changes require a complete **agent-sandbox restart**, not just an OMP
+module/process restart. The launcher currently unsets `SSH_AUTH_SOCK`; an
+encrypted key requires separately provisioned dedicated agent/socket access and
+explicit SSH selection inside the new sandbox. Host `ssh-add` is insufficient,
+and this feature changes neither launcher nor agent-forwarding policy.
+
+The main agent exercised the actual launcher and edited allowlist against a
+private HOME fixture: config/state mounts were visible, writes persisted to
+the outside fixture, unrelated `~/.ssh` stayed hidden and SSH_AUTH_SOCK stayed
+unset. No real host directory/key creation occurred. The final native extension
+suite passed **361 tests, zero failures**, 2,764 expectations/14 files (2.19 seconds).
+Actual **OMP 18.14.2 shared-SSH onboarding/migration smoke passed in 32.39 seconds**,
+including native `/export` runtime-message handoff evidence (details below).
+Stop at the required full sandbox restart before real login testing;
+post-restart login/live-cluster proofs remain separate pending gates.
 
 ---
 
@@ -462,16 +523,16 @@ Widget should gracefully handle:
 
 Prior integrated results: 336 root Python tests passed with one existing
 Starlette warning; 278 extension Bun tests passed with zero failures
-(1,388 expectations/13 files). Native bare `bun test` including onboarding and
-SSH portability now passes **345 tests**, zero failures, 2,341 expectations/14
-files (1.62 seconds), without bwrap or a system-config fixture.
-Native interactive OMP onboarding passed in 15.14 seconds: isolated plugin
+(1,388 expectations/13 files). Historical per-profile onboarding/SSH-portability
+`bun test` passed **345 tests**, zero failures, 2,341 expectations/14 files
+(1.62 seconds), without bwrap or a system-config fixture.
+Historical native interactive OMP onboarding passed in 15.14 seconds: isolated plugin
 replacement/relink/discovery, artifact-free cancellation, existing-profile
 preservation on save, actual Ed25519 public-key/fingerprint/permissions, real
 bootstrap/dedicated OpenSSH `-G` host/user/port/jump/original-identity resolution,
 and durable visible public instructions.
 
-Both current proofs ran without bwrap or system-SSH-config substitution. The
+Both historical per-profile proofs ran without bwrap or system-SSH-config substitution. The
 production inclusion guard handled this host's unsafe UID-65534-owned 0644
 system config by omitting it with a durable warning. No product permission
 bypass or host system edit was used. OMP startup provider/catalog CONNECT
@@ -479,6 +540,22 @@ attempts were recorded and denied by a local proxy with 403 before TLS:
 zero forwarded connections/model completions, and no real cluster SSH/submission.
 The candidate updated SIF is not built/executed, and live IBEX/charged acceptance
 is not done.
+Current sandbox mount-fixture proof passed as recorded above. The final native
+extension suite passed **361 tests, zero failures**, 2,764 expectations/14 files
+(2.19 seconds). Actual **OMP 18.14.2 shared-SSH smoke passed in 32.39 seconds**:
+normal plugin link/discovery, `/cluster-add` cancel/two independent profiles
+sharing one configuration-root key and explicit managed host trust, migration
+cancel/four legacy profiles including IDs `id_ed25519` and `known_hosts`,
+selected-key promotion preserving its fingerprint and old keys/external config/
+ordinary SSH config, real OpenSSH `-G` for both configs, and repeat migration
+retaining the old bootstrap identity.
+
+Native OMP creates no JSONL journal before a first model turn. Its supported
+`/export` exposed actual persisted native `custom_message` entries, IDs,
+commands and warnings, proving runtime handoff without a model call.
+Startup CONNECT attempts were all locally denied with 403; no SSH network
+connection or real host-trust autoacceptance occurred. Full sandbox restart and
+real login/IBEX acceptance remain required separate gates.
 
 Local proof covers real runtime/control/database/queue behavior through actual
 Bun MCP stdio, including cluster enqueue, failure delivery during worker

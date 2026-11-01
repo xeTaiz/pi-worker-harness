@@ -203,36 +203,67 @@ value. A site's actual values and permissions must come from its operator, not
 guessed IBEX partition names.
 
 Profiles are saved to `WH_CLUSTER_CONFIG` or the XDG configuration path above.
-New connections use `dirname(clusters.json)/ssh/<id>/id_ed25519`, its `.pub`,
-`config` and `bootstrap_config`, with 0700 directories/0600 files. The profile records
-`ssh_config_file`; cluster SSH calls use `-F` without modifying `~/.ssh/config`.
-Alias mode retains user SSH configuration. The system `/etc/ssh/ssh_config` is
-included only if readable/regular, owned by root or the current UID, and not
-group/world writable. Unsafe, missing or inaccessible system config is omitted
-with a durable warning; put required site options in user config before continuing.
-User config remains subject to strict OpenSSH checks; no checks are weakened.
-Direct mode creates `wh-<id>` with supplied hostname/user/port and optional ProxyJump. Reusing
-another profile keeps its managed connection/key and offers shared storage,
-SIF/runtime/enrollment defaults with retained-path confirmation. Run the
-command again for a CPU preparation target sharing the GPU profile's
-`storage_id`, `shared_root`, and SIF; use the real authorized CPU partition.
+All onboarded clusters share **one** managed login identity:
+`dirname(clusters.json)/id_ed25519` and `id_ed25519.pub`, plus
+`dirname(clusters.json)/known_hosts` (default `~/.config/worker-harness`).
+These shared files are directly in the configuration parent, not `ssh/`, so
+valid legacy profile IDs cannot collide with them. Connection-specific
+`config` and `bootstrap_config` remain under `ssh/<id>/`; connection reuse can
+retain the original profile's config path. Directories are 0700/files 0600.
+Existing shared key/trust files are reused, never overwritten. The profile's
+`ssh_config_file` selects argv `-F` without modifying `~/.ssh/config`.
 
-The completion message prints the exact paths and commands. Review them, then
-in your own terminal verify the login host's fingerprint against an independent
-site source, establish known-host trust, and install **only the public key**:
-`ssh-copy-id -F <bootstrap_config> -i <public-key> <alias>` (or the printed manual
-authorized_keys alternative). The first-connect command also uses bootstrap_config,
-which retains existing default-file/agent/password authentication without forcing
-the not-yet-authorized dedicated identity. Commands are printed, not executed.
-Do not disable strict host checking or trust ssh-keyscan alone.
+Alias mode retains ordinary user SSH/ProxyJump/ControlMaster policy.
+`/etc/ssh/ssh_config` is included only if readable/regular, root/current-UID
+owned, and not group/world writable; otherwise a durable warning directs
+required site options into user config. Strict OpenSSH checks are not weakened.
+Direct mode creates `wh-<id>` with supplied hostname/user/port and optional
+ProxyJump. Reuse offers storage/SIF/runtime/enrollment defaults with retained-path
+confirmation. CPU/GPU profiles sharing storage use the same `storage_id`,
+`shared_root`, and SIF but their real authorized partitions.
 
-The new private key initially has no passphrase. Add one interactively with
-`ssh-keygen -p -f <private-key>`, then `ssh-add <private-key>` in an existing
-SSH agent; start an agent if needed and ensure OMP inherits `SSH_AUTH_SOCK`.
-The printed strict probe uses the dedicated `config` (not bootstrap_config)/alias with `BatchMode=yes`,
-`StrictHostKeyChecking=yes`, and `ConnectTimeout=10`. It must succeed before
-using tools; unattended submission cannot answer a passphrase/MFA prompt.
-Registration of the profile only makes `cluster:<id>` discoverable, not ready.
+Both dedicated and bootstrap configs explicitly select the shared
+`UserKnownHostsFile`. An empty 0600 configuration-parent `known_hosts` is created only if absent;
+existing trust is not replaced, cleared or automatically imported. Verify the
+host's fingerprint against an independent site source before accepting it with
+the printed bootstrap first-connect command. Copy existing entries only after
+reviewing their independent verification; `ssh-keyscan` alone is not proof.
+Install **only the shared public key** with the printed
+`ssh-copy-id -F <bootstrap_config> -i <shared-public-key> <alias>` or manual
+authorized_keys alternative. A new profile's bootstrap preserves existing
+key/agent/password/MFA authentication and target/includes without imposing the
+shared IdentityFile/IdentitiesOnly restriction. A migrated profile's bootstrap
+retains its **old per-profile IdentityFile without IdentitiesOnly**, allowing
+old-key-only hosts to authorize the shared public key. The final probe uses
+dedicated `config`, shared identity and `IdentitiesOnly`, with `BatchMode=yes`,
+`StrictHostKeyChecking=yes`, and `ConnectTimeout=10`. Commands are printed,
+not executed. Never bypass missing/changed host trust.
+
+A newly generated shared private key initially has no passphrase; an existing
+shared key (including an encrypted one) is preserved. Add a passphrase in your
+own terminal with `ssh-keygen -p -f <shared-private-key>` if desired, and unlock
+through an accessible dedicated agent. Read the sandbox/agent gate below first:
+the current launcher unsets `SSH_AUTH_SOCK`. BatchMode cannot unlock a key or
+answer MFA. Profile discovery alone does not establish login readiness.
+
+#### Migrate existing per-profile SSH setup
+
+After the full sandbox restart below, run `/cluster-ssh-migrate` interactively.
+If the shared key is absent, explicitly select one existing wizard-managed key
+and confirm its exclusive byte-copy into the shared path; encrypted keys retain
+their encryption. An existing shared key is always reused. Legacy keys are not
+deleted. Only recognized wizard-generated configs are rewritten; external or
+unrecognized configs are explicitly skipped, not guessed. Review the report.
+
+Migration retains destination/alias policy, shared host trust and each old
+profile's IdentityFile in bootstrap without IdentitiesOnly; dedicated configs
+select only the shared identity. It prints bootstrap first-connect,
+shared-public-key installation and strict dedicated-config probes for each
+distinct migrated host. Install this **shared public key** on each affected
+account that previously accepted a different profile key.
+Host trust is not imported automatically; manually review verified entries or
+verify each host interactively into the shared known_hosts. New mounts alone
+cannot migrate old profiles or authorize the shared identity remotely.
 
 This login key is **not** `tailnet_key_file` (a separately provisioned restricted
 ephemeral allocation-enrollment key) or the WH operator/session control bearer.
@@ -242,6 +273,55 @@ allocated workers register on **12888**, with orchestrator-to-worker Tailnet SSH
 shared-identity proof on an existing participating worker, a one-time updated
 candidate SIF build, matching deployed control/runtime, and site/charged-submit
 approval remain prerequisites; onboarding does not provision them.
+
+### Sandbox persistence and required restart
+
+The actual allowlist at
+`~/dotfiles/agent-sandbox/.config/agent-sandbox/paths` includes both
+`~/.config/worker-harness` and `~/.local/state/worker-harness`. Keep profiles,
+managed SSH identity/host trust **and** state journals/cursors persistent.
+The launcher skips absent host sources. In a **host terminal outside the
+existing sandbox**, before launching its replacement:
+
+```bash
+mkdir -p "$HOME/.config/worker-harness" "$HOME/.local/state/worker-harness"
+chmod 700 "$HOME/.config/worker-harness" "$HOME/.local/state/worker-harness"
+```
+
+Creating these inside the current masked HOME does not establish persistent
+host directories. Their absence inside this sandbox says nothing about existing
+host configuration. For `XDG_CONFIG_HOME`, `WH_CLUSTER_CONFIG`, `XDG_STATE_HOME`
+or `WH_CLUSTER_STATE_DIR` overrides, allowlist and create the **actual** host
+configuration/SSH and state paths; the default entries do not cover arbitrary
+overrides.
+
+For the new host launch, set
+`AGENT_SANDBOX_PATHS="$HOME/dotfiles/agent-sandbox/.config/agent-sandbox/paths"`,
+or verify that the host's active paths-file/symlink resolves to this edited
+file. The active host configuration/symlink has not been observed here.
+
+**Exit and restart agent-sandbox, then start OMP there. Restarting only OMP
+cannot apply changed mounts.** Existing profiles require `/cluster-ssh-migrate`
+after restart; new path mounts alone do not repair legacy SSH configuration.
+Stop at this restart gate before attempting the real login test.
+
+The current launcher unsets `SSH_AUTH_SOCK`. A passphrase-protected shared key
+therefore needs deliberately provisioned **dedicated** agent/socket access
+inside the new sandbox, explicitly selected for SSH. Host `ssh-add` and an OMP
+restart alone do not provide it; even a sandbox restart under the unchanged
+launcher does not forward an agent. Do not forward the general host agent or
+change launcher policy as part of this setup.
+
+The main agent's actual-launcher/private-HOME smoke passed with the modified
+allowlist: both mounts were visible, writes persisted to the outside fixture,
+unrelated `~/.ssh` stayed hidden and `SSH_AUTH_SOCK` stayed unset. It did not
+create real host directories or keys. The final native extension suite passed
+**361 tests, zero failures**, 2,764 expectations/14 files (2.19 seconds).
+Actual **OMP 18.14.2 shared-SSH onboarding/migration smoke passed** in 32.39
+seconds, including native `/export` message handoff evidence (details below).
+Live login/cluster proof remains pending full sandbox restart, migration,
+independent fingerprint verification and the strict probe. Local proofs do not
+authorize charged work.
 
 ## Tools
 
@@ -335,15 +415,15 @@ Key bindings:
 
 Prior integrated suites passed 336 root Python tests (one existing Starlette
 warning) and 278 Bun tests (zero failures, 1,388 expectations/13 files).
-Native bare `bun test` including onboarding/SSH portability now passes **345
+Historical per-profile onboarding/SSH-portability `bun test` passed **345
 tests**, zero failures, 2,341 expectations/14 files (1.62 seconds), without bwrap
-or a system-config fixture. Native interactive OMP onboarding also passed
-(15.14 seconds): isolated plugin replacement/relink and discovery,
+or a system-config fixture. Historical native interactive OMP onboarding also
+passed (15.14 seconds): isolated plugin replacement/relink and discovery,
 cancel without artifacts, save preserving existing profiles, real Ed25519
 public-key/fingerprint/permissions, bootstrap/dedicated OpenSSH `-G` resolution,
 and visible durable public setup instructions.
 
-Both current proofs ran without bwrap or system-config substitution. The production
+Both historical per-profile proofs ran without bwrap or system-config substitution. The production
 guard omitted this host's unsafe UID-65534-owned 0644 system SSH config with a
 durable warning; no product permission bypass or host system edit was used.
 OMP startup provider/catalog CONNECT attempts were recorded and denied locally
@@ -351,6 +431,22 @@ with 403 before TLS; there were zero forwarded connections/model completions,
 and no real cluster SSH connection or submission occurred.
 The updated candidate SIF has not been built/executed, and no live IBEX/charged
 submission has been performed.
+Current sandbox mount-fixture proof passed as recorded above. The final native
+extension suite passed **361 tests, zero failures**, 2,764 expectations/14 files
+(2.19 seconds). Actual **OMP 18.14.2 shared-SSH smoke passed in 32.39 seconds**:
+normal plugin link/discovery; `/cluster-add` cancel and two independent
+profiles sharing one configuration-root key and explicit managed host trust;
+migration cancel and four legacy profiles including IDs `id_ed25519` and
+`known_hosts`; selected-key promotion preserving its fingerprint, old keys,
+external config and ordinary SSH config; real OpenSSH `-G` for both configs;
+and repeat migration retaining the old bootstrap identity.
+
+Before a first model turn native OMP creates no JSONL journal. Its supported
+`/export` exposed the actual persisted native `custom_message` entries, IDs,
+commands and warnings as runtime-handoff evidence; no model call was needed.
+Startup CONNECT attempts were all locally blocked with 403. No SSH network
+connection or real host-trust autoacceptance occurred. Real login/IBEX proof
+still requires the full sandbox restart and explicit live gates above.
 
 Isolated local validation exercised the real control API, database, queue,
 daemon and job runner through actual Bun MCP stdio: cluster discovery/enqueue,

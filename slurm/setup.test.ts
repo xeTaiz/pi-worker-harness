@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { loadClusterProfiles, sharedPath, type ClusterProfile, type Environment } from "./profiles.ts";
-import { inspectSystemSshConfig, runClusterAdd, type SetupUI } from "./setup.ts";
+import { inspectSystemSshConfig, runClusterAdd, runClusterSshMigrate, type SetupUI } from "./setup.ts";
 
 let root: string;
 let home: string;
@@ -188,7 +188,7 @@ function shellQuote(value: string): string { return "'" + value.replace(/'/g, "'
 async function expectSecureFiles(profile: ClusterProfile): Promise<void> {
   const directory = dirname(profile.ssh_config_file!);
   for (const path of [dirname(configPath), dirname(directory), directory]) expect((await stat(path)).mode & 0o777).toBe(0o700);
-  for (const path of [configPath, profile.ssh_config_file!, join(directory, "bootstrap_config"), join(directory, "id_ed25519"), join(directory, "id_ed25519.pub")]) {
+  for (const path of [configPath, profile.ssh_config_file!, join(directory, "bootstrap_config"), join(dirname(configPath), "id_ed25519"), join(dirname(configPath), "id_ed25519.pub"), join(dirname(configPath), "known_hosts")]) {
     const info = await lstat(path);
     expect(info.isFile()).toBe(true);
     expect(info.isSymbolicLink()).toBe(false);
@@ -196,15 +196,22 @@ async function expectSecureFiles(profile: ClusterProfile): Promise<void> {
   }
 }
 
-async function expectBootstrapAuthentication(profile: ClusterProfile): Promise<void> {
+async function expectBootstrapAuthentication(profile: ClusterProfile, legacyKey?: string): Promise<void> {
   const dedicated = await effectiveSSH(profile);
   const bootstrap = await effectiveSSH(profile, join(dirname(profile.ssh_config_file!), "bootstrap_config"));
   // OpenSSH's effective settings, not config source wording, establish that the
   // install path still offers default identities and unnamed ssh-agent keys.
   expect(dedicated.get("identitiesonly")).toBe("yes");
   expect(bootstrap.get("identitiesonly")).toBe("no");
-  expect(bootstrap.get("identityfile")).toMatch(/(?:~|\/).*\.ssh\/id_/);
-  expect(bootstrap.get("identityfile")).not.toContain(dirname(profile.ssh_config_file!));
+  if (legacyKey) expect(bootstrap.get("identityfile")?.replace(/%%/g, "%")).toBe(legacyKey);
+  else {
+    expect(bootstrap.get("identityfile")).toMatch(/(?:~|\/).*\.ssh\/id_/);
+    expect(bootstrap.get("identityfile")).not.toContain(dirname(profile.ssh_config_file!));
+  }
+  for (const values of [dedicated, bootstrap]) {
+    expect(values.get("userknownhostsfile")?.replace(/%%/g, "%")).toContain(join(dirname(configPath), "known_hosts"));
+  }
+  expect(dedicated.get("identityfile")?.replace(/%%/g, "%")).toContain(join(dirname(configPath), "id_ed25519"));
   for (const field of ["hostname", "user", "port", "proxyjump", "controlmaster", "controlpersist"]) {
     expect(bootstrap.get(field)).toBe(dedicated.get(field));
   }
@@ -214,7 +221,7 @@ async function expectSafePublication(ui: WizardUI, profile: ClusterProfile): Pro
   await expectBootstrapAuthentication(profile);
   expect(ui.published).toHaveLength(1);
   const output = ui.published[0]!;
-  const key = join(dirname(profile.ssh_config_file!), "id_ed25519");
+  const key = join(dirname(configPath), "id_ed25519");
   const publicKey = (await readFile(key + ".pub", "utf8")).trim();
   const privateKey = await readFile(key, "utf8");
   expect(output.includes(privateKey)).toBe(false);
@@ -450,7 +457,7 @@ for (const invalid of ["{not valid JSON", JSON.stringify({ version: 2, clusters:
   });
 }
 
-test("copying a managed connection reuses its config, key and canonical shared storage, without a sibling key", async () => {
+test("copying a managed connection creates per-profile configs using the same shared key and storage", async () => {
   const sourceUI = new WizardUI("source-gpu", { replies: { "Compute kind": "gpu", "Slurm partition": "gpu-partition" } });
   const source = await sourceUI.run();
   sourceUI.expectScriptUsed();
@@ -472,7 +479,7 @@ test("copying a managed connection reuses its config, key and canonical shared s
   expect(result).toMatchObject({
     id: "copied-cpu", compute_kind: "cpu", max_gpus: 0, storage_id: source!.storage_id,
     shared_root: source!.shared_root, sif_path: source!.sif_path, ssh_host: source!.ssh_host,
-    ssh_config_file: source!.ssh_config_file, runtime: source!.runtime, runtime_setup: source!.runtime_setup,
+    ssh_config_file: join(dirname(configPath), "ssh", "copied-cpu", "config"), runtime: source!.runtime, runtime_setup: source!.runtime_setup,
     tailnet_key_file: source!.tailnet_key_file, tailnet_login_server: source!.tailnet_login_server,
     orchestrator_host: source!.orchestrator_host,
   });
@@ -482,7 +489,7 @@ test("copying a managed connection reuses its config, key and canonical shared s
   expect(copied.matching("SSH hostname")).toEqual([]);
   expect(copied.matching("Confirm cluster")[0]?.current).toMatch(/reuse/i);
   expect(await tree(sourceDirectory)).toEqual(oldSSH);
-  expect(await readdir(dirname(sourceDirectory))).toEqual(["source-gpu"]);
+  expect((await readdir(dirname(sourceDirectory))).sort()).toEqual(["copied-cpu", "source-gpu"]);
   expect((await document()).clusters).toEqual([source, result]);
   await expectSafePublication(copied, result!);
 });
@@ -492,7 +499,7 @@ test("copying refuses a symlinked private key without changing the source or reg
   const source = await sourceUI.run();
   sourceUI.expectScriptUsed();
   expect(source).toBeDefined();
-  const key = join(dirname(source!.ssh_config_file!), "id_ed25519");
+  const key = join(dirname(configPath), "id_ed25519");
   const outsideKey = join(root, "outside-private-key");
   await writeFile(outsideKey, await readFile(key), { mode: 0o600 });
   await rm(key);
@@ -516,7 +523,7 @@ for (const invalidPublicFile of ["private-key", "invalid-ed25519-blob"] as const
     const source = await sourceUI.run();
     sourceUI.expectScriptUsed();
     expect(source).toBeDefined();
-    const key = join(dirname(source!.ssh_config_file!), "id_ed25519");
+    const key = join(dirname(configPath), "id_ed25519");
     const privateKey = await readFile(key, "utf8");
     await writeFile(key + ".pub", invalidPublicFile === "private-key" ? privateKey : "ssh-ed25519 c2VjcmV0 invalid-key-blob");
     const before = await tree();
@@ -563,7 +570,7 @@ test("two simultaneous real registrations never lose a profile; a lock loser can
   expect(firstCommit.clusters[0]).toEqual(old);
   expect(firstCommit.clusters.slice(1).map((profile) => profile.id).sort()).toEqual(results.filter((profile): profile is ClusterProfile => profile !== undefined).map((profile) => profile.id).sort());
   const committedKeys = new Map<string, string>();
-  for (const profile of firstCommit.clusters.slice(1)) committedKeys.set(profile.id, await readFile(join(dirname(profile.ssh_config_file!), "id_ed25519"), "utf8"));
+  for (const profile of firstCommit.clusters.slice(1)) committedKeys.set(profile.id, await readFile(join(dirname(configPath), "id_ed25519"), "utf8"));
   for (let index = 0; index < results.length; index++) {
     if (results[index] !== undefined) continue;
     const failed = index === 0 ? first : second;
@@ -579,7 +586,7 @@ test("two simultaneous real registrations never lose a profile; a lock loser can
   expect(saved.clusters.slice(1).map((profile) => profile.id).sort()).toEqual(["parallel-a", "parallel-b"]);
   for (const profile of saved.clusters.slice(1)) {
     await expectSecureFiles(profile);
-    if (committedKeys.has(profile.id)) expect((await readFile(join(dirname(profile.ssh_config_file!), "id_ed25519"), "utf8")) === committedKeys.get(profile.id)).toBe(true);
+    if (committedKeys.has(profile.id)) expect((await readFile(join(dirname(configPath), "id_ed25519"), "utf8")) === committedKeys.get(profile.id)).toBe(true);
   }
   expect((await tree()).some((entry) => /\.lock$|\.tmp$/.test(entry.path))).toBe(false);
 });
@@ -596,7 +603,7 @@ test("concurrent registrations of the same ID commit exactly one key/profile wit
   expect(winners).toHaveLength(1);
   expect((await document()).clusters).toEqual([baseline(), winners[0]]);
   expect(first.published.length + second.published.length).toBe(1);
-  expect(await readdir(join(dirname(configPath), "ssh"))).toEqual(["same-id"]);
+  expect((await readdir(join(dirname(configPath), "ssh"))).sort()).toEqual(["same-id"]);
   await expectSecureFiles(winners[0]!);
   expect((await tree()).some((entry) => /\.lock$|\.tmp$/.test(entry.path))).toBe(false);
 });
@@ -665,3 +672,218 @@ test("native system SSH config policy permits safe user alias resolution without
   expect(code).not.toBe(0);
   expect(stderr).toContain("Bad owner or permissions");
 });
+
+async function legacyProfiles(encrypted = false, ids = ["legacy-cpu", "legacy-second"]): Promise<{ profiles: ClusterProfile[]; keys: string[] }> {
+  const profiles: ClusterProfile[] = [];
+  const keys: string[] = [];
+  const pathToken = (text: string) => '"' + text.replace(/%/g, "%%").replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+  for (const [index, id] of ids.entries()) {
+    const directory = join(dirname(configPath), "ssh", id);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const key = join(directory, "id_ed25519");
+    await local(["ssh-keygen", "-q", "-t", "ed25519", "-N", encrypted && index === 0 ? "fixture-passphrase" : "", "-f", key]);
+    await chmod(key + ".pub", 0o600);
+    const profile = { ...baseline(id), ssh_host: index === 0 ? `wh-${id}` : "site-login", ssh_config_file: join(directory, "config") } as ClusterProfile;
+    // Reproduce the prior wizard format independently of the new renderer.
+    for (const bootstrap of [false, true]) {
+      const lines = [`Host ${profile.ssh_host}`];
+      if (!bootstrap) lines.push(`  IdentityFile ${pathToken(key)}`, "  IdentitiesOnly yes");
+      if (index === 0) lines.push("  HostName 192.0.2.17", "  User researcher", "  Port 2222", "  ProxyJump jump-user@gateway.example.test:2200");
+      lines.push("Host *", `  Include ${pathToken(join(home, ".ssh", "config"))}`, "");
+      await writeFile(join(directory, bootstrap ? "bootstrap_config" : "config"), lines.join("\n"), { mode: 0o600 });
+    }
+    profiles.push(profile);
+    keys.push(key);
+  }
+  await saveBaseline(profiles);
+  return { profiles, keys };
+}
+
+test("independent profiles share exactly one key and preserve every verified known_hosts byte", async () => {
+  const first = await new WizardUI("first").run();
+  expect(first).toBeDefined();
+  const ssh = dirname(configPath);
+  const originalKey = await readFile(join(ssh, "id_ed25519"));
+  const trust = "|1|verified-hash|verified-host ssh-ed25519 site-public-key\n# retain exactly\n";
+  await writeFile(join(ssh, "known_hosts"), trust, { mode: 0o600 });
+  const secondUI = new WizardUI("second", { replies: { "SSH hostname / IP": "192.0.2.18" } });
+  const second = await secondUI.run();
+  expect(second).toBeDefined();
+  expect(await readFile(join(ssh, "id_ed25519"))).toEqual(originalKey);
+  expect(await readFile(join(ssh, "known_hosts"), "utf8")).toBe(trust);
+  expect(secondUI.matching("Confirm cluster")[0]?.current).toContain("Reuse the existing shared SSH key");
+  await expectBootstrapAuthentication(first!);
+  await expectBootstrapAuthentication(second!);
+  expect(await readdir(dirname(second!.ssh_config_file!))).toEqual(["bootstrap_config", "config"]);
+});
+
+for (const encrypted of [false, true]) {
+  test(`explicit legacy migration preserves ${encrypted ? "encrypted" : "unencrypted"} chosen key bytes, connection settings and all old keypairs`, async () => {
+    const { profiles, keys } = await legacyProfiles(encrypted);
+    const original = await readFile(configPath, "utf8");
+    const originals = await Promise.all(keys.map(async (key) => [await readFile(key), await readFile(key + ".pub")]));
+    const previous = await Promise.all(profiles.map((profile) => effectiveSSH(profile)));
+    const externalFile = join(home, "external.config");
+    await writeFile(externalFile, "Host *\n  HostName external.example.test\n", { mode: 0o600 });
+    await saveBaseline([...profiles, { ...baseline("external-cpu"), ssh_config_file: externalFile }]);
+    const configBefore = await readFile(configPath, "utf8");
+    const ui = new WizardUI("migration", { replies: { "Select existing managed key": "legacy-cpu" } });
+    expect(await runClusterSshMigrate(ui, ui.publish, env)).toEqual(["legacy-cpu", "legacy-second"]);
+    ui.expectScriptUsed();
+    expect(await readFile(configPath, "utf8")).toBe(configBefore);
+    expect(original).not.toBe(configBefore);
+    const shared = join(dirname(configPath), "id_ed25519");
+    expect(await readFile(shared)).toEqual(originals[0]![0]);
+    expect(await readFile(shared + ".pub")).toEqual(originals[0]![1]);
+    for (const [index, key] of keys.entries()) {
+      expect(await readFile(key)).toEqual(originals[index]![0]);
+      expect(await readFile(key + ".pub")).toEqual(originals[index]![1]);
+      const effective = await effectiveSSH(profiles[index]!);
+      for (const field of ["hostname", "user", "port", "proxyjump", "controlmaster", "controlpersist"]) expect(effective.get(field)).toBe(previous[index]!.get(field));
+      await expectBootstrapAuthentication(profiles[index]!, key);
+      await expectSecureFiles(profiles[index]!);
+    }
+    expect(await readFile(externalFile, "utf8")).toBe("Host *\n  HostName external.example.test\n");
+    expect(ui.published[0]).toContain("external-cpu");
+    expect(ui.published[0]).toContain("NOT migrated");
+    expect(ui.published[0]).toContain("EACH distinct login host");
+    expect(ui.published[0]).toContain("No host trust was imported automatically");
+    expect(ui.published[0]).toContain("SSH_AUTH_SOCK");
+    if (encrypted) expect(ui.published[0]).toContain("encrypted; original bytes preserved");
+    for (const profile of profiles) expect(ui.published[0]).toContain(`ssh-copy-id -F ${shellQuote(join(dirname(profile.ssh_config_file!), "bootstrap_config"))}`);
+    for (const pair of originals) expect(ui.published[0]).not.toContain(pair[0]!.toString("utf8"));
+  });
+}
+
+test("migration cancellation is completely read-only and add refuses to silently replace legacy authorization", async () => {
+  await legacyProfiles();
+  const before = await tree();
+  const ui = new WizardUI("migration", { confirm: false, replies: { "Select existing managed key": "legacy-cpu" }, beforePrompt: async () => { expect(await tree()).toEqual(before); } });
+  expect(await runClusterSshMigrate(ui, ui.publish, env)).toBeUndefined();
+  expect(await tree()).toEqual(before);
+  const add = new WizardUI("new-profile");
+  expect(await add.run()).toBeUndefined();
+  expect(add.notices.some(({ message }) => message.includes("/cluster-ssh-migrate"))).toBe(true);
+  expect(await tree()).toEqual(before);
+});
+
+test("existing shared key always wins migration and verified shared trust is never replaced", async () => {
+  const { profiles, keys } = await legacyProfiles();
+  const shared = join(dirname(configPath), "id_ed25519");
+  await local(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", shared]);
+  await chmod(shared + ".pub", 0o600);
+  const bytes = await readFile(shared);
+  const trust = "# trusted existing site entries must survive migration\n";
+  await writeFile(join(dirname(shared), "known_hosts"), trust, { mode: 0o600 });
+  const ui = new WizardUI("migration");
+  expect(await runClusterSshMigrate(ui, ui.publish, env)).toEqual(profiles.map(({ id }) => id));
+  expect(ui.matching("Select existing")).toEqual([]);
+  expect(await readFile(shared)).toEqual(bytes);
+  expect(await readFile(join(dirname(shared), "known_hosts"), "utf8")).toBe(trust);
+  expect(await readFile(shared)).not.toEqual(await readFile(keys[0]!));
+  const again = new WizardUI("repeat-migration");
+  expect(await runClusterSshMigrate(again, again.publish, env)).toEqual(profiles.map(({ id }) => id));
+  expect(await readFile(shared)).toEqual(bytes);
+  for (const [index, profile] of profiles.entries()) {
+    await expectBootstrapAuthentication(profile, keys[index]);
+    const bootstrap = await readFile(join(dirname(profile.ssh_config_file!), "bootstrap_config"), "utf8");
+    expect(bootstrap).not.toContain("IdentitiesOnly");
+  }
+});
+
+test("manually modified wizard-shaped config is explicitly left outside migration scope", async () => {
+  const { profiles } = await legacyProfiles();
+  const changed = profiles[1]!.ssh_config_file!;
+  const contents = await readFile(changed, "utf8") + "# operator customization\n";
+  await writeFile(changed, contents);
+  const ui = new WizardUI("migration", { replies: { "Select existing managed key": "legacy-cpu" } });
+  expect(await runClusterSshMigrate(ui, ui.publish, env)).toEqual(["legacy-cpu"]);
+  expect(await readFile(changed, "utf8")).toBe(contents);
+  expect(ui.published[0]).toContain("NOT migrated: legacy-second");
+});
+
+for (const unsafe of ["shared-key-symlink", "trust-symlink", "trust-world-readable", "mismatched-public", "fake-private-with-valid-public"] as const) {
+  test(`shared SSH rejects ${unsafe} without replacing user files`, async () => {
+    const profile = await new WizardUI("source").run();
+    expect(profile).toBeDefined();
+    const ssh = dirname(configPath);
+    const key = join(ssh, "id_ed25519");
+    const trust = join(ssh, "known_hosts");
+    if (unsafe.endsWith("symlink")) {
+      const destination = unsafe === "shared-key-symlink" ? key : trust;
+      const victim = join(root, "untouched-victim");
+      await writeFile(victim, await readFile(destination), { mode: 0o600 });
+      await rm(destination);
+      await symlink(victim, destination);
+    } else if (unsafe === "trust-world-readable") await chmod(trust, 0o644);
+    else if (unsafe === "fake-private-with-valid-public") await writeFile(key, "not a private key\n");
+    else {
+      const other = join(root, "other-key");
+      await local(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", other]);
+      await writeFile(key + ".pub", await readFile(other + ".pub"));
+    }
+    const before = await tree();
+    const ui = new WizardUI("rejected");
+    expect(await ui.run()).toBeUndefined();
+    expect(await tree()).toEqual(before);
+    expect(ui.published).toEqual([]);
+  });
+}
+
+test("migration detects configs changed during confirmation before shared-key or trust creation", async () => {
+  const { profiles } = await legacyProfiles();
+  const changed = profiles[0]!.ssh_config_file!;
+  const ui = new WizardUI("migration", {
+    replies: { "Select existing managed key": "legacy-cpu" },
+    beforePrompt: async ({ kind }) => { if (kind === "confirm") await writeFile(changed, (await readFile(changed, "utf8")) + "# concurrent edit\n"); },
+  });
+  expect(await runClusterSshMigrate(ui, ui.publish, env)).toBeUndefined();
+  expect(ui.notices.some(({ message }) => message.includes("changed concurrently"))).toBe(true);
+  expect((await readdir(join(dirname(configPath), "ssh"))).sort()).toEqual(["legacy-cpu", "legacy-second"]);
+});
+
+test("legacy profile IDs matching shared filenames migrate without namespace collisions", async () => {
+  const { profiles, keys } = await legacyProfiles(false, ["id_ed25519", "known_hosts"]);
+  const originalKey = await readFile(keys[0]!);
+  const ui = new WizardUI("migration", { replies: { "Select existing managed key": "id_ed25519" } });
+  expect(await runClusterSshMigrate(ui, ui.publish, env)).toEqual(["id_ed25519", "known_hosts"]);
+  expect(await readFile(join(dirname(configPath), "id_ed25519"))).toEqual(originalKey);
+  expect((await lstat(join(dirname(configPath), "known_hosts"))).isFile()).toBe(true);
+  for (const [index, profile] of profiles.entries()) {
+    expect((await lstat(dirname(profile.ssh_config_file!))).isDirectory()).toBe(true);
+    await expectBootstrapAuthentication(profile, keys[index]);
+  }
+  const bootstrapBefore = await Promise.all(profiles.map((profile) => readFile(join(dirname(profile.ssh_config_file!), "bootstrap_config"), "utf8")));
+  const again = new WizardUI("repeat-migration");
+  expect(await runClusterSshMigrate(again, again.publish, env)).toEqual(["id_ed25519", "known_hosts"]);
+  expect(await Promise.all(profiles.map((profile) => readFile(join(dirname(profile.ssh_config_file!), "bootstrap_config"), "utf8")))).toEqual(bootstrapBefore);
+  const added = new WizardUI("new-after-migration");
+  expect(await added.run()).toBeDefined();
+  expect(await readFile(join(dirname(configPath), "id_ed25519"))).toEqual(originalKey);
+});
+
+for (const failAt of [2, 3, 4]) {
+  test(`migration rolls back original config pairs after commit rename ${failAt} fails`, async () => {
+    const { profiles } = await legacyProfiles();
+    const paths = profiles.flatMap((profile) => [profile.ssh_config_file!, join(dirname(profile.ssh_config_file!), "bootstrap_config")]);
+    const originals = await Promise.all(paths.map((path) => readFile(path)));
+    const ui = new WizardUI("migration", { replies: { "Select existing managed key": "legacy-cpu" } });
+    let commits = 0;
+    expect(await runClusterSshMigrate(ui, ui.publish, env, async (source, destination) => {
+      if (++commits === failAt) {
+        // Real ENOENT from the filesystem at a chosen commit boundary, after
+        // prior renames have actually replaced their destination files.
+        await rename(join(root, "missing-staged-file"), destination);
+      }
+      await rename(source, destination);
+    })).toBeUndefined();
+    expect(await Promise.all(paths.map((path) => readFile(path)))).toEqual(originals);
+    expect(ui.published).toEqual([]);
+    expect((await tree()).some((entry) => /\.lock$|\.tmp$/.test(entry.path))).toBe(false);
+    // The shared copy is retained safely; rollback leaves original wizard
+    // renderings recognizable, so retry needs no new generation or promotion.
+    const again = new WizardUI("retry-migration");
+    expect(await runClusterSshMigrate(again, again.publish, env)).toEqual(["legacy-cpu", "legacy-second"]);
+    expect(again.matching("Select existing")).toEqual([]);
+  });
+}

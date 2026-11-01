@@ -20,7 +20,7 @@ import {
   saveWorkerHarnessConfig,
 } from "./config.ts";
 import { createClientSession, type ClientSession } from "./slurm/notifications.ts";
-import { runClusterAdd } from "./slurm/setup.ts";
+import { runClusterAdd, runClusterSshMigrate } from "./slurm/setup.ts";
 
 export default async function (pi: ExtensionAPI) {
   // The persisted config is a user default. WH_ORCHESTRATOR_URL is set by the
@@ -220,7 +220,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cluster-add", {
-    description: "Interactively register a Slurm cluster and dedicated local SSH key (optional cluster ID)",
+    description: "Interactively register a Slurm cluster using the shared managed SSH key (optional cluster ID)",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("/cluster-add requires an interactive UI.", "error");
@@ -233,6 +233,23 @@ export default async function (pi: ExtensionAPI) {
           display: true,
         }, { triggerTurn: false });
       }, Array.isArray(args) ? args.join(" ") : String(args ?? ""));
+    },
+  });
+
+  pi.registerCommand("cluster-ssh-migrate", {
+    description: "Explicitly migrate recognized cluster wizard SSH configs to one shared key and known_hosts",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("/cluster-ssh-migrate requires an interactive UI.", "error");
+        return;
+      }
+      await runClusterSshMigrate(ctx.ui, async (content) => {
+        await pi.sendMessage({
+          customType: "worker-harness-cluster-setup",
+          content,
+          display: true,
+        }, { triggerTurn: false });
+      });
     },
   });
 
