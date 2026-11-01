@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SlurmClient, SlurmClientError, shellQuote, sshTransport, workloadCommand, type ClientApi, type ClusterEnqueueInput, type SlurmTransport } from "./client.ts";
-import type { ClusterProfile } from "./profiles.ts";
+import { DEFAULT_ALLOCATION_WALLTIME_SECONDS, sharedRoots, type ClusterProfile } from "./profiles.ts";
 import type { Job, QueuedJob, SlurmObservation, SlurmReservationRequest, Worker, WorkerDetail } from "../types.ts";
 
 const directories: string[] = [];
@@ -128,6 +128,7 @@ describe("finite local Slurm client", () => {
     expect(flags).toContain("--nodes=1"); expect(flags).toContain("--ntasks=1");
     expect(flags).toContain("--cpus-per-task=8"); expect(flags).toContain("--mem=65536M");
     expect(flags).toContain("--gpus-per-node=a100:1"); expect(flags).toContain("--export=NIL"); expect(flags).toContain("--no-requeue");
+    expect(flags).toContain("--account=test");
     expect(flags).not.toContain("--exclusive");
     expect(f.queued[0]!.command).toBe(workloadCommand("/data/shared/shared/projects/project", "/data/shared/shared/projects/project/.venvs/test", f.input.command));
     expect(f.queued[0]!.submission_key).toBe(f.reservations[0]!.request_id);
@@ -136,6 +137,7 @@ describe("finite local Slurm client", () => {
     expect(settings).toMatchObject({ version: 1, compute_kind: "gpu", cpus: 8, memory_mb: 65536 });
     expect(settings.worker_name).toBe(f.reservations[0]!.name);
     expect(settings).not.toHaveProperty("registration_token");
+    expect(settings).not.toHaveProperty("additional_shared_roots");
     const retried = await client.enqueueCluster(f.profile, f.input, f.context);
     expect(retried.slurm_job_id).toBe("123"); expect(f.submissions).toHaveLength(1);
     await expect(client.enqueueCluster(f.profile, { ...f.input, command: "changed" }, f.context)).rejects.toMatchObject({ code: "SUBMISSION_KEY_CONFLICT", submission_key: "stable-key" });
@@ -297,6 +299,84 @@ test("shared path preflight resolves symlinks before persisting cwd and refuses 
   expect(f.reservations).toHaveLength(previous);
 });
 
+test("real mapped project/environment preflight, all identity probes and staging retain primary run storage", async () => {
+  const f = await fixture();
+  f.profile.additional_shared_roots = [
+    { storage_id: "projects", shared_root: join(f.root, "projects-store") },
+    { storage_id: "envs", shared_root: join(f.root, "env-store") },
+  ];
+  const mappings = sharedRoots(f.profile);
+  for (const mapping of mappings) await mkdir(mapping.shared_root, { recursive: true });
+  await mkdir(join(f.root, "projects-store", "real"));
+  await mkdir(join(f.root, "env-store", "venv", "bin"), { recursive: true });
+  await symlink(join(f.root, "projects-store", "real"), join(f.root, "projects-store", "alias"));
+  await writeFile(f.profile.sif_path, "image");
+  await writeFile(join(f.root, "projects-store", "real", "uv.lock"), "lock");
+  const executed: string[] = [];
+  const run = async (script: string, stdin = "") => {
+    const process = Bun.spawn(["bash", "-c", script], { stdin: new Blob([stdin]), stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, code] = await Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited]);
+    if (code) throw new Error(stderr);
+    return stdout;
+  };
+  const transport: SlurmTransport = async (p, script, stdin, options) => {
+    if (["# wh:path-preflight", "# wh:shared-probe", "# wh:stage"].some((marker) => script.includes(marker))) return run(script, stdin);
+    return f.transport(p, script, stdin, options);
+  };
+  const client = new SlurmClient({ api: {
+    ...f.fakeApi,
+    listDataPaths: async () => Object.fromEntries(mappings.map((mapping) => [`/data/shared/${mapping.storage_id}`, [{ worker_id: "ordinary-worker", worker_name: "ordinary" }]])),
+    startJob: async (input) => {
+      executed.push(input.command);
+      let command = input.command;
+      for (const mapping of mappings) command = command.replaceAll(`/data/shared/${mapping.storage_id}/`, `${mapping.shared_root}/`);
+      await run(command);
+      return { id: "probe-job", worker_id: input.worker_id, status: "done", exit_code: 0 } as Job;
+    },
+  }, env: f.env, transport });
+  const input = { ...f.input, slurm: { project_path: "/data/shared/projects/alias", environment_path: "/data/shared/envs/venv", walltime_seconds: 600 } };
+  const result = await client.enqueueCluster(f.profile, input, f.context);
+  expect(f.queued[0]!.command).toBe(workloadCommand("/data/shared/projects/real", "/data/shared/envs/venv", input.command));
+  expect(result.shared_paths).toMatchObject({ run_path: `/data/shared/shared/.wh-slurm/${f.workerId}` });
+  const settings = JSON.parse(await readFile(join(f.profile.shared_root, ".wh-slurm", f.workerId, "settings.json"), "utf8"));
+  expect(settings.additional_shared_roots).toEqual(f.profile.additional_shared_roots);
+  expect(settings.shared_root).toBe(f.profile.shared_root);
+  expect(settings.host_run_path).toBe(join(f.profile.shared_root, ".wh-slurm", f.workerId));
+  expect(executed.filter((command) => command.startsWith("umask"))).toHaveLength(3);
+  expect(executed.filter((command) => command.startsWith("rm"))).toHaveLength(3);
+  for (const mapping of mappings) expect((await readdir(mapping.shared_root)).some((entry) => entry.startsWith(".wh-probe-"))).toBe(false);
+  await symlink(f.profile.shared_root, join(f.root, "projects-store", "escape"));
+  const previous = f.reservations.length;
+  await expect(client.enqueueCluster(f.profile, { ...input, submission_key: "extra-project-escape", slurm: { ...input.slurm, project_path: "/data/shared/projects/escape" } }, f.context)).rejects.toThrow("resolved path escapes shared storage");
+  await symlink(join(f.root, "projects-store"), join(f.root, "env-store", "escape"));
+  await expect(client.enqueueCluster(f.profile, { ...input, submission_key: "extra-env-escape", slurm: { ...input.slurm, environment_path: "/data/shared/envs/escape" } }, f.context)).rejects.toThrow("resolved path escapes shared storage");
+  await rm(join(f.root, "env-store", "venv", "bin"), { recursive: true });
+  await symlink(f.profile.shared_root, join(f.root, "env-store", "venv", "bin"));
+  await expect(client.enqueueCluster(f.profile, { ...input, submission_key: "extra-bin-escape" }, f.context)).rejects.toThrow("resolved path escapes shared storage");
+  expect(f.reservations).toHaveLength(previous);
+});
+
+test("additional mapping identity mismatch is not verified and its worker probe is cleaned before refusal", async () => {
+  const f = await fixture();
+  f.profile.additional_shared_roots = [{ storage_id: "archive", shared_root: "/different/archive" }];
+  const commands: string[] = [];
+  const client = new SlurmClient({ api: {
+    ...f.fakeApi,
+    listDataPaths: async () => ({
+      "/data/shared/shared": [{ worker_id: "ordinary-worker", worker_name: "ordinary" }],
+      "/data/shared/archive": [{ worker_id: "archive-worker", worker_name: "archive" }],
+    }),
+    startJob: async (input) => { commands.push(input.command); return f.fakeApi.startJob!(input); },
+  }, env: f.env, transport: async (p, script, stdin, options) => {
+    if (script.includes("# wh:shared-probe") && script.includes("/different/archive/")) return "different filesystem";
+    return f.transport(p, script, stdin, options);
+  } });
+  await expect(client.enqueueCluster(f.profile, f.input, f.context)).rejects.toMatchObject({ code: "SHARED_STORAGE_NOT_VERIFIED" });
+  expect(commands.filter((command) => command.startsWith("rm") && command.includes("/data/shared/archive/"))).toHaveLength(1);
+  expect(f.reservations).toHaveLength(0);
+  expect(f.submissions).toHaveLength(0);
+});
+
 test("persisted workload wrapper uses safe cwd/PATH and preserves one original command argument", async () => {
   const root = await mkdtemp(join(tmpdir(), "wh-workload-command-")); directories.push(root);
   const project = join(root, "project 'quoted'"), environment = join(root, "env 'quoted'");
@@ -313,13 +393,16 @@ test("persisted workload wrapper uses safe cwd/PATH and preserves one original c
 
 test("actual fenced remote subprocess strips inherited Slurm options, commits receipt and never repeats sbatch", async () => {
   const f = await fixture();
+  delete f.profile.account;
+  f.profile.max_walltime_seconds = DEFAULT_ALLOCATION_WALLTIME_SECONDS;
   await mkdir(f.profile.shared_root, { recursive: true });
   const record = join(f.root, "sbatch-record.jsonl");
   const executable = join(f.root, "sbatch");
-  await writeFile(executable, `#!/usr/bin/env python3\nimport json,os,sys\nwith open(${JSON.stringify(record)},'a') as f: f.write(json.dumps({'args':sys.argv[1:],'env':dict(os.environ)})+'\\n')\nprint('321;local')\n`, { mode: 0o700 });
+  await writeFile(executable, `#!/usr/bin/env python3\nimport json,os,sys\nif sys.argv[1:]==['--help']:\n print('--parsable --no-requeue --export --nodes --ntasks --cpus-per-task --mem --comment --signal --time --partition --job-name --output --error --gpus-per-node')\n sys.exit(0)\nwith open(${JSON.stringify(record)},'a') as f: f.write(json.dumps({'args':sys.argv[1:],'env':dict(os.environ)})+'\\n')\nprint('321;local')\n`, { mode: 0o700 });
+  await writeFile(join(f.root, "scontrol"), "#!/bin/sh\nprintf 'ClusterName = local\\n'\n", { mode: 0o700 });
   const transport: SlurmTransport = async (p, script, stdin, opts) => {
-    if (script.includes("# wh:stage") || script.includes("# wh:submit-fenced") || script.includes("# wh:read-submitted")) {
-      const process = Bun.spawn(["bash", "-c", script], { stdin: new Blob([stdin ?? ""]), stdout: "pipe", stderr: "pipe", env: { ...globalThis.process.env, SBATCH_ARRAY_INX: "0-99", SBATCH_EXCLUSIVE: "yes", SLURM_CLUSTERS: "wrong", SLURM_HINT: "multithread", SLURM_DEBUG_FLAGS: "all", SLURM_EXIT_ERROR: "1", SITE_REQUIRED: "preserved" } });
+    if (script.includes("# wh:stage") || script.includes("# wh:submit-fenced") || script.includes("# wh:read-submitted") || script.includes("# wh:sbatch-preflight")) {
+      const process = Bun.spawn(["bash", "-c", script], { stdin: new Blob([stdin ?? ""]), stdout: "pipe", stderr: "pipe", env: { ...globalThis.process.env, PATH: `${f.root}:${globalThis.process.env.PATH}`, SBATCH_ARRAY_INX: "0-99", SBATCH_EXCLUSIVE: "yes", SLURM_CLUSTERS: "wrong", SLURM_HINT: "multithread", SLURM_DEBUG_FLAGS: "all", SLURM_EXIT_ERROR: "1", SITE_REQUIRED: "preserved" } });
       const [stdout, stderr, code] = await Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited]);
       if (code) throw new Error(stderr);
       return stdout;
@@ -336,6 +419,8 @@ test("actual fenced remote subprocess strips inherited Slurm options, commits re
   for (const key of ["SLURM_CLUSTERS", "SLURM_HINT", "SLURM_DEBUG_FLAGS", "SLURM_EXIT_ERROR"]) expect(records[0].env).not.toHaveProperty(key);
   expect(records[0].env.SLURM_UMASK).toBe("077"); expect(records[0].env.SITE_REQUIRED).toBe("preserved");
   expect(records[0].args.filter((arg: string) => arg.startsWith("--nodes="))).toEqual(["--nodes=1"]);
+  expect(records[0].args.some((arg: string) => arg.startsWith("--account"))).toBe(false);
+  expect(records[0].args).toContain("--time=0-00:10:00");
 });
 
 test("system ssh uses argv transport with strict host checking and no local shell interpretation", async () => {
@@ -353,6 +438,8 @@ test("system ssh uses argv transport with strict host checking and no local shel
     const configured = JSON.parse(await sshTransport({ ...f.profile, ssh_config_file: configFile }, script, "configured stdin"));
     expect(configured.args).toEqual(["-F", configFile, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", "test-alias", "bash -c " + shellQuote(script)]);
     expect(configured.stdin).toBe("configured stdin");
+    const generic = JSON.parse(await sshTransport({ ssh_host: "researcher@login.example.test" }, script));
+    expect(generic.args.slice(-2)).toEqual(["researcher@login.example.test", "bash -c " + shellQuote(script)]);
     expect(await readdir(f.root)).not.toContain("definitely-not-a-local-command");
     for (const ssh_config_file of [null, false, 42, [], {}, "", "relative/config", "~/.ssh/config", "-F/config", "/", "///", "/ssh/../config", "/ssh/./config", "/ssh\nconfig", "/ssh\0config", "/ssh\u007fconfig"]) {
       const profile = { ...f.profile, ssh_config_file } as unknown as ClusterProfile;

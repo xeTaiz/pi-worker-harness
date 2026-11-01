@@ -2,8 +2,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { loadClusterProfiles, sharedPath, type ClusterProfile, type Environment } from "./profiles.ts";
-import { inspectSystemSshConfig, runClusterAdd, runClusterSshMigrate, type SetupUI } from "./setup.ts";
+import { loadClusterProfiles, type ClusterProfile, type Environment } from "./profiles.ts";
+import { buildDiscoveredProfiles, commitSetupProfiles, discoveredTargetId, inspectSystemSshConfig, runClusterAdd, runClusterSshMigrate, type SetupDraft, type SetupOptions, type SetupUI } from "./setup.ts";
+import type { DiscoveryResult, DiscoveryTarget } from "./discovery.ts";
+import { defaultRegistrationHost } from "./setup-integration.ts";
 
 let root: string;
 let home: string;
@@ -40,6 +42,8 @@ type Prompt = { kind: "input" | "select" | "editor" | "confirm"; title: string; 
 type ScriptOptions = {
   replies?: Record<string, Reply>;
   confirm?: boolean;
+  confirms?: Record<string, boolean>;
+  setup?: SetupOptions;
   beforePrompt?: (prompt: Prompt) => void | Promise<void>;
 };
 
@@ -54,40 +58,21 @@ class WizardUI implements SetupUI {
 
   constructor(readonly id: string, private readonly options: ScriptOptions = {}) {
     this.replies = {
-      "Cluster ID": id,
-      "Reuse an existing": "New connection and storage",
-      "Name / description": "Research CPU partition; site utilization limits apply",
-      "Compute kind": "cpu",
-      "SSH connection": "Direct hostname",
-      "SSH hostname / IP": "192.0.2.17",
-      "SSH username": "researcher",
-      "SSH port": "2222",
-      "ProxyJump": "jump-user@gateway.example.test:2200",
-      "Existing SSH alias": "site-login",
-      "Shared storage ID": "research-storage",
-      "Shared root": "/cluster//research group/",
-      "Worker SIF": "/cluster//research group/worker.sif",
-      "Container runtime": "apptainer",
-      "Trusted runtime shell prelude": "module purge\nmodule load apptainer",
-      "Slurm account": "research",
-      "Slurm partition": "cpu-partition",
-      "Slurm GPU type": "a100_80gb",
-      "Maximum GPUs": "4",
-      "Maximum walltime": "3600",
-      "Failure diagnosis grace": "0",
-      "Termination grace": "30",
+      "SSH destination": "researcher@192.0.2.17",
+      "Cluster name": id,
+      "Description (optional)": "Research cluster; site utilization limits apply",
+      "Authorize the public key": "Key installed — test connection",
+      "WH shared filesystem": "/data/shared/research-storage",
+      "WH shared path": "/data/shared/research-storage",
+      "Same filesystem root": "/cluster//research group/",
+      "Add another filesystem mapping?": "No",
+      "Discovery prerequisites unresolved": "Save and exit",
+      "Trusted runtime shell prelude": "module load apptainer",
+      "Compatible Worker SIF": "/cluster/research group/worker.sif",
+      "Billing default unresolved": "Use scheduler default",
       "Local Tailnet enrollment KEY FILE": join(home, "tailnet enrollment key"),
       "Tailnet login server": "https://control.example.test",
-      "Orchestrator hostname": "orchestrator.example.test",
-      "Advanced settings": "Use defaults (warning 120s, port 12888, poll 15s; no extra caps)",
-      "QoS": "research-qos",
-      "Feature constraint": "a100&nvlink",
-      "Maximum CPUs": "32",
-      "Maximum memory": "65536",
-      "Signal warning": "0",
-      "Orchestrator registration port": "12889",
-      "Scheduler poll interval": "3",
-      "Review cluster": "Save profile",
+      "Review cluster": "Register targets",
       ...options.replies,
     };
   }
@@ -118,12 +103,12 @@ class WizardUI implements SetupUI {
     const prompt: Prompt = { kind: "confirm", title, current: message };
     this.prompts.push(prompt);
     await this.options.beforePrompt?.(prompt);
-    return this.options.confirm ?? true;
+    return this.options.confirms?.[title] ?? this.options.confirm ?? true;
   }
   notify(message: string, type?: string): void { this.notices.push({ message, type }); }
   publish = (content: string): void => { this.published.push(content); };
 
-  run(args = this.id): Promise<ClusterProfile | undefined> { return runClusterAdd(this, this.publish, args, env); }
+  run(args = this.id): Promise<ClusterProfile | undefined> { return runClusterAdd(this, this.publish, args, env, { ...offlineSetup(), ...this.options.setup }); }
   matching(prefix: string): Prompt[] { return this.prompts.filter((prompt) => prompt.title.startsWith(prefix)); }
   expectScriptUsed(): void { expect(this.scriptErrors).toEqual([]); }
 }
@@ -219,8 +204,8 @@ async function expectBootstrapAuthentication(profile: ClusterProfile, legacyKey?
 
 async function expectSafePublication(ui: WizardUI, profile: ClusterProfile): Promise<void> {
   await expectBootstrapAuthentication(profile);
-  expect(ui.published).toHaveLength(1);
-  const output = ui.published[0]!;
+  expect(ui.published.length).toBeGreaterThanOrEqual(1);
+  const output = ui.published.join("\n");
   const key = join(dirname(configPath), "id_ed25519");
   const publicKey = (await readFile(key + ".pub", "utf8")).trim();
   const privateKey = await readFile(key, "utf8");
@@ -236,8 +221,7 @@ async function expectSafePublication(ui: WizardUI, profile: ClusterProfile): Pro
   expect(output).not.toContain("StrictHostKeyChecking=no");
   expect(output).toContain("authorized_keys");
   expect(output).toContain("fingerprint");
-  expect(output).toContain("No allocation submitted");
-  expect(output).toContain("not proof of connectivity");
+  expect(output).toMatch(/no allocation/i);
   expect(output).toContain(`ssh-keygen -p -f ${shellQuote(key)}`);
   expect(output).toContain(`ssh-add ${shellQuote(key)}`);
   // Check real key correspondence, not merely plausible public-key wording.
@@ -249,162 +233,220 @@ async function expectSafePublication(ui: WizardUI, profile: ClusterProfile): Pro
   }
 }
 
+function target(partition = "cpu-partition", gpu_type?: string, ceiling = 1_209_600): DiscoveryTarget {
+  return {
+    partition, compute_kind: gpu_type ? "gpu" : "cpu", ...(gpu_type ? { gpu_type, max_gpus: 4 } : {}),
+    max_walltime_seconds: ceiling, limits: {}, defaults: { cpus: 4, memory_mb: 8192 },
+    review_required: false, permission: "unverified_until_submission",
+  };
+}
+
+function discovery(overrides: Partial<DiscoveryResult> = {}): DiscoveryResult {
+  return {
+    observed_at: "2026-10-25T12:00:00.000Z", cluster_name: "research",
+    account_source: "scheduler", accounts: [], qos: [],
+    runtime: { executable: "apptainer", version: "1.3.0", prelude: "" },
+    sif_path: "/cluster/research group/worker.sif",
+    targets: [target()], unresolved: [], evidence: [], ...overrides,
+  };
+}
+
+/** Keep real private filesystem/keygen and managed ssh -G; isolate resolver input from operator config. */
+function offlineSetup(): SetupOptions {
+  return {
+    transport: async () => "", verifyMappings: async () => {},
+    discover: async () => discovery(), catalogue: async () => [], readiness: async () => [],
+    resolveSsh: async (destination) => {
+      if (!destination.includes("@")) return { connection: { kind: "alias", alias: destination }, alias: destination };
+      const [user, hostname] = destination.split("@") as [string, string];
+      return hostname === "site-login"
+        ? { connection: { kind: "direct", hostname: "192.0.2.42", user, port: 2202, jump: "gateway.example.test" }, alias: hostname }
+        : { connection: { kind: "direct", hostname, user, port: 22 }, alias: hostname };
+    },
+  };
+}
+
+async function drafts(): Promise<SetupDraft[]> {
+  const path = join(dirname(configPath), "setup-drafts.json");
+  const value = JSON.parse(await readFile(path, "utf8"));
+  expect(value.version).toBe(1);
+  expect((await stat(path)).mode & 0o777).toBe(0o600);
+  return value.drafts;
+}
+
 for (const withBaseline of [false, true]) {
-  for (const stage of ["input", "editor", "review-escape", "review-cancel", "final-confirm"] as const) {
-    test(`cancellation at ${stage} leaves ${withBaseline ? "existing config and key" : "fresh home"} byte-for-byte unchanged`, async () => {
-      if (withBaseline) {
-        await saveBaseline();
-        const oldKeyDirectory = join(dirname(configPath), "ssh", "existing");
-        await mkdir(oldKeyDirectory, { recursive: true, mode: 0o700 });
-        await writeFile(join(oldKeyDirectory, "id_ed25519"), "existing-private-secret", { mode: 0o600 });
-      }
+  for (const stage of ["destination", "name", "description", "consent"] as const) {
+    test(`preconsent cancellation at ${stage} preserves ${withBaseline ? "existing config" : "fresh home"} byte-exactly`, async () => {
+      if (withBaseline) await saveBaseline();
       const before = await tree();
       const replies: Record<string, Reply> = {};
-      if (stage === "input") replies["Name / description"] = undefined;
-      if (stage === "editor") replies["Trusted runtime shell prelude"] = undefined;
-      if (stage === "review-escape") replies["Review cluster"] = undefined;
-      if (stage === "review-cancel") replies["Review cluster"] = "Cancel";
+      if (stage === "destination") replies["SSH destination"] = undefined;
+      if (stage === "name") replies["Cluster name"] = undefined;
+      if (stage === "description") replies["Description (optional)"] = undefined;
       const ui = new WizardUI("cancelled", {
-        replies, confirm: stage !== "final-confirm",
+        replies, confirm: stage !== "consent",
         beforePrompt: async () => { expect(await tree()).toEqual(before); },
       });
       expect(await ui.run()).toBeUndefined();
       ui.expectScriptUsed();
       expect(await tree()).toEqual(before);
       expect(ui.published).toEqual([]);
-      expect(ui.notices.some((notice) => notice.type === "info" && /cancelled/i.test(notice.message))).toBe(true);
-      expect(ui.matching("Confirm cluster")).toHaveLength(stage === "final-confirm" ? 1 : 0);
+      expect(ui.notices.some(({ message }) => /before consent|no credentials/i.test(message))).toBe(true);
     });
   }
 }
 
-test("CPU/direct registration persists a canonical profile, private files and actionable public-only instructions", async () => {
+test("consent saves a real key and private draft; a fresh invocation resumes without duplicate keys or targets", async () => {
+  const paused = new WizardUI("resume-me", { replies: { "Authorize the public key": "Save and exit" } });
+  expect(await paused.run()).toBeUndefined();
+  paused.expectScriptUsed();
+  expect(await loadClusterProfiles(env)).toEqual([]);
+  expect((await drafts())[0]).toMatchObject({ id: "resume-me", phase: "ssh", mappings: [] });
+  const key = join(dirname(configPath), "id_ed25519");
+  const bytes = await readFile(key);
+  expect((await stat(key)).mode & 0o777).toBe(0o600);
+  expect(await readFile(join(dirname(configPath), "known_hosts"), "utf8")).toBe("");
+  expect(paused.notices.some(({ message }) => /shared SSH key.*private draft retained/i.test(message))).toBe(true);
+  const resumed = new WizardUI("resume-me");
+  const profile = await resumed.run();
+  resumed.expectScriptUsed();
+  expect(profile).toBeDefined();
+  for (const prompt of ["SSH destination", "Cluster name", "Create shared SSH connection"]) expect(resumed.matching(prompt)).toEqual([]);
+  expect(await readFile(key)).toEqual(bytes);
+  expect(await drafts()).toEqual([]);
+  expect(await loadClusterProfiles(env)).toEqual([profile!]);
+  expect(await readdir(join(dirname(configPath), "ssh"))).toEqual(["resume-me"]);
+  await expectSafePublication(resumed, profile!);
+});
+
+test("direct registration preserves old entries and uses minimal questions and safe defaults", async () => {
   const old = baseline();
   await saveBaseline([old]);
-  const before = await tree();
-  const ui = new WizardUI("cpu-direct", { beforePrompt: async () => { expect(await tree()).toEqual(before); } });
+  const ui = new WizardUI("cpu-direct");
   const result = await ui.run();
   ui.expectScriptUsed();
-  expect(result).toEqual({
-    id: "cpu-direct", description: "Research CPU partition; site utilization limits apply",
-    ssh_host: "wh-cpu-direct", ssh_config_file: join(dirname(configPath), "ssh", "cpu-direct", "config"),
-    storage_id: "research-storage", shared_root: "/cluster/research group", sif_path: "/cluster/research group/worker.sif",
-    compute_kind: "cpu", max_gpus: 0, runtime: "apptainer", runtime_setup: "module purge\nmodule load apptainer",
-    account: "research", partition: "cpu-partition", max_walltime_seconds: 3600, failure_grace_seconds: 0,
-    termination_grace_seconds: 30, warning_seconds: 120, orchestrator_registration_port: 12888, poll_seconds: 15,
-    tailnet_key_file: join(home, "tailnet enrollment key"), tailnet_login_server: "https://control.example.test",
-    orchestrator_host: "orchestrator.example.test",
+  expect(result).toMatchObject({
+    id: discoveredTargetId("cpu-direct", target()), description: "Research cluster; site utilization limits apply",
+    ssh_host: "192.0.2.17", ssh_config_file: join(dirname(configPath), "ssh", "cpu-direct", "config"),
+    storage_id: "research-storage", shared_root: "/cluster/research group", compute_kind: "cpu", max_gpus: 0,
+    runtime: "apptainer", max_walltime_seconds: 604800, failure_grace_seconds: 0,
+    termination_grace_seconds: 20, warning_seconds: 120, poll_seconds: 15,
   });
-  const saved = await document();
-  expect(saved.version).toBe(1);
-  expect(saved.clusters).toEqual([old, result]);
-  expect((await loadClusterProfiles(env)).at(-1)).toEqual(result);
+  expect(result).not.toHaveProperty("account");
   expect(result).not.toHaveProperty("gpu_type");
-  expect(ui.matching("Confirm cluster")[0]?.current).toMatch(/UNENCRYPTED/);
+  expect((await document()).clusters).toEqual([old, result]);
+  expect((await loadClusterProfiles(env)).at(-1)).toEqual(result);
+  for (const obsolete of ["Compute kind", "SSH username", "SSH port", "Slurm partition", "Slurm GPU type", "Maximum GPUs", "Maximum walltime", "Container runtime", "Trusted runtime", "Slurm account"]) expect(ui.matching(obsolete)).toEqual([]);
+  expect(ui.matching("Local Tailnet enrollment KEY FILE")).toEqual([]);
+  expect(ui.matching("Tailnet login server")).toEqual([]);
+  expect(ui.matching("Review cluster")[0]?.options).toEqual(["Register targets", "Edit review", "Advanced", "Save and exit"]);
   await expectSecureFiles(result!);
   const ssh = await effectiveSSH(result!);
   expect(ssh.get("hostname")).toBe("192.0.2.17");
   expect(ssh.get("user")).toBe("researcher");
-  expect(ssh.get("port")).toBe("2222");
-  expect(ssh.get("proxyjump")).toBe("jump-user@gateway.example.test:2200");
-  expect(ssh.get("identitiesonly")).toBe("yes");
+  expect(ssh.get("port")).toBe("22");
   await expectSafePublication(ui, result!);
-  expect((await tree()).some((entry) => /\.lock$|\.tmp$/.test(entry.path))).toBe(false);
 });
 
-test("GPU/existing-alias registration retains effective HostName, jump and multiplexing offline", async () => {
-  const originalSSH = await readFile(join(home, ".ssh", "config"), "utf8");
-  const ui = new WizardUI("gpu-alias", { replies: {
-    "Compute kind": "gpu", "SSH connection": "Existing SSH alias", "Slurm partition": "gpu-partition",
-    "Container runtime": "singularity", "Advanced settings": "Configure advanced settings",
-  } });
-  const result = await ui.run();
-  ui.expectScriptUsed();
-  expect(result).toMatchObject({
-    id: "gpu-alias", compute_kind: "gpu", gpu_type: "a100_80gb", max_gpus: 4,
-    ssh_host: "site-login", runtime: "singularity", partition: "gpu-partition",
-    qos: "research-qos", constraint: "a100&nvlink", max_cpus: 32, max_memory_mb: 65536,
-    warning_seconds: 0, orchestrator_registration_port: 12889, poll_seconds: 3,
-    shared_root: "/cluster/research group", sif_path: "/cluster/research group/worker.sif",
+test("existing aliases retain effective host, jump, port and multiplexing without editing user SSH config", async () => {
+  const original = await readFile(join(home, ".ssh", "config"), "utf8");
+  const ui = new WizardUI("gpu-alias", {
+    replies: { "SSH destination": "site-login" },
+    setup: { discover: async () => discovery({ targets: [target("gpu-partition", "a100_80gb")] }) },
   });
-  expect((await document()).clusters).toEqual([result]);
-  expect(await loadClusterProfiles(env)).toEqual([result!]);
-  expect(await readFile(join(home, ".ssh", "config"), "utf8")).toBe(originalSSH);
-  const ssh = await effectiveSSH(result!);
-  expect(ssh.get("hostname")).toBe("192.0.2.42");
-  expect(ssh.get("user")).toBe("site-user");
-  expect(ssh.get("port")).toBe("2202");
-  expect(ssh.get("proxyjump")).toBe("gateway.example.test");
-  expect(ssh.get("controlmaster")).toBe("auto");
-  expect(ssh.get("controlpersist")).toBe("300");
-  expect(ssh.get("identitiesonly")).toBe("yes");
-  const identity = ssh.get("identityfile")!;
-  expect(identity).toContain("id_ed25519");
-  expect(identity).toContain("space");
-  await expectSecureFiles(result!);
-  await expectSafePublication(ui, result!);
+  const profile = await ui.run();
+  ui.expectScriptUsed();
+  expect(profile).toMatchObject({ compute_kind: "gpu", gpu_type: "a100_80gb", max_gpus: 4, ssh_host: "site-login" });
+  expect(await readFile(join(home, ".ssh", "config"), "utf8")).toBe(original);
+  const ssh = await effectiveSSH(profile!);
+  for (const [field, value] of Object.entries({ hostname: "192.0.2.42", user: "site-user", port: "2202", proxyjump: "gateway.example.test", controlmaster: "auto", controlpersist: "300", identitiesonly: "yes" })) expect(ssh.get(field)).toBe(value);
+  await expectSecureFiles(profile!);
+  await expectSafePublication(ui, profile!);
 });
 
-test("invalid numeric, path, URL and port corrections retain earlier answers with no writes before confirmation", async () => {
-  const before = await tree();
-  const ui = new WizardUI("corrected", {
-    replies: {
-      "Maximum walltime": ["not-a-number", "1.5", "9007199254740992", "7200"],
-      "Shared root": ["relative/shared", "/cluster/../escape", "/cluster//corrected shared/"],
-      "Local Tailnet enrollment KEY FILE": ["not-an-absolute-file", join(home, "tailnet enrollment key")],
-      "Tailnet login server": ["https://user:secret@control.example.test", "https://control.example.test"],
-      "Advanced settings": "Configure advanced settings",
-      "Orchestrator registration port": ["65536", "12999"],
-      "Review cluster": ["Edit a field", "Save profile"],
-      "Field to correct": "Name / description (include site limits)",
-      "Name / description": ["Retained initial description", "Corrected final description"],
+test("strict SSH succeeds before mapping identity verification and discovery", async () => {
+  const order: string[] = [];
+  let attempts = 0;
+  const ui = new WizardUI("ordered", { setup: {
+    transport: async () => {
+      order.push("ssh");
+      if (++attempts === 1) throw new Error("host fingerprint not trusted");
+      return "";
     },
-    beforePrompt: async () => { expect(await tree()).toEqual(before); },
-  });
-  const result = await ui.run();
+    verifyMappings: async () => { order.push("verify"); },
+    discover: async () => { order.push("discover"); return discovery(); },
+  } });
+  expect(await ui.run()).toBeDefined();
   ui.expectScriptUsed();
-  expect(result).toMatchObject({ description: "Corrected final description", shared_root: "/cluster/corrected shared", max_walltime_seconds: 7200, orchestrator_registration_port: 12999 });
-  expect(ui.matching("Maximum walltime")).toHaveLength(4);
-  expect(ui.matching("Shared root")).toHaveLength(3);
-  expect(ui.matching("Shared root")[1]?.current).toBe("relative/shared");
-  expect(ui.matching("Shared root")[2]?.current).toBe("/cluster/../escape");
-  expect(ui.matching("Name / description")[1]?.current).toBe("Retained initial description");
-  expect(ui.matching("SSH username")).toHaveLength(1);
-  expect(ui.matching("Slurm account")).toHaveLength(1);
-  expect(ui.matching("Review cluster")[0]?.title).toContain("Retained initial description");
-  expect(ui.matching("Field to correct")[0]?.options).not.toContain("Maximum GPUs per allocation");
-  expect(ui.notices.filter((notice) => notice.type === "error").length).toBeGreaterThanOrEqual(7);
-  expect((await document()).clusters).toEqual([result]);
-  await expectSecureFiles(result!);
+  expect(order).toEqual(["ssh", "ssh", "verify", "discover"]);
+  expect(ui.matching("Authorize the public key")).toHaveLength(2);
+  expect(ui.notices.some(({ message }) => /Strict SSH test failed/.test(message))).toBe(true);
 });
 
-test("correcting a populated optional field with '-' removes it without disturbing other answers", async () => {
-  const ui = new WizardUI("clear-optional", { replies: {
-    "Advanced settings": "Configure advanced settings",
-    "Review cluster": ["Edit a field", "Save profile"],
-    "Field to correct": "QoS (optional)",
-    "QoS": ["research-qos", "-"],
-  } });
-  const result = await ui.run();
+test("the exact two-mapping catalogue loop keeps primary identity and forwards both mappings", async () => {
+  const mappings = [{ storage_id: "research-storage", shared_root: "/cluster/research group" }, { storage_id: "datasets", shared_root: "/cluster/datasets" }];
+  const ui = new WizardUI("two-filesystems", {
+    replies: {
+      "WH shared filesystem": ["/data/shared/research-storage", "/data/shared/datasets"],
+      "Same filesystem root": ["/cluster//research group/", "/cluster/datasets"],
+      "Add another filesystem mapping?": ["Yes", "No"],
+    },
+    setup: {
+      catalogue: async () => ["/data/shared/research-storage", "/data/shared/datasets", "/data/local/not-shared"],
+      verifyMappings: async (_connection, value) => { expect(value).toEqual(mappings); },
+      discover: async (_connection, input) => { expect(input.mappings).toEqual(mappings); return discovery(); },
+    },
+  });
+  expect(await ui.run()).toMatchObject({ ...mappings[0], additional_shared_roots: [mappings[1]] });
   ui.expectScriptUsed();
-  expect(result).toBeDefined();
-  expect(result).not.toHaveProperty("qos");
-  expect(result).toMatchObject({ max_cpus: 32, max_memory_mb: 65536, partition: "cpu-partition" });
-  expect(ui.matching("QoS")[1]?.current).toBe("research-qos");
-  expect((await document()).clusters).toEqual([result]);
+  expect(ui.matching("WH shared filesystem").map(({ options }) => options)).toEqual([
+    ["/data/shared/research-storage", "/data/shared/datasets", "Enter /data/shared/<id>"],
+    ["/data/shared/datasets", "Enter /data/shared/<id>"],
+  ]);
+  expect(ui.matching("Add another filesystem mapping?").map(({ title, options }) => ({ title, options }))).toEqual([
+    { title: "Add another filesystem mapping?", options: ["No", "Yes"] },
+    { title: "Add another filesystem mapping?", options: ["No", "Yes"] },
+  ]);
+  expect(ui.matching("WH shared path")).toEqual([]);
+});
+
+test("manual path and URL corrections retain earlier answers", async () => {
+  const ui = new WizardUI("corrected", { replies: {
+    "WH shared path": ["/data/local/wrong", "/data/shared/research-storage"],
+    "Same filesystem root": ["relative/shared", "/cluster/../escape", "/cluster//corrected shared/"],
+    "Local Tailnet enrollment KEY FILE": ["relative/key", join(home, "tailnet enrollment key")],
+    "Tailnet login server": ["https://user:secret@control.example.test", "https://control.example.test"],
+  } });
+  expect(await ui.run()).toMatchObject({ shared_root: "/cluster/corrected shared" });
+  ui.expectScriptUsed();
+  expect(ui.matching("SSH destination")).toHaveLength(1);
+  expect(ui.notices.filter(({ type }) => type === "error").length).toBeGreaterThanOrEqual(5);
+});
+
+test("automatic CPU/GPU IDs are collision-safe; ceilings are seven days or lower partition caps", async () => {
+  const targets = [target("cpu.part"), target("cpu-part"), target("short", undefined, 3600), target("gpu", "a100.80gb"), target("gpu", "a100-80gb")];
+  const ui = new WizardUI("all-targets", { setup: { discover: async () => discovery({ targets }) } });
+  expect(await ui.run()).toBeDefined();
+  ui.expectScriptUsed();
+  const profiles = (await document()).clusters;
+  expect(profiles).toHaveLength(5);
+  expect(new Set(profiles.map(({ id }) => id)).size).toBe(5);
+  expect(profiles.map(({ id }) => id)).toEqual(targets.map((candidate) => discoveredTargetId("all-targets", candidate)));
+  expect(profiles.map(({ max_walltime_seconds }) => max_walltime_seconds)).toEqual([604800, 604800, 3600, 604800, 604800]);
+  expect(profiles.filter(({ compute_kind }) => compute_kind === "gpu").map(({ gpu_type }) => gpu_type)).toEqual(["a100.80gb", "a100-80gb"]);
+  expect(new Set(profiles.map(({ ssh_config_file }) => ssh_config_file)).size).toBe(1);
 });
 
 test("an existing ID is rejected without replacing its profile or managed secret", async () => {
   await saveBaseline();
-  const keyDirectory = join(dirname(configPath), "ssh", "existing");
-  await mkdir(keyDirectory, { recursive: true, mode: 0o700 });
-  await writeFile(join(keyDirectory, "id_ed25519"), "existing-private-secret", { mode: 0o600 });
+  const directory = join(dirname(configPath), "ssh", "existing");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(join(directory, "id_ed25519"), "existing-private-secret", { mode: 0o600 });
   const before = await tree();
-  const ui = new WizardUI("existing", { replies: { "Cluster ID": ["existing", undefined] } });
+  const ui = new WizardUI("existing", { replies: { "Cluster name": ["existing", undefined] } });
   expect(await ui.run()).toBeUndefined();
   ui.expectScriptUsed();
-  expect(ui.matching("Cluster ID")).toHaveLength(2);
-  expect(ui.notices.some((notice) => notice.type === "error")).toBe(true);
+  expect(ui.matching("Cluster name")).toHaveLength(2);
   expect(ui.published).toEqual([]);
   expect(await tree()).toEqual(before);
 });
@@ -435,7 +477,6 @@ for (const collision of ["existing-directory", "key-directory-symlink", "config-
     const ui = new WizardUI("collision");
     expect(await ui.run()).toBeUndefined();
     ui.expectScriptUsed();
-    expect(ui.matching("Confirm cluster")).toHaveLength(1);
     expect(ui.notices.some((notice) => notice.type === "error")).toBe(true);
     expect(ui.published).toEqual([]);
     expect(await tree()).toEqual(before);
@@ -457,68 +498,47 @@ for (const invalid of ["{not valid JSON", JSON.stringify({ version: 2, clusters:
   });
 }
 
-test("copying a managed connection creates per-profile configs using the same shared key and storage", async () => {
-  const sourceUI = new WizardUI("source-gpu", { replies: { "Compute kind": "gpu", "Slurm partition": "gpu-partition" } });
-  const source = await sourceUI.run();
-  sourceUI.expectScriptUsed();
-  expect(source).toBeDefined();
-  const sourceDirectory = dirname(source!.ssh_config_file!);
-  const oldSSH = await tree(sourceDirectory);
-  const before = await tree();
-  const copied = new WizardUI("copied-cpu", {
-    replies: {
-      "Reuse an existing": "Copy source-gpu: connection / storage / runtime",
-      "Shared storage ID": "", "Shared root": "", "Worker SIF": "",
-      "Local Tailnet enrollment KEY FILE": "", "Tailnet login server": "", "Orchestrator hostname": "",
-      "Trusted runtime shell prelude": "module purge\nmodule load apptainer",
-    },
-    beforePrompt: async () => { expect(await tree()).toEqual(before); },
-  });
-  const result = await copied.run();
-  copied.expectScriptUsed();
-  expect(result).toMatchObject({
-    id: "copied-cpu", compute_kind: "cpu", max_gpus: 0, storage_id: source!.storage_id,
-    shared_root: source!.shared_root, sif_path: source!.sif_path, ssh_host: source!.ssh_host,
-    ssh_config_file: join(dirname(configPath), "ssh", "copied-cpu", "config"), runtime: source!.runtime, runtime_setup: source!.runtime_setup,
-    tailnet_key_file: source!.tailnet_key_file, tailnet_login_server: source!.tailnet_login_server,
-    orchestrator_host: source!.orchestrator_host,
-  });
-  expect(result).not.toHaveProperty("gpu_type");
-  expect(sharedPath(result!)).toBe(sharedPath(source!));
-  expect(copied.matching("SSH connection")).toEqual([]);
-  expect(copied.matching("SSH hostname")).toEqual([]);
-  expect(copied.matching("Confirm cluster")[0]?.current).toMatch(/reuse/i);
-  expect(await tree(sourceDirectory)).toEqual(oldSSH);
-  expect((await readdir(dirname(sourceDirectory))).sort()).toEqual(["copied-cpu", "source-gpu"]);
-  expect((await document()).clusters).toEqual([source, result]);
-  await expectSafePublication(copied, result!);
+test("global integration prompts once and is reused by later clusters without publishing secrets", async () => {
+  const firstUI = new WizardUI("first-integration");
+  const first = await firstUI.run();
+  firstUI.expectScriptUsed();
+  expect(first).toMatchObject({ tailnet_key_file: join(home, "tailnet enrollment key"), tailnet_login_server: "https://control.example.test", orchestrator_host: defaultRegistrationHost(), orchestrator_registration_port: 12888 });
+  expect(firstUI.matching("Local Tailnet enrollment KEY FILE")).toHaveLength(1);
+  expect(firstUI.matching("Tailnet login server")).toHaveLength(1);
+  expect(firstUI.matching("Orchestrator")).toEqual([]);
+  const settingsPath = join(dirname(configPath), "cluster-integration.json");
+  const settings = await readFile(settingsPath, "utf8");
+  expect(JSON.parse(settings)).toEqual({ version: 1, integration: {
+    tailnet_key_file: first!.tailnet_key_file, tailnet_login_server: first!.tailnet_login_server,
+    orchestrator_host: first!.orchestrator_host, orchestrator_registration_port: 12888,
+  } });
+  expect(settings).not.toContain(enrollmentSecret);
+  expect((await stat(settingsPath)).mode & 0o777).toBe(0o600);
+  const secondUI = new WizardUI("second-integration");
+  expect(await secondUI.run()).toBeDefined();
+  secondUI.expectScriptUsed();
+  expect(secondUI.matching("Local Tailnet enrollment KEY FILE")).toEqual([]);
+  expect(secondUI.matching("Tailnet login server")).toEqual([]);
+  expect(await readFile(settingsPath, "utf8")).toBe(settings);
+  expect([...firstUI.published, ...secondUI.published].join("\n")).not.toContain(enrollmentSecret);
 });
 
-test("copying refuses a symlinked private key without changing the source or registering a new profile", async () => {
-  const sourceUI = new WizardUI("managed-source");
-  const source = await sourceUI.run();
-  sourceUI.expectScriptUsed();
+test("unambiguous aliases automatically reuse stable mappings without copying credentials", async () => {
+  const source = await new WizardUI("source-alias", { replies: { "SSH destination": "site-login" } }).run();
   expect(source).toBeDefined();
-  const key = join(dirname(configPath), "id_ed25519");
-  const outsideKey = join(root, "outside-private-key");
-  await writeFile(outsideKey, await readFile(key), { mode: 0o600 });
-  await rm(key);
-  await symlink(outsideKey, key);
-  const before = await tree();
-  const copied = new WizardUI("rejected-copy", { replies: {
-    "Reuse an existing": "Copy managed-source: connection / storage / runtime",
-    "Shared storage ID": "", "Shared root": "", "Worker SIF": "",
-  } });
-  expect(await copied.run()).toBeUndefined();
-  copied.expectScriptUsed();
-  expect(copied.matching("Confirm cluster")).toHaveLength(1);
-  expect(copied.notices.some((notice) => notice.type === "error")).toBe(true);
-  expect(copied.published).toEqual([]);
-  expect(await tree()).toEqual(before);
+  const sourceFiles = await tree(dirname(source!.ssh_config_file!));
+  const key = await readFile(join(dirname(configPath), "id_ed25519"));
+  const ui = new WizardUI("reused-alias", { replies: { "SSH destination": "site-login" } });
+  expect(await ui.run()).toMatchObject({ storage_id: source!.storage_id, shared_root: source!.shared_root, ssh_host: "site-login" });
+  ui.expectScriptUsed();
+  expect(ui.matching("WH shared path")).toEqual([]);
+  expect(ui.matching("Same filesystem root")).toEqual([]);
+  expect(await tree(dirname(source!.ssh_config_file!))).toEqual(sourceFiles);
+  expect(await readFile(join(dirname(configPath), "id_ed25519"))).toEqual(key);
 });
 
 for (const invalidPublicFile of ["private-key", "invalid-ed25519-blob"] as const) {
-  test(`copying rejects ${invalidPublicFile} in the public-key file without publishing or committing it`, async () => {
+  test(`shared identity rejects ${invalidPublicFile} in the public-key file without publishing or committing it`, async () => {
     const sourceUI = new WizardUI("public-key-source");
     const source = await sourceUI.run();
     sourceUI.expectScriptUsed();
@@ -527,13 +547,10 @@ for (const invalidPublicFile of ["private-key", "invalid-ed25519-blob"] as const
     const privateKey = await readFile(key, "utf8");
     await writeFile(key + ".pub", invalidPublicFile === "private-key" ? privateKey : "ssh-ed25519 c2VjcmV0 invalid-key-blob");
     const before = await tree();
-    const copied = new WizardUI("unsafe-public-copy", { replies: {
-      "Reuse an existing": "Copy public-key-source: connection / storage / runtime",
-      "Shared storage ID": "", "Shared root": "", "Worker SIF": "",
-    } });
+    const copied = new WizardUI("unsafe-public-copy");
     expect(await copied.run()).toBeUndefined();
     copied.expectScriptUsed();
-    expect(copied.matching("Confirm cluster")).toHaveLength(1);
+    expect(copied.matching("Create shared SSH connection")).toEqual([]);
     expect(copied.published).toEqual([]);
     expect(copied.notices.some((notice) => notice.type === "error" && /public key/i.test(notice.message))).toBe(true);
     for (const notice of copied.notices) {
@@ -546,66 +563,336 @@ for (const invalidPublicFile of ["private-key", "invalid-ed25519-blob"] as const
   });
 }
 
-function simultaneousConfirmation(): (prompt: Prompt) => Promise<void> {
-  const ready = Promise.withResolvers<void>();
-  let count = 0;
-  return async (prompt) => {
-    if (prompt.kind !== "confirm") return;
-    if (++count === 2) ready.resolve();
-    await ready.promise;
-  };
+for (const missing of ["runtime", "image"] as const) {
+  test(`only missing ${missing} asks a conditional corrective field before rediscovery`, async () => {
+    let calls = 0;
+    const ui = new WizardUI(`missing-${missing}`, {
+      replies: { "Discovery prerequisites unresolved": "Provide missing runtime / image" },
+      setup: { discover: async (_connection, input) => {
+        if (++calls === 1) return discovery({
+          ...(missing === "runtime" ? { runtime: undefined } : { sif_path: undefined }),
+          unresolved: [{ kind: missing, blocking: true, message: `Missing ${missing}` }],
+        });
+        if (missing === "runtime") expect(input.runtime_setup).toBe("module load apptainer");
+        else expect(input.sif_path).toBe("/cluster/research group/worker.sif");
+        return discovery();
+      } },
+    });
+    expect(await ui.run()).toBeDefined();
+    ui.expectScriptUsed();
+    expect(calls).toBe(2);
+    expect(ui.matching("Trusted runtime shell prelude")).toHaveLength(missing === "runtime" ? 1 : 0);
+    expect(ui.matching("Compatible Worker SIF")).toHaveLength(missing === "image" ? 1 : 0);
+    expect(ui.matching("Billing default unresolved")).toEqual([]);
+  });
 }
 
-test("two simultaneous real registrations never lose a profile; a lock loser can retry safely", async () => {
-  const old = baseline();
-  await saveBaseline([old]);
-  const barrier = simultaneousConfirmation();
-  const first = new WizardUI("parallel-a", { beforePrompt: barrier });
-  const second = new WizardUI("parallel-b", { beforePrompt: barrier });
-  const results = await Promise.all([first.run(), second.run()]);
-  first.expectScriptUsed();
-  second.expectScriptUsed();
-  expect(results.filter(Boolean).length).toBeGreaterThanOrEqual(1);
-  const firstCommit = await document();
-  expect(firstCommit.clusters[0]).toEqual(old);
-  expect(firstCommit.clusters.slice(1).map((profile) => profile.id).sort()).toEqual(results.filter((profile): profile is ClusterProfile => profile !== undefined).map((profile) => profile.id).sort());
-  const committedKeys = new Map<string, string>();
-  for (const profile of firstCommit.clusters.slice(1)) committedKeys.set(profile.id, await readFile(join(dirname(configPath), "id_ed25519"), "utf8"));
-  for (let index = 0; index < results.length; index++) {
-    if (results[index] !== undefined) continue;
-    const failed = index === 0 ? first : second;
-    expect(failed.published).toEqual([]);
-    expect(failed.notices.some((notice) => notice.type === "error" && /lock|concurren/i.test(notice.message))).toBe(true);
-    const retry = new WizardUI(failed.id);
-    results[index] = await retry.run();
-    retry.expectScriptUsed();
-    expect(results[index]).toBeDefined();
-  }
-  const saved = await document();
-  expect(saved.clusters[0]).toEqual(old);
-  expect(saved.clusters.slice(1).map((profile) => profile.id).sort()).toEqual(["parallel-a", "parallel-b"]);
-  for (const profile of saved.clusters.slice(1)) {
-    await expectSecureFiles(profile);
-    if (committedKeys.has(profile.id)) expect((await readFile(join(dirname(configPath), "id_ed25519"), "utf8")) === committedKeys.get(profile.id)).toBe(true);
-  }
-  expect((await tree()).some((entry) => /\.lock$|\.tmp$/.test(entry.path))).toBe(false);
+test("billing is conditional and an explicitly chosen account is rediscovered", async () => {
+  let calls = 0;
+  const ui = new WizardUI("billing", {
+    replies: { "Billing default unresolved": "Account project-b" },
+    setup: { discover: async (_connection, input) => {
+      if (++calls === 1) return discovery({ accounts: ["project-a", "project-b"], unresolved: [{ kind: "billing", blocking: false, message: "No site default" }] });
+      expect(input.account).toBe("project-b");
+      return discovery({ account: "project-b", account_source: "explicit" });
+    } },
+  });
+  expect(await ui.run()).toMatchObject({ account: "project-b" });
+  ui.expectScriptUsed();
+  expect(calls).toBe(2);
+  expect(ui.matching("Billing default unresolved")[0]?.options).toEqual(["Use scheduler default", "Account project-a", "Account project-b"]);
 });
 
-test("concurrent registrations of the same ID commit exactly one key/profile without replacement", async () => {
-  await saveBaseline();
-  const barrier = simultaneousConfirmation();
-  const first = new WizardUI("same-id", { replies: { "Name / description": "First concurrent draft" }, beforePrompt: barrier });
-  const second = new WizardUI("same-id", { replies: { "Name / description": "Second concurrent draft" }, beforePrompt: barrier });
-  const results = await Promise.all([first.run(), second.run()]);
-  first.expectScriptUsed();
-  second.expectScriptUsed();
-  const winners = results.filter((profile): profile is ClusterProfile => profile !== undefined);
-  expect(winners).toHaveLength(1);
-  expect((await document()).clusters).toEqual([baseline(), winners[0]]);
-  expect(first.published.length + second.published.length).toBe(1);
-  expect((await readdir(join(dirname(configPath), "ssh"))).sort()).toEqual(["same-id"]);
-  await expectSecureFiles(winners[0]!);
-  expect((await tree()).some((entry) => /\.lock$|\.tmp$/.test(entry.path))).toBe(false);
+for (const missing of ["image", "key-file", "private-key-file", "key-file-symlink", "live-openapi"] as const) {
+  test(`${missing} saves blocked setup without registering any ready target`, async () => {
+    const key = join(home, "tailnet enrollment key");
+    if (missing === "key-file") await rm(key);
+    if (missing === "private-key-file") await chmod(key, 0o644);
+    if (missing === "key-file-symlink") { await rename(key, key + ".real"); await symlink(key + ".real", key); }
+    const ui = new WizardUI(`blocked-${missing}`, { setup: {
+      ...(missing === "image" ? { discover: async () => discovery({ sif_path: undefined, unresolved: [{ kind: "image", blocking: true, message: "Compatible image missing" }] }) } : {}),
+      readiness: async () => missing === "live-openapi" ? ["Control deployment lacks POST /api/v1/workers/reservations and GET /api/v1/job-events"] : [],
+    } });
+    expect(await ui.run()).toBeUndefined();
+    ui.expectScriptUsed();
+    expect(await loadClusterProfiles(env)).toEqual([]);
+    expect((await drafts())[0]).toMatchObject({ phase: "blocked" });
+    expect(ui.matching("Review cluster")).toEqual([]);
+    expect(ui.published.join("\n")).toMatch(/blocked/i);
+    expect(ui.published.join("\n")).not.toContain(enrollmentSecret);
+  });
+}
+
+test("failed mapping verification blocks before discovery/readiness with mappings retained", async () => {
+  const calls: string[] = [];
+  const ui = new WizardUI("mapping-mismatch", { setup: {
+    verifyMappings: async () => { throw new Error("Shared filesystem identity could not be verified"); },
+    discover: async () => { calls.push("discovery"); return discovery(); },
+    readiness: async () => { calls.push("readiness"); return []; },
+  } });
+  expect(await ui.run()).toBeUndefined();
+  ui.expectScriptUsed();
+  expect(calls).toEqual([]);
+  expect(await loadClusterProfiles(env)).toEqual([]);
+  expect((await drafts())[0]).toMatchObject({ phase: "blocked", mappings: [{ storage_id: "research-storage", shared_root: "/cluster/research group" }] });
+});
+
+for (const stage of ["ssh", "mapping", "mapping-loop", "runtime-editor", "image-input", "review-escape", "review-save", "advanced", "edit-review", "final-confirm"] as const) {
+  test(`cancellation at ${stage} retains honest resumable state with no targets`, async () => {
+    const replies: Record<string, Reply> = {};
+    if (stage === "ssh") replies["Authorize the public key"] = undefined;
+    if (stage === "mapping") replies["Same filesystem root"] = undefined;
+    if (stage === "mapping-loop") replies["Add another filesystem mapping?"] = undefined;
+    if (stage === "runtime-editor" || stage === "image-input") {
+      replies["Discovery prerequisites unresolved"] = "Provide missing runtime / image";
+      replies[stage === "runtime-editor" ? "Trusted runtime shell prelude" : "Compatible Worker SIF"] = undefined;
+    }
+    if (stage === "review-escape") replies["Review cluster"] = undefined;
+    if (stage === "review-save") replies["Review cluster"] = "Save and exit";
+    if (stage === "advanced") { replies["Review cluster"] = "Advanced"; replies["Advanced allocation settings"] = undefined; }
+    if (stage === "edit-review") { replies["Review cluster"] = "Edit review"; replies["Edit cluster review"] = undefined; }
+    const ui = new WizardUI(`cancel-${stage}`, {
+      replies, confirms: { "Register discovered cluster targets?": stage !== "final-confirm" },
+      setup: stage === "runtime-editor" || stage === "image-input" ? {
+        discover: async () => discovery({ unresolved: [{ kind: stage === "runtime-editor" ? "runtime" : "image", blocking: true, message: "Missing prerequisite" }] }),
+      } : {},
+    });
+    expect(await ui.run()).toBeUndefined();
+    ui.expectScriptUsed();
+    expect(await loadClusterProfiles(env)).toEqual([]);
+    expect(await drafts()).toHaveLength(1);
+    expect((await stat(join(dirname(configPath), "id_ed25519"))).isFile()).toBe(true);
+    expect(ui.notices.some(({ message }) => /draft retained/.test(message))).toBe(true);
+    expect(ui.notices.some(({ message }) => /nothing saved|before consent/.test(message))).toBe(false);
+  });
+}
+
+test("resuming a partial mapping repeats the extra-filesystem question without duplicating primary", async () => {
+  const paused = new WizardUI("partial-mapping", { replies: { "Add another filesystem mapping?": undefined } });
+  expect(await paused.run()).toBeUndefined();
+  paused.expectScriptUsed();
+  expect((await drafts())[0]!.mappings).toHaveLength(1);
+  const resumed = new WizardUI("partial-mapping");
+  expect(await resumed.run()).toBeDefined();
+  resumed.expectScriptUsed();
+  expect(resumed.matching("WH shared path")).toEqual([]);
+  expect(resumed.matching("Same filesystem root")).toEqual([]);
+  expect(resumed.matching("Add another filesystem mapping?")).toHaveLength(1);
+});
+
+test("aborting discovery passes the signal and preserves the saved discovery-stage draft", async () => {
+  const controller = new AbortController();
+  const ui = new WizardUI("abort-discovery", { setup: {
+    signal: controller.signal,
+    discover: async (_connection, _input, options) => {
+      expect(options?.signal).toBe(controller.signal);
+      controller.abort();
+      controller.signal.throwIfAborted();
+      return discovery();
+    },
+  } });
+  expect(await ui.run()).toBeUndefined();
+  ui.expectScriptUsed();
+  expect((await drafts())[0]!.phase).toBe("discovery");
+  expect(await loadClusterProfiles(env)).toEqual([]);
+  expect(ui.notices.some(({ message }) => /draft retained/.test(message))).toBe(true);
+});
+
+test("advanced failure grace requires idle-policy opt-in while the partition remains a hard ceiling", async () => {
+  const ui = new WizardUI("advanced-opt-in", {
+    replies: {
+      "Review cluster": ["Advanced", "Register targets"],
+      "Advanced allocation settings": JSON.stringify({ failure_grace_seconds: 300, max_walltime_seconds: 604800 }),
+    },
+    setup: { discover: async () => discovery({ targets: [target("short", undefined, 7200)] }) },
+  });
+  expect(await ui.run()).toMatchObject({ failure_grace_seconds: 300, max_walltime_seconds: 7200 });
+  ui.expectScriptUsed();
+  expect(ui.matching("Opt in to failure diagnosis idle holding?")[0]?.current).toMatch(/idle allocations.*site.*utilization policy/i);
+});
+
+test("concurrent config edits at final confirmation survive atomic registration of the entire target set", async () => {
+  const initial = baseline();
+  await saveBaseline([initial]);
+  const concurrent = { ...baseline("operator-added"), description: "Concurrent operator edit" };
+  const ui = new WizardUI("atomic-set", {
+    setup: { discover: async () => discovery({ targets: [target("cpu"), target("gpu", "a100")] }) },
+    beforePrompt: async ({ title }) => { if (title === "Register discovered cluster targets?") await saveBaseline([initial, concurrent]); },
+  });
+  expect(await ui.run()).toBeDefined();
+  ui.expectScriptUsed();
+  const saved = (await document()).clusters;
+  expect(saved.slice(0, 2)).toEqual([initial, concurrent]);
+  expect(saved.slice(2).map(({ compute_kind }) => compute_kind)).toEqual(["cpu", "gpu"]);
+});
+
+test("concurrent draft revision blocks all targets without changing existing config", async () => {
+  const before = await saveBaseline();
+  const ui = new WizardUI("concurrent-draft", {
+    setup: { discover: async () => discovery({ targets: [target("cpu"), target("gpu", "a100")] }) },
+    beforePrompt: async ({ title }) => {
+      if (title !== "Register discovered cluster targets?") return;
+      const saved = await drafts();
+      saved[0]!.revision++;
+      await writeFile(join(dirname(configPath), "setup-drafts.json"), JSON.stringify({ version: 1, drafts: saved }), { mode: 0o600 });
+    },
+  });
+  expect(await ui.run()).toBeUndefined();
+  ui.expectScriptUsed();
+  expect(await readFile(configPath, "utf8")).toBe(before);
+  expect(ui.notices.some(({ message }) => /changed concurrently/.test(message))).toBe(true);
+});
+
+test("commit rename failure leaves existing config byte-exact and the full target set resumable", async () => {
+  const before = await saveBaseline();
+  let replacements = 0;
+  const targets = [target("cpu"), target("gpu", "a100")];
+  const ui = new WizardUI("rename-failure", { setup: {
+    discover: async () => discovery({ targets }),
+    replaceConfig: async (_source, destination) => { replacements++; await rename(join(root, "missing-staged-file"), destination); },
+  } });
+  expect(await ui.run()).toBeUndefined();
+  ui.expectScriptUsed();
+  expect(replacements).toBe(1);
+  expect(await readFile(configPath, "utf8")).toBe(before);
+  expect(await drafts()).toHaveLength(1);
+  expect((await tree()).some(({ path }) => /\.lock$|\.tmp$/.test(path))).toBe(false);
+  const retry = new WizardUI("rename-failure", { setup: { discover: async () => discovery({ targets }) } });
+  expect(await retry.run()).toBeDefined();
+  retry.expectScriptUsed();
+  expect((await document()).clusters).toHaveLength(3);
+});
+
+test("successful atomic commit reports retained draft if only draft cleanup fails", async () => {
+  const paused = new WizardUI("cleanup-failure", { replies: { "Review cluster": "Save and exit" } });
+  expect(await paused.run()).toBeUndefined();
+  paused.expectScriptUsed();
+  const draft = (await drafts())[0]!;
+  const profiles = buildDiscoveredProfiles(draft, draft.discovery!);
+  const draftPath = join(dirname(configPath), "setup-drafts.json");
+  const result = await commitSetupProfiles(draft, profiles, env, async (source, destination) => {
+    await rename(source, destination);
+    // Prevent only cleanup's rename, after the real completed-profile commit.
+    await rename(draftPath, draftPath + ".retained");
+    await mkdir(draftPath, { mode: 0o700 });
+  });
+  expect(result).toEqual({ draftRetained: true });
+  expect((await document()).clusters).toEqual(profiles);
+  expect(JSON.parse(await readFile(draftPath + ".retained", "utf8")).drafts).toEqual([draft]);
+});
+
+test("resuming after discovered partitions and GPU types change replaces stale selections with a fresh target", async () => {
+  const oldTargets = [target("old-cpu"), target("old-gpu", "a100")];
+  const paused = new WizardUI("changed-discovery", {
+    replies: { "Review cluster": "Save and exit" },
+    setup: { discover: async () => discovery({ targets: oldTargets }) },
+  });
+  expect(await paused.run()).toBeUndefined();
+  paused.expectScriptUsed();
+  expect((await drafts())[0]!.selected_targets).toEqual(oldTargets.map((candidate) => discoveredTargetId("changed-discovery", candidate)));
+  expect(await loadClusterProfiles(env)).toEqual([]);
+  const freshTargets = [target("new-cpu"), target("new-gpu", "h100")];
+  const resumed = new WizardUI("changed-discovery", {
+    replies: { "Saved targets are no longer available": "new-gpu gpu h100" },
+    setup: { discover: async () => discovery({ targets: freshTargets }) },
+  });
+  const profile = await resumed.run();
+  resumed.expectScriptUsed();
+  expect(profile).toMatchObject({
+    id: discoveredTargetId("changed-discovery", freshTargets[1]!),
+    partition: "new-gpu", compute_kind: "gpu", gpu_type: "h100",
+  });
+  expect(resumed.matching("Saved targets are no longer available")[0]?.options).toEqual(["new-cpu cpu", "new-gpu gpu h100", "Save and exit"]);
+  expect(resumed.matching("Review cluster")).toHaveLength(1);
+  expect(await loadClusterProfiles(env)).toEqual([profile!]);
+  expect(await drafts()).toEqual([]);
+});
+
+test("an explicit user on a fixture alias preserves its resolved port, jump and original Host context", async () => {
+  const ui = new WizardUI("explicit-alias-user", { replies: { "SSH destination": "researcher@site-login" } });
+  const profile = await ui.run();
+  ui.expectScriptUsed();
+  expect(profile).toMatchObject({ ssh_host: "site-login" });
+  const ssh = await effectiveSSH(profile!);
+  for (const [field, value] of Object.entries({
+    hostname: "192.0.2.42", user: "researcher", port: "2202", proxyjump: "gateway.example.test",
+    controlmaster: "auto", controlpersist: "300",
+  })) expect(ssh.get(field)).toBe(value);
+  await expectBootstrapAuthentication(profile!);
+});
+
+test("cluster name defaults to the requested argument or short SSH hostname without extra connection questions", async () => {
+  const requested = new WizardUI("unused", {
+    replies: { "Cluster name": "", "Authorize the public key": "Save and exit" },
+  });
+  expect(await requested.run("requested-name")).toBeUndefined();
+  requested.expectScriptUsed();
+  expect(requested.matching("Cluster name")[0]?.current).toBe("requested-name");
+  const hostname = new WizardUI("unused", { replies: {
+    "SSH destination": "researcher@login.example.test", "Cluster name": "",
+    "Authorize the public key": "Save and exit", "Resume cluster setup?": "New cluster",
+  } });
+  expect(await hostname.run("")).toBeUndefined();
+  hostname.expectScriptUsed();
+  expect(hostname.matching("Cluster name")[0]?.current).toBe("login");
+  expect((await drafts()).map(({ id }) => id).sort()).toEqual(["login", "requested-name"]);
+  expect(await loadClusterProfiles(env)).toEqual([]);
+});
+
+test("review editing registers only the selected discovered target and corrected description", async () => {
+  const targets = [target("cpu"), target("gpu", "a100")];
+  const selected = discoveredTargetId("edited-review", targets[1]!);
+  const ui = new WizardUI("edited-review", {
+    replies: {
+      "Review cluster": ["Edit review", "Register targets"],
+      "Edit cluster review": JSON.stringify({ description: "Selected GPU research target", selected_targets: [selected] }),
+    },
+    setup: { discover: async () => discovery({ targets }) },
+  });
+  expect(await ui.run()).toMatchObject({ id: selected, description: "Selected GPU research target", compute_kind: "gpu" });
+  ui.expectScriptUsed();
+  expect((await document()).clusters).toHaveLength(1);
+  expect(ui.matching("Review cluster")[1]?.title).toContain("Selected GPU research target");
+});
+
+test("simultaneous commits of one reviewed draft register exactly one complete target set", async () => {
+  const paused = new WizardUI("simultaneous-commit", {
+    replies: { "Review cluster": "Save and exit" },
+    setup: { discover: async () => discovery({ targets: [target("cpu"), target("gpu", "a100")] }) },
+  });
+  expect(await paused.run()).toBeUndefined();
+  paused.expectScriptUsed();
+  const draft = (await drafts())[0]!;
+  const profiles = buildDiscoveredProfiles(draft, draft.discovery!);
+  const key = await readFile(join(dirname(configPath), "id_ed25519"));
+  const results = await Promise.allSettled([
+    commitSetupProfiles(draft, profiles, env),
+    commitSetupProfiles(draft, profiles, env),
+  ]);
+  expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+  expect(results.filter(({ status }) => status === "rejected")).toHaveLength(1);
+  expect((await document()).clusters).toEqual(profiles);
+  expect(await readFile(join(dirname(configPath), "id_ed25519"))).toEqual(key);
+  expect(await drafts()).toEqual([]);
+});
+
+test("UI reports registration success and retained-draft guidance when only cleanup fails", async () => {
+  const draftPath = join(dirname(configPath), "setup-drafts.json");
+  const ui = new WizardUI("cleanup-ui", { setup: {
+    replaceConfig: async (source, destination) => {
+      await rename(source, destination);
+      await rename(draftPath, draftPath + ".retained");
+      await mkdir(draftPath, { mode: 0o700 });
+    },
+  } });
+  const profile = await ui.run();
+  ui.expectScriptUsed();
+  expect(profile).toBeDefined();
+  expect(await loadClusterProfiles(env)).toEqual([profile!]);
+  expect(ui.published.join("\n")).toMatch(/registered.*cluster:/s);
+  expect(ui.published.join("\n")).toContain("Completed draft cleanup failed");
+  expect(ui.published.join("\n")).toContain("not another target");
+  expect(ui.notices.some(({ type }) => type === "error")).toBe(false);
 });
 
 test("system SSH inclusion requires a regular resolved file with safe ownership and write permissions", async () => {
@@ -648,7 +935,7 @@ test("native system SSH config policy permits safe user alias resolution without
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     expect(system.includePath).toBeUndefined();
   }
-  const ui = new WizardUI("native-system-policy", { replies: { "SSH connection": "Existing SSH alias" } });
+  const ui = new WizardUI("native-system-policy", { replies: { "SSH destination": "site-login" } });
   const profile = await ui.run();
   ui.expectScriptUsed();
   expect(profile).toBeDefined();
@@ -706,12 +993,12 @@ test("independent profiles share exactly one key and preserve every verified kno
   const originalKey = await readFile(join(ssh, "id_ed25519"));
   const trust = "|1|verified-hash|verified-host ssh-ed25519 site-public-key\n# retain exactly\n";
   await writeFile(join(ssh, "known_hosts"), trust, { mode: 0o600 });
-  const secondUI = new WizardUI("second", { replies: { "SSH hostname / IP": "192.0.2.18" } });
+  const secondUI = new WizardUI("second", { replies: { "SSH destination": "researcher@192.0.2.18" } });
   const second = await secondUI.run();
   expect(second).toBeDefined();
   expect(await readFile(join(ssh, "id_ed25519"))).toEqual(originalKey);
   expect(await readFile(join(ssh, "known_hosts"), "utf8")).toBe(trust);
-  expect(secondUI.matching("Confirm cluster")[0]?.current).toContain("Reuse the existing shared SSH key");
+  expect(secondUI.matching("Create shared SSH connection")[0]?.current).toContain("Reuse the shared key");
   await expectBootstrapAuthentication(first!);
   await expectBootstrapAuthentication(second!);
   expect(await readdir(dirname(second!.ssh_config_file!))).toEqual(["bootstrap_config", "config"]);
@@ -802,7 +1089,7 @@ test("manually modified wizard-shaped config is explicitly left outside migratio
   expect(ui.published[0]).toContain("NOT migrated: legacy-second");
 });
 
-for (const unsafe of ["shared-key-symlink", "trust-symlink", "trust-world-readable", "mismatched-public", "fake-private-with-valid-public"] as const) {
+for (const unsafe of ["shared-key-symlink", "public-key-symlink", "trust-symlink", "trust-world-readable", "mismatched-public", "fake-private-with-valid-public"] as const) {
   test(`shared SSH rejects ${unsafe} without replacing user files`, async () => {
     const profile = await new WizardUI("source").run();
     expect(profile).toBeDefined();
@@ -810,7 +1097,7 @@ for (const unsafe of ["shared-key-symlink", "trust-symlink", "trust-world-readab
     const key = join(ssh, "id_ed25519");
     const trust = join(ssh, "known_hosts");
     if (unsafe.endsWith("symlink")) {
-      const destination = unsafe === "shared-key-symlink" ? key : trust;
+      const destination = unsafe === "shared-key-symlink" ? key : unsafe === "public-key-symlink" ? key + ".pub" : trust;
       const victim = join(root, "untouched-victim");
       await writeFile(victim, await readFile(destination), { mode: 0o600 });
       await rm(destination);

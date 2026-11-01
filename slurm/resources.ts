@@ -1,5 +1,10 @@
 import type { ClusterProfile } from "./profiles.ts";
 
+/** Resource discovery does not require a configured image, account or SSH connection. */
+export type ResourceProfile = Pick<ClusterProfile,
+  "id" | "partition" | "constraint" | "max_cpus" | "max_memory_mb" | "max_walltime_seconds"
+> & ({ compute_kind: "cpu" } | { compute_kind: "gpu"; gpu_type: string; max_gpus: number });
+
 export class SlurmResourceError extends Error {
   readonly name = "SlurmResourceError";
   readonly code = "SLURM_RESOURCES_INVALID";
@@ -231,7 +236,7 @@ function physicalGpus(value: string | undefined, configured: Fields, node: strin
   return result;
 }
 
-function allocatedGpus(allocated: Fields, gpus: Record<string, number>, profile: ClusterProfile): number | undefined {
+function allocatedGpus(allocated: Fields, gpus: Record<string, number>, profile: ResourceProfile): number | undefined {
   if (profile.compute_kind === "cpu") return 0;
   const typed = allocated[`gres/gpu:${profile.gpu_type}`];
   if (typed !== undefined) return integer(typed, "allocated typed GPUs");
@@ -246,7 +251,7 @@ function unavailable(state: string): boolean {
 }
 
 /** No SSH, scheduling, or ginfo dependency: configured capacities determine all sizing. */
-export function parseInventory(profile: ClusterProfile, source: InventorySource): Inventory {
+export function parseInventory(profile: ResourceProfile, source: InventorySource): Inventory {
   const requiredFeatures = constraintFeatures(profile.constraint);
   const partitionRecords = records(source.partition).filter((record) => record.PartitionName === profile.partition);
   if (partitionRecords.length !== 1) fail(`Expected exactly one configured partition ${profile.partition}`);
@@ -348,7 +353,7 @@ function minimum(...values: (number | undefined)[]): number | undefined {
 }
 
 /** Defaults may be capped; explicit needs are never silently reduced. */
-export function sizeResources(profile: ClusterProfile, inventory: Inventory, request: ResourceRequest): RequestedResources {
+export function sizeResources(profile: ResourceProfile, inventory: Inventory, request: ResourceRequest): RequestedResources {
   if (inventory.partition !== profile.partition) fail("Inventory belongs to another partition");
   const gpuCount = requestInteger(request.gpu_count ?? (profile.compute_kind === "gpu" ? 1 : 0), "gpu_count", 0);
   if (profile.compute_kind === "cpu" ? gpuCount !== 0 : gpuCount < 1 || gpuCount > profile.max_gpus) {

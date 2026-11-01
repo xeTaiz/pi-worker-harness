@@ -2,6 +2,11 @@ import { readFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { join, posix, resolve } from "node:path";
 
+/** Default allocation ceiling, not a default per-job walltime request. */
+export const DEFAULT_ALLOCATION_WALLTIME_SECONDS = 604800;
+
+export interface SharedRoot { storage_id: string; shared_root: string }
+
 interface ClusterProfileBase {
   id: string;
   description: string;
@@ -9,11 +14,12 @@ interface ClusterProfileBase {
   ssh_config_file?: string;
   storage_id: string;
   shared_root: string;
+  additional_shared_roots?: SharedRoot[];
   sif_path: string;
   runtime: "apptainer" | "singularity";
   /** Trusted, operator-authored shell prelude; never populated from job input. */
   runtime_setup: string;
-  account: string;
+  account?: string;
   partition: string;
   qos?: string;
   constraint?: string;
@@ -58,6 +64,7 @@ const slurmToken = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const controlCharacter = /[\u0000-\u001f\u007f]/;
 const profileFields: Readonly<Record<string, true>> = {
   id: true, description: true, ssh_host: true, ssh_config_file: true, storage_id: true, shared_root: true, sif_path: true,
+  additional_shared_roots: true,
   compute_kind: true, gpu_type: true, runtime: true, runtime_setup: true, account: true, partition: true,
   qos: true, constraint: true, max_gpus: true, max_walltime_seconds: true, max_cpus: true, max_memory_mb: true,
   failure_grace_seconds: true, warning_seconds: true, termination_grace_seconds: true, tailnet_key_file: true,
@@ -67,6 +74,11 @@ const profileFields: Readonly<Record<string, true>> = {
 /** Container path shared by every partition profile on the same filesystem. */
 export function sharedPath(profile: ClusterProfile): string {
   return `/data/shared/${profile.storage_id}`;
+}
+
+/** Primary run storage first; omission remains omission in persisted profiles. */
+export function sharedRoots(profile: Pick<ClusterProfile, "storage_id" | "shared_root" | "additional_shared_roots">): SharedRoot[] {
+  return [{ storage_id: profile.storage_id, shared_root: profile.shared_root }, ...(profile.additional_shared_roots ?? [])];
 }
 
 /** Resolve the operator-selected configuration file without reading it. */
@@ -162,11 +174,31 @@ export function parseClusterProfiles(document: unknown, configPath?: string): Cl
     ids.add(id);
     const storage_id = token(source.storage_id === undefined ? id : source.storage_id, field("storage_id"), identifier);
     const shared_root = path(source.shared_root, field("shared_root"), true);
-    const previousRoot = storageRoots.get(storage_id);
-    if (previousRoot !== undefined && previousRoot !== shared_root) {
-      invalid(field("shared_root"), `storage_id ${storage_id} must use the same shared_root in every profile`);
+    const mappings: SharedRoot[] = [{ storage_id, shared_root }];
+    let additional_shared_roots: SharedRoot[] | undefined;
+    if (source.additional_shared_roots !== undefined) {
+      if (!Array.isArray(source.additional_shared_roots)) invalid(field("additional_shared_roots"), "expected an array");
+      additional_shared_roots = (source.additional_shared_roots as unknown[]).map((value, mappingIndex) => {
+        const name = field(`additional_shared_roots[${mappingIndex}]`);
+        const mapping = object(value, name);
+        for (const key of Object.keys(mapping)) {
+          if (key !== "storage_id" && key !== "shared_root") invalid(`${name}.${key}`, "unknown mapping field");
+        }
+        return { storage_id: token(mapping.storage_id, `${name}.storage_id`, identifier), shared_root: path(mapping.shared_root, `${name}.shared_root`, true) };
+      });
+      mappings.push(...additional_shared_roots);
     }
-    storageRoots.set(storage_id, shared_root);
+    const mappingIds = new Set<string>();
+    for (const [mappingIndex, mapping] of mappings.entries()) {
+      const name = mappingIndex === 0 ? prefix : field(`additional_shared_roots[${mappingIndex - 1}]`);
+      if (mappingIds.has(mapping.storage_id)) invalid(`${name}.storage_id`, `duplicate storage ID ${mapping.storage_id}`);
+      mappingIds.add(mapping.storage_id);
+      const previousRoot = storageRoots.get(mapping.storage_id);
+      if (previousRoot !== undefined && previousRoot !== mapping.shared_root) {
+        invalid(`${name}.shared_root`, `storage_id ${mapping.storage_id} must use the same shared_root in every profile`);
+      }
+      storageRoots.set(mapping.storage_id, mapping.shared_root);
+    }
     const ssh_host = token(source.ssh_host, field("ssh_host"));
     if (source.runtime !== "apptainer" && source.runtime !== "singularity") invalid(field("runtime"), "expected apptainer or singularity");
     if (source.compute_kind !== "gpu" && source.compute_kind !== "cpu") invalid(field("compute_kind"), "expected gpu or cpu");
@@ -195,7 +227,6 @@ export function parseClusterProfiles(document: unknown, configPath?: string): Cl
       sif_path: path(source.sif_path, field("sif_path")),
       runtime: source.runtime as ClusterProfileBase["runtime"],
       runtime_setup: runtime_setup as string,
-      account: token(source.account, field("account")),
       partition: token(source.partition, field("partition")),
       max_walltime_seconds: integer(source.max_walltime_seconds, field("max_walltime_seconds"), 1),
       failure_grace_seconds: integer(source.failure_grace_seconds, field("failure_grace_seconds"), 0),
@@ -207,6 +238,8 @@ export function parseClusterProfiles(document: unknown, configPath?: string): Cl
       orchestrator_registration_port: integer(source.orchestrator_registration_port === undefined ? 12888 : source.orchestrator_registration_port, field("orchestrator_registration_port"), 1, 65535),
       poll_seconds: integer(source.poll_seconds === undefined ? 15 : source.poll_seconds, field("poll_seconds"), 1),
     };
+    if (additional_shared_roots !== undefined) profile.additional_shared_roots = additional_shared_roots;
+    if (source.account !== undefined) profile.account = token(source.account, field("account"));
     if (source.ssh_config_file !== undefined) profile.ssh_config_file = path(source.ssh_config_file, field("ssh_config_file"));
     if (source.qos !== undefined) profile.qos = token(source.qos, field("qos"));
     // Eligibility parsing belongs to resource discovery; retain the configured expression here.

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { ClusterConfigError, loadClusterProfiles, parseClusterProfiles, resolveClusterConfigPath, sharedPath, type Environment } from "./profiles.ts";
+import { ClusterConfigError, DEFAULT_ALLOCATION_WALLTIME_SECONDS, loadClusterProfiles, parseClusterProfiles, resolveClusterConfigPath, sharedPath, sharedRoots, type Environment } from "./profiles.ts";
 
 let directory: string;
 let configPath: string;
@@ -96,6 +96,67 @@ test("public parser and loader produce the same normalized defaults and optional
   await writeFile(configPath, JSON.stringify(document));
   expect(await loadClusterProfiles({ WH_CLUSTER_CONFIG: configPath })).toEqual(parsed);
   expect(document.clusters[0].ssh_config_file).toBe("/home/user//ssh configs/operator's config/");
+});
+
+test("optional account and additional roots preserve legacy canonical profile bodies", () => {
+  const legacy = parseClusterProfiles({ version: 1, clusters: [gpu()] })[0]!;
+  expect(legacy).not.toHaveProperty("additional_shared_roots");
+  expect(legacy.account).toBe("research");
+  const source = gpu();
+  delete source.account;
+  const profile = parseClusterProfiles({ version: 1, clusters: [source] })[0]!;
+  expect(profile).not.toHaveProperty("account");
+  expect(profile).not.toHaveProperty("additional_shared_roots");
+  expect(sharedRoots(profile)).toEqual([{ storage_id: "ibex-gpu", shared_root: "/cluster/shared/research group" }]);
+  expect(DEFAULT_ALLOCATION_WALLTIME_SECONDS).toBe(604800);
+  expect(profile.max_walltime_seconds).toBe(3600);
+});
+
+test("multiple mappings normalize independently and nested source directories retain distinct identities", () => {
+  const extra = [
+    { storage_id: "archive", shared_root: "/cluster//archive/" },
+    { storage_id: "nested", shared_root: "/cluster/archive/nested/" },
+  ];
+  const [profile] = parseClusterProfiles({ version: 1, clusters: [gpu({ storage_id: "primary", additional_shared_roots: extra })] });
+  expect(sharedRoots(profile!)).toEqual([
+    { storage_id: "primary", shared_root: "/cluster/shared/research group" },
+    { storage_id: "archive", shared_root: "/cluster/archive" },
+    { storage_id: "nested", shared_root: "/cluster/archive/nested" },
+  ]);
+  expect(extra[0]!.shared_root).toBe("/cluster//archive/");
+  const explicit = parseClusterProfiles({ version: 1, clusters: [gpu({ additional_shared_roots: [] })] })[0]!;
+  expect(explicit.additional_shared_roots).toEqual([]);
+});
+
+for (const [mappings, field] of [
+  [null, "additional_shared_roots"],
+  [{ archive: "/archive" }, "additional_shared_roots"],
+  [[null], "additional_shared_roots[0]"],
+  [[{ storage_id: "bad/id", shared_root: "/archive" }], "additional_shared_roots[0].storage_id"],
+  [[{ storage_id: "ibex-gpu", shared_root: "/archive" }], "additional_shared_roots[0].storage_id"],
+  [[{ storage_id: "a", shared_root: "/archive" }, { storage_id: "a", shared_root: "/archive" }], "additional_shared_roots[1].storage_id"],
+  [[{ storage_id: "a", shared_root: "/archive", typo: true }], "additional_shared_roots[0].typo"],
+  ...["/", "relative", "/a/../b", "/a/./b", "/a:b", "/a,b", "/a;b", "/a\nb", "/a\u007fb"].map((shared_root) => [[{ storage_id: "a", shared_root }], "additional_shared_roots[0].shared_root"]),
+] as const) {
+  test(`additional mapping diagnostics: ${JSON.stringify(mappings)}`, () => {
+    expect(() => parseClusterProfiles({ version: 1, clusters: [gpu({ additional_shared_roots: mappings })] })).toThrow();
+    try { parseClusterProfiles({ version: 1, clusters: [gpu({ additional_shared_roots: mappings })] }); }
+    catch (error) { expect(error).toMatchObject({ field: `clusters[0].${field}` }); }
+  });
+}
+
+test("mapping consistency spans primary and additional roots across profiles", () => {
+  const additional_shared_roots = [{ storage_id: "archive", shared_root: "/archive" }];
+  expect(() => parseClusterProfiles({ version: 1, clusters: [
+    gpu({ additional_shared_roots }),
+    cpu({ storage_id: "archive", shared_root: "/elsewhere" }),
+  ] })).toThrow("storage_id archive");
+  expect(() => parseClusterProfiles({ version: 1, clusters: [
+    gpu({ additional_shared_roots }),
+    cpu({ additional_shared_roots: [{ storage_id: "archive", shared_root: "/elsewhere" }] }),
+  ] })).toThrow("storage_id archive");
+  const profiles = parseClusterProfiles({ version: 1, clusters: [gpu({ additional_shared_roots }), cpu({ additional_shared_roots })] });
+  expect(profiles).toHaveLength(2);
 });
 
 for (const [document, field] of [
@@ -219,7 +280,7 @@ for (const entry of [null, [], false, "cluster"]) {
   });
 }
 
-for (const field of ["id", "description", "ssh_host", "shared_root", "sif_path", "compute_kind", "gpu_type", "runtime", "account", "partition", "max_gpus", "max_walltime_seconds", "failure_grace_seconds", "termination_grace_seconds", "tailnet_key_file", "tailnet_login_server", "orchestrator_host"]) {
+for (const field of ["id", "description", "ssh_host", "shared_root", "sif_path", "compute_kind", "gpu_type", "runtime", "partition", "max_gpus", "max_walltime_seconds", "failure_grace_seconds", "termination_grace_seconds", "tailnet_key_file", "tailnet_login_server", "orchestrator_host"]) {
   test(`required profile field is not silently defaulted: ${field}`, async () => {
     const profile = gpu();
     delete profile[field];
@@ -232,7 +293,7 @@ for (const [field, value] of [
   ["compute_kind", "accelerator"], ["runtime", "docker"], ["gpu_type", ""], ["gpu_type", "a100:2"],
   ["id", "cluster:ibex"], ["id", "../ibex"], ["storage_id", ".."], ["storage_id", "a/b"],
   ["description", ""], ["runtime_setup", "echo before\0echo after"], ["runtime_setup", 42],
-  ["account", "account\n#SBATCH --exclusive"], ["partition", "gpu --exclusive"], ["qos", ""], ["constraint", "x\ny"],
+  ["account", ""], ["account", null], ["account", "account\n#SBATCH --exclusive"], ["partition", "gpu --exclusive"], ["qos", ""], ["constraint", "x\ny"],
   ["ssh_config_file", null], ["ssh_config_file", 42], ["ssh_config_file", true], ["ssh_config_file", []], ["ssh_config_file", {}],
 ] as const) {
   test(`invalid profile value fails: ${field}=${JSON.stringify(value)}`, async () => {

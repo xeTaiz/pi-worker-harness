@@ -4,7 +4,7 @@ import { chmod, link, mkdir, open, readFile, readdir, rename, rm } from "node:fs
 import { dirname, join, posix } from "node:path";
 import * as api from "../api.ts";
 import type { ClusterTarget, Job, JobLogsResult, RunnerResult, SlurmEnqueueOptions, SlurmObservation } from "../types.ts";
-import { loadClusterProfiles, sharedPath, type ClusterProfile } from "./profiles.ts";
+import { loadClusterProfiles, sharedPath, sharedRoots, type ClusterProfile, type SharedRoot } from "./profiles.ts";
 import { parseInventory, sizeResources, type Inventory, type RequestedResources } from "./resources.ts";
 
 export interface SlurmContext {
@@ -26,6 +26,7 @@ export interface ClusterEnqueueInput {
   submission_key?: string;
   candidate_job_id?: string;
 }
+export interface SshConnection { ssh_host: string; ssh_config_file?: string }
 export interface TransportOptions { timeout_ms?: number; max_bytes?: number; signal?: AbortSignal }
 export type SlurmTransport = (profile: ClusterProfile, script: string, stdin?: string, options?: TransportOptions) => Promise<string>;
 export type ClientApi = Pick<typeof api, "getOrchestratorUrl" | "getAuthorizationHeaders" | "reserveWorker" | "observeSlurmWorker" | "enqueueJob" | "getJob" | "getWorker" | "listJobs" | "listQueue" | "listDataPaths" | "startJob" | "getJobLogs" | "stopJob">;
@@ -81,8 +82,8 @@ const safeId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/.test(valu
 const py = (source: string, args: string[] = []) => `python3 -c ${shellQuote(source)} ${args.map(shellQuote).join(" ")}`;
 
 /** No shell joining locally: user SSH aliases retain normal ProxyJump/ControlMaster configuration. */
-export const sshTransport: SlurmTransport = (profile, script, stdin = "", options = {}) => {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(profile.ssh_host)) return Promise.reject(new SlurmClientError("INVALID_SSH_ALIAS", "unsupported SSH alias"));
+export const sshTransport = (profile: SshConnection, script: string, stdin = "", options: TransportOptions = {}): Promise<string> => {
+  if (!/^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(profile.ssh_host)) return Promise.reject(new SlurmClientError("INVALID_SSH_ALIAS", "unsupported SSH destination"));
   const configFile = profile.ssh_config_file;
   if (configFile !== undefined && (
     typeof configFile !== "string" || !posix.isAbsolute(configFile) || /[\u0000-\u001f\u007f]/.test(configFile) ||
@@ -113,25 +114,89 @@ export const sshTransport: SlurmTransport = (profile, script, stdin = "", option
   return promise;
 };
 
+export interface SharedMappingVerificationOptions {
+  api?: Pick<ClientApi, "listDataPaths" | "startJob">;
+  transport?: typeof sshTransport;
+  signal?: AbortSignal;
+}
+
+/** Prove every mapping against an existing ordinary worker, without an allocation. */
+export async function verifySharedMappings(connection: SshConnection, mappings: SharedRoot[], options: SharedMappingVerificationOptions = {}): Promise<void> {
+  const workerApi = options.api ?? api, transport = options.transport ?? sshTransport;
+  const ids = new Set<string>();
+  if (!mappings.length) throw new SlurmClientError("SHARED_STORAGE_NOT_VERIFIED", "at least one shared mapping is required");
+  for (const mapping of mappings) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(mapping.storage_id) || ids.has(mapping.storage_id)) throw new SlurmClientError("INVALID_SHARED_MAPPING", "shared mapping IDs must be valid and unique");
+    ids.add(mapping.storage_id);
+    if (!posix.isAbsolute(mapping.shared_root) || /[\u0000-\u001f\u007f:;,]/.test(mapping.shared_root) || posix.normalize(mapping.shared_root) === "/" || mapping.shared_root.split("/").some((part) => part === "." || part === "..")) throw new SlurmClientError("INVALID_SHARED_MAPPING", "shared roots must be safe absolute paths without traversal or bind delimiters");
+  }
+  options.signal?.throwIfAborted();
+  const catalog = await workerApi.listDataPaths();
+  for (const mapping of mappings) {
+    options.signal?.throwIfAborted();
+    const base = `/data/shared/${mapping.storage_id}`;
+    const candidates = [...new Set(Object.entries(catalog).filter(([path]) => path === base || path.startsWith(base + "/")).flatMap(([, workers]) => workers.map((w) => w.worker_id)))];
+    const probe = ".wh-probe-" + randomUUID(), contents = randomBytes(32).toString("hex");
+    let verified = false, lastError: unknown;
+    for (const worker_id of candidates) {
+      options.signal?.throwIfAborted();
+      const path = base + "/" + probe;
+      try {
+        const written = await workerApi.startJob({ worker_id, command: `umask 077; printf '%s' ${shellQuote(contents)} > ${shellQuote(path)}`, name: "WH shared-storage identity probe", sync: true, sync_timeout: 30, no_pty: true });
+        if (written.status !== "done" || written.exit_code !== 0) throw new Error("ordinary probe job did not complete successfully");
+        const remote = await transport(connection, "# wh:shared-probe\n" + py(String.raw`
+import os,sys
+root=os.path.realpath(sys.argv[1],strict=True)
+if root=='/' or not os.path.isdir(root) or any(c in ':;,' or ord(c)<32 or ord(c)==127 for c in root): raise ValueError('invalid resolved shared root')
+probe=os.path.realpath(sys.argv[2],strict=True)
+if os.path.commonpath([root,probe])!=root: raise ValueError('resolved probe escapes shared storage')
+with open(probe) as handle: sys.stdout.write(handle.read(1024))
+`, [mapping.shared_root, mapping.shared_root + "/" + probe]), undefined, { max_bytes: 1024, signal: options.signal });
+        if (remote !== contents) throw new Error("shared storage identity mismatch");
+        verified = true;
+      } catch (error) { lastError = error; }
+      finally {
+        // Cancellation must not strand a successfully written probe.
+        let removed: Job;
+        try { removed = await workerApi.startJob({ worker_id, command: `rm -f -- ${shellQuote(path)}`, name: "WH shared-storage probe cleanup", sync: true, sync_timeout: 30, no_pty: true }); }
+        catch (error) { throw new SlurmClientError("SHARED_PROBE_CLEANUP_FAILED", `ordinary worker could not remove shared probe for ${mapping.storage_id}`, undefined, String(error)); }
+        if (removed.status !== "done" || removed.exit_code !== 0) throw new SlurmClientError("SHARED_PROBE_CLEANUP_FAILED", `ordinary worker could not remove shared probe for ${mapping.storage_id}`);
+      }
+      options.signal?.throwIfAborted();
+      if (verified) break;
+    }
+    if (!verified) throw new SlurmClientError("SHARED_STORAGE_NOT_VERIFIED", `no participating worker proved shared storage ${mapping.storage_id} at ${mapping.shared_root}`, undefined, String(lastError ?? "list_data contains no participating worker"));
+  }
+}
+
 const PATH_PREFLIGHT = String.raw`
 # wh:path-preflight
 import hashlib,json,os,sys
-p=json.load(sys.stdin); root=os.path.realpath(p['shared_root'],strict=True)
-def inside(path):
- r=os.path.realpath(path,strict=True)
+p=json.load(sys.stdin)
+roots={}
+for mapping in p['mappings']:
+ root=os.path.realpath(mapping['shared_root'],strict=True)
+ if not os.path.isdir(root) or root=='/' or any(c in ':;,' or ord(c)<32 or ord(c)==127 for c in root): raise ValueError('invalid resolved shared root')
+ if mapping['storage_id'] in roots: raise ValueError('duplicate storage ID')
+ roots[mapping['storage_id']]=root
+def inside(selection,path=None):
+ root=roots[selection['storage_id']]
+ r=os.path.realpath(path or selection['host_path'],strict=True)
  if os.path.commonpath([root,r])!=root: raise ValueError('resolved path escapes shared storage')
  return r
-def container(r): return p['shared_path']+('/'+os.path.relpath(r,root) if r!=root else '')
-project=inside(p['project_host'])
+def container(selection,r):
+ root=roots[selection['storage_id']]
+ return '/data/shared/'+selection['storage_id']+('/'+os.path.relpath(r,root) if r!=root else '')
+project=inside(p['project'])
 if not os.path.isdir(project): raise ValueError('project_path must be a directory')
-env=inside(p['environment_host']) if p.get('environment_host') else None
-if env and not os.path.isdir(inside(os.path.join(env,'bin'))): raise ValueError('environment_path requires bin directory')
+env=inside(p['environment']) if p.get('environment') else None
+if env and not os.path.isdir(inside(p['environment'],os.path.join(env,'bin'))): raise ValueError('environment_path requires bin directory')
 def digest(path):
  h=hashlib.sha256()
  with open(path,'rb') as f:
   for block in iter(lambda:f.read(1048576),b''): h.update(block)
  return h.hexdigest()
-print(json.dumps(dict(project_path=container(project),environment_path=container(env) if env else None,image_sha256=digest(p['sif_path']),lock_sha256=digest(os.path.join(project,'uv.lock')) if os.path.isfile(os.path.join(project,'uv.lock')) else None)))
+print(json.dumps(dict(project_path=container(p['project'],project),environment_path=container(p['environment'],env) if env else None,image_sha256=digest(p['sif_path']),lock_sha256=digest(os.path.join(project,'uv.lock')) if os.path.isfile(os.path.join(project,'uv.lock')) else None)))
 `;
 const STAGE = String.raw`
 # wh:stage
@@ -297,31 +362,11 @@ print(json.dumps(dict(sinfo=run(['sinfo','--Node','--noheader','--partition='+sy
     }
     return result;
   }
-  private hostPath(p: ClusterProfile, path: string): string {
-    const base = sharedPath(p);
-    if (!path || /[\0\r\n]/.test(path) || (path !== base && !path.startsWith(base + "/")) || path.split("/").some((v) => v === ".." || v === ".")) throw new SlurmClientError("INVALID_SHARED_PATH", `path must be beneath ${base}`);
-    return p.shared_root + path.slice(base.length);
-  }
-  private async verifySharedStorage(p: ClusterProfile): Promise<void> {
-    const catalog = await this.api.listDataPaths();
-    const candidates = [...new Set(Object.entries(catalog).filter(([path]) => path === sharedPath(p) || path.startsWith(sharedPath(p) + "/")).flatMap(([, workers]) => workers.map((w) => w.worker_id)))];
-    const probe = ".wh-probe-" + randomUUID(), contents = randomBytes(32).toString("hex");
-    let lastError: unknown;
-    for (const worker_id of candidates) {
-      const path = sharedPath(p) + "/" + probe;
-      try {
-        const written = await this.api.startJob({ worker_id, command: `umask 077; printf '%s' ${shellQuote(contents)} > ${shellQuote(path)}`, name: "WH shared-storage identity probe", sync: true, sync_timeout: 30, no_pty: true });
-        if (written.status !== "done" || written.exit_code !== 0) throw new Error("ordinary probe job did not complete successfully");
-        const remote = await this.transport(p, `# wh:shared-probe\ncat -- ${shellQuote(p.shared_root + "/" + probe)}`, undefined, { max_bytes: 1024 });
-        if (remote !== contents) throw new Error("shared storage identity mismatch");
-        return;
-      } catch (error) { lastError = error; }
-      finally {
-        const removed = await this.api.startJob({ worker_id, command: `rm -f -- ${shellQuote(path)}`, name: "WH shared-storage probe cleanup", sync: true, sync_timeout: 30, no_pty: true });
-        if (removed.status !== "done" || removed.exit_code !== 0) throw new SlurmClientError("SHARED_PROBE_CLEANUP_FAILED", "ordinary worker could not remove shared probe");
-      }
-    }
-    throw new SlurmClientError("SHARED_STORAGE_NOT_VERIFIED", "no participating worker proved the same shared filesystem", undefined, String(lastError ?? "list_data contains no participating worker"));
+  private hostPath(p: ClusterProfile, path: string): { storage_id: string; host_path: string } {
+    if (!path || /[\u0000-\u001f\u007f]/.test(path) || path.split("/").some((v) => v === ".." || v === ".")) throw new SlurmClientError("INVALID_SHARED_PATH", "path must be beneath a configured /data/shared/<storage_id> mapping");
+    const mapping = sharedRoots(p).find((root) => path === `/data/shared/${root.storage_id}` || path.startsWith(`/data/shared/${root.storage_id}/`));
+    if (!mapping) throw new SlurmClientError("INVALID_SHARED_PATH", "path must be beneath a configured /data/shared/<storage_id> mapping");
+    return { storage_id: mapping.storage_id, host_path: mapping.shared_root + path.slice(`/data/shared/${mapping.storage_id}`.length) };
   }
   private async preflight(p: ClusterProfile): Promise<{ sbatch: string; user: string; cluster: string }> {
     return JSON.parse(await this.transport(p, `set -e\n${p.runtime_setup}\n` + py(String.raw`
@@ -330,7 +375,7 @@ import json,os,shutil,subprocess,sys
 path=shutil.which('sbatch')
 if not path: raise RuntimeError('sbatch not installed')
 help=subprocess.check_output([path,'--help'],text=True)
-for flag in ['--parsable','--no-requeue','--export','--nodes','--ntasks','--cpus-per-task','--mem','--comment','--signal','--time','--account','--partition','--job-name','--output','--error'] + (['--gpus-per-node'] if sys.argv[1]=='gpu' else []) + (['--qos'] if sys.argv[2] else []) + (['--constraint'] if sys.argv[3] else []):
+for flag in ['--parsable','--no-requeue','--export','--nodes','--ntasks','--cpus-per-task','--mem','--comment','--signal','--time','--partition','--job-name','--output','--error'] + (['--gpus-per-node'] if sys.argv[1]=='gpu' else []) + (['--qos'] if sys.argv[2] else []) + (['--constraint'] if sys.argv[3] else []) + (['--account'] if sys.argv[4] else []):
  if flag not in help: raise RuntimeError('required sbatch flag unsupported: '+flag)
 config=subprocess.check_output(['scontrol','show','config'],text=True)
 cluster=''
@@ -338,19 +383,19 @@ for line in config.splitlines():
  if line.strip().startswith('ClusterName') and '=' in line: cluster=line.split('=',1)[1].strip().split()[0]
 if not cluster: raise RuntimeError('could not establish local ClusterName')
 print(json.dumps(dict(sbatch=os.path.realpath(path),user=subprocess.check_output(['id','-un'],text=True).strip(),cluster=cluster)))
-`, [p.compute_kind, p.qos ?? "", p.constraint ?? ""])));
+`, [p.compute_kind, p.qos ?? "", p.constraint ?? "", p.account ?? ""])));
   }
   private async stage(j: Journal): Promise<void> {
     const p = j.profile, run = j.host_run_path!, resources = j.resources!;
     const assets = JSON.parse(await readFile(new URL("./runtime-assets.json", import.meta.url), "utf8"));
     if (assets.version !== 1 || typeof assets.assets?.["start-wh.sh"] !== "string" || typeof assets.assets?.["wh-allocation.sh"] !== "string") throw new SlurmClientError("RUNTIME_ASSETS_INVALID", "run just package-slurm-client with current root runtime");
-    const settings = { version: 1, worker_id: j.worker_id, worker_name: `whc-${p.id}-${j.request_id}`, compute_kind: p.compute_kind, gpu_count: resources.gpu_count, cpus: resources.cpus, memory_mb: resources.memory_mb, failure_grace_seconds: p.failure_grace_seconds, termination_grace_seconds: p.termination_grace_seconds, warning_seconds: p.warning_seconds, checkpoint_signal: j.input.slurm.checkpoint_signal ?? "USR1", run_path: j.run_path, host_run_path: run, shared_root: p.shared_root, storage_id: p.storage_id, sif_path: p.sif_path, runtime: p.runtime, tailnet_key_file: run + "/tailnet.key", worker_token_file: run + "/worker.token", tailnet_login_server: p.tailnet_login_server, orchestrator_host: p.orchestrator_host, orchestrator_registration_port: p.orchestrator_registration_port };
+    const settings = { version: 1, worker_id: j.worker_id, worker_name: `whc-${p.id}-${j.request_id}`, compute_kind: p.compute_kind, gpu_count: resources.gpu_count, cpus: resources.cpus, memory_mb: resources.memory_mb, failure_grace_seconds: p.failure_grace_seconds, termination_grace_seconds: p.termination_grace_seconds, warning_seconds: p.warning_seconds, checkpoint_signal: j.input.slurm.checkpoint_signal ?? "USR1", run_path: j.run_path, host_run_path: run, shared_root: p.shared_root, storage_id: p.storage_id, ...(p.additional_shared_roots === undefined ? {} : { additional_shared_roots: p.additional_shared_roots }), sif_path: p.sif_path, runtime: p.runtime, tailnet_key_file: run + "/tailnet.key", worker_token_file: run + "/worker.token", tailnet_login_server: p.tailnet_login_server, orchestrator_host: p.orchestrator_host, orchestrator_registration_port: p.orchestrator_registration_port };
     const files = { ...assets.assets, "settings.json": JSON.stringify(settings), "worker.token": j.registration_token, "tailnet.key": (await readFile(p.tailnet_key_file, "utf8")).trim(), "batch.sh": `#!/bin/bash\nset -euo pipefail\numask 077\n${p.runtime_setup}\nexec /bin/bash ${shellQuote(run + "/wh-allocation.sh")} ${shellQuote(run + "/settings.json")}\n` };
     await this.transport(p, py(STAGE), JSON.stringify({ shared_root: p.shared_root, worker_id: j.worker_id, files }));
   }
   private submissionArgs(j: Journal): string[] {
     const p = j.profile, run = j.host_run_path!;
-    return ["--parsable", "--no-requeue", "--export=NIL", ...j.resources!.sbatch_flags, `--account=${p.account}`, `--partition=${p.partition}`, ...(p.qos ? [`--qos=${p.qos}`] : []), ...(p.constraint ? [`--constraint=${p.constraint}`] : []), `--job-name=whc-${j.worker_id}`, `--comment=wh:${j.worker_id}`, `--output=${run}/batch.out`, `--error=${run}/batch.err`, ...(p.warning_seconds > 0 ? [`--signal=B:USR1@${p.warning_seconds}`] : []), run + "/batch.sh"];
+    return ["--parsable", "--no-requeue", "--export=NIL", ...j.resources!.sbatch_flags, ...(p.account === undefined ? [] : [`--account=${p.account}`]), `--partition=${p.partition}`, ...(p.qos ? [`--qos=${p.qos}`] : []), ...(p.constraint ? [`--constraint=${p.constraint}`] : []), `--job-name=whc-${j.worker_id}`, `--comment=wh:${j.worker_id}`, `--output=${run}/batch.out`, `--error=${run}/batch.err`, ...(p.warning_seconds > 0 ? [`--signal=B:USR1@${p.warning_seconds}`] : []), run + "/batch.sh"];
   }
   private response(j: Journal): Record<string, unknown> {
     return { job_id: j.job_id, worker_id: j.worker_id, cluster_target_id: `cluster:${j.profile.id}`, submission_key: j.submission_key, slurm_job_id: j.slurm_job_id ?? null, scheduler_id: j.slurm_job_id ?? null, requested_resources: j.resources, shared_paths: { run_path: j.run_path, batch_script: j.run_path + "/batch.sh", batch_stdout: j.run_path + "/batch.out", batch_stderr: j.run_path + "/batch.err" }, evidence: j.paths, submission_attempted: !!j.submission_attempted };
@@ -384,10 +429,10 @@ print(json.dumps(dict(sbatch=os.path.realpath(path),user=subprocess.check_output
       const sized = sizeResources(p, inventory, { ...input.slurm, gpu_count: normalized.gpu_count });
       if (j.worker_id && j.resources && (j.resources.cpus !== sized.cpus || j.resources.memory_mb !== sized.memory_mb || j.resources.gpu_count !== sized.gpu_count || j.resources.walltime_seconds !== sized.walltime_seconds)) throw new SlurmClientError("RESERVATION_RESOURCES_CHANGED", "fresh sizing differs from reserved resources; cancel and use a fresh submission key");
       j.resources = sized;
-      const paths = JSON.parse(await this.transport(p, py(PATH_PREFLIGHT), JSON.stringify({ shared_root: p.shared_root, shared_path: sharedPath(p), project_host: this.hostPath(p, input.slurm.project_path), environment_host: input.slurm.environment_path ? this.hostPath(p, input.slurm.environment_path) : undefined, sif_path: p.sif_path }), { timeout_ms: 300_000 }));
+      const paths = JSON.parse(await this.transport(p, py(PATH_PREFLIGHT), JSON.stringify({ mappings: sharedRoots(p), project: this.hostPath(p, input.slurm.project_path), environment: input.slurm.environment_path ? this.hostPath(p, input.slurm.environment_path) : undefined, sif_path: p.sif_path }), { timeout_ms: 300_000 }));
       j.paths = { ...paths, environment_path: paths.environment_path ?? undefined };
       j.command = workloadCommand(paths.project_path, paths.environment_path ?? undefined, input.command);
-      await this.verifySharedStorage(p);
+      await verifySharedMappings(p, sharedRoots(p), { api: this.api, transport: (_connection, script, stdin, options) => this.transport(p, script, stdin, options) });
       const preflight = await this.preflight(p);
       j.scheduler_user = preflight.user; j.scheduler_cluster = preflight.cluster;
       await this.save(j);

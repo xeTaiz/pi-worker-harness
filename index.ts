@@ -220,7 +220,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cluster-add", {
-    description: "Interactively register a Slurm cluster using the shared managed SSH key (optional cluster ID)",
+    description: "Add or resume SSH-first Slurm discovery (optional cluster name); save only ready reviewed targets",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("/cluster-add requires an interactive UI.", "error");
