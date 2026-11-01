@@ -276,18 +276,22 @@ approval remain prerequisites; onboarding does not provision them.
 
 ### Sandbox persistence and required restart
 
-The actual allowlist at
-`~/dotfiles/agent-sandbox/.config/agent-sandbox/paths` contains
-`human:~/.config/worker-harness` and `human:~/.local/state/worker-harness`.
-These retain profiles, managed SSH identity/host trust, enrollment credentials
-stored there, and state journals/scoped tokens/cursors for the **human** client
-only: `WH_SESSION_ROLE` must be unset or empty. Every nonempty role, including
-`orchestrator` and unknown roles, skips marked entries entirely. Unmarked legacy
-entries keep their shared behavior. Empty/malformed marked paths fail normal
-human-launch path validation rather than falling back to shared binds. Do not
-allowlist a broader shared parent that exposes these credentials to fleet roles.
-This narrow mount boundary is not hostile-user isolation and does not forward
-SSH-agent access or other credentials. The launcher skips absent host sources
+The interactive operator's default allowlist at
+`~/dotfiles/agent-sandbox/.config/agent-sandbox/paths` contains plain
+`~/.config/worker-harness` and `~/.local/state/worker-harness` entries.
+These persist profiles, managed SSH identity/host trust, enrollment credentials
+stored there, and state journals/scoped tokens/cursors. All entries retain the
+ordinary path parser and unrelated legacy entries are unchanged.
+
+Fleet launches select a different, generated allowlist through
+`AGENT_SANDBOX_PATHS`: root `src/worker_harness/sandbox.py:25–31,41–48,66–73`
+defines/renders `ROLE_PATHS` without these credential directories and selects
+the session file; `src/worker_harness/orchestration.py:450–466` writes it before
+launch. The boundary is the selected file, not role-dependent path syntax.
+A manually launched process using the operator default receives those ordinary
+binds regardless of `WH_SESSION_ROLE`; this is not hostile-user isolation.
+Do not replace the generated fleet allowlist with the operator default.
+No SSH-agent forwarding policy changes. The launcher skips absent host sources
 without creating them. In a **host terminal outside the existing sandbox**,
 before launching its replacement:
 
@@ -300,24 +304,21 @@ Creating these inside the current masked HOME does not establish persistent
 host directories. Their absence inside this sandbox says nothing about existing
 host configuration. For `XDG_CONFIG_HOME`, `WH_CLUSTER_CONFIG`, `XDG_STATE_HOME`
 or `WH_CLUSTER_STATE_DIR` overrides, allowlist the **actual** host
-configuration/SSH and state paths with the same **`human:` prefix**, then create
-them outside the sandbox; default entries do not cover arbitrary overrides.
+configuration/SSH and state locations as ordinary paths, then create them
+outside the sandbox; default entries do not cover arbitrary overrides.
 
-For the new host launch, invoke the edited launcher explicitly:
+For the next interactive operator launch, invoke the existing launcher explicitly:
 `"$HOME/dotfiles/agent-sandbox/.local/bin/agent-sandbox"` with its usual
 tool/binary arguments, and set
 `AGENT_SANDBOX_PATHS="$HOME/dotfiles/agent-sandbox/.config/agent-sandbox/paths"`
-in that host environment. Alternatively, update the host's stow/symlink
-installation for **both** launcher and allowlist and verify both active paths
-resolve to these edited files. An older installed launcher rejects `human:`;
-updating only its paths file is insufficient. The active host launcher/config
-symlinks have not been observed here.
+in that host environment. Alternatively, use the host's stow/symlink installation
+pointing to that launcher and allowlist. No new launcher syntax is required.
+The active host launcher/config symlinks have not been observed here.
 
-**Exit and restart agent-sandbox, then start human OMP there with
-`WH_SESSION_ROLE` unset or empty. Restarting only OMP cannot apply changed
-mounts.** Existing profiles require `/cluster-ssh-migrate` after restart; new
-path mounts alone do not repair legacy SSH configuration. Stop at this restart
-gate before attempting the real login test.
+**Exit and restart agent-sandbox, then start OMP there. Restarting only OMP
+cannot apply changed mounts.** Existing profiles require `/cluster-ssh-migrate`
+after restart; new path mounts alone do not repair legacy SSH configuration.
+Stop at this restart gate before attempting the real login test.
 
 The current launcher unsets `SSH_AUTH_SOCK`. A passphrase-protected shared key
 therefore needs deliberately provisioned **dedicated** agent/socket access
@@ -326,14 +327,15 @@ restart alone do not provide it; even a sandbox restart under the unchanged
 launcher does not forward an agent. Do not forward the general host agent or
 change SSH-agent forwarding policy as part of this setup.
 
-The main agent's **actual edited dotfiles launcher plus actual allowlist**
-passed a private-HOME role-scoped smoke: with `WH_SESSION_ROLE` unset,
-config/state files were visible and writes persisted outside the fixture.
-For `orchestrator`, `worker`, and `unknown-role`, those files stayed hidden and
-could not be mutated. Ordinary Work paths remained available in every specimen,
-unrelated `~/.ssh` stayed hidden, `SSH_AUTH_SOCK` stayed unset, and operator
-environment variables were stripped for the role specimens. No real host
-directories or keys were created. The final native extension suite passed
+The main agent's actual restored launcher/private-HOME proof **passed** with
+the plain default allowlist and actual source-generated
+`sandbox.paths_file_content` for `orchestrator`, `pm`, and `task`. Interactive
+config/state files were visible and writes persisted outside the fixture; all
+three generated fleet allowlists kept them hidden. Ordinary Work access was
+unchanged, unrelated `~/.ssh` stayed hidden, `SSH_AUTH_SOCK` stayed unset, and
+role-based operator-environment stripping was unchanged. This was not a real
+login test.
+The final native extension suite passed
 **361 tests, zero failures**, 2,764 expectations/14 files (2.19 seconds).
 Actual **OMP 18.14.2 shared-SSH onboarding/migration smoke passed** in 32.39
 seconds, including native `/export` message handoff evidence (details below).
