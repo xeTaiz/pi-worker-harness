@@ -104,9 +104,12 @@ test("renders QueueBoard revisions, CPU jobs, ownership, metadata and server ETA
 
 test("renders positive delay with ceil minutes, actor, owner, reason and time", () => {
   expect(formatDelayEntry(delay())).toBe(
-    "+1 minutes estimated delay because of urgent training by Bob. Moved by Carol: Agreed experiment window (1970-01-01 00:01:40Z)",
+    "+1 minute estimated delay because of urgent training by Bob. Moved by Carol: Agreed experiment window (1970-01-01 00:01:40Z)",
   );
   expect(formatDelayEntry(delay({ delay_seconds: 61 }))).toContain("+2 minutes");
+  expect(formatDelayEntry(delay({ delay_seconds: 120, moved_itself: true }))).toBe(
+    "+2 minutes estimated delay. Moved later by Carol: Agreed experiment window (1970-01-01 00:01:40Z)",
+  );
   expect(formatDelayEntry(delay({ delay_seconds: null }))).toContain("Moved later; delay estimate unavailable");
   expect(formatDelayEntry(delay({ delay_seconds: 0 }))).toBe("");
   expect(formatDelayEntry(delay({ delay_seconds: -60 }))).toBe("");

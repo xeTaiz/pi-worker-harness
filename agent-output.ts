@@ -32,10 +32,13 @@ export function availableGpuWorkers(workers: PublicWorker[]): PublicWorker[] {
 /** Empty means the event did not delay this job and must not be rendered as a delay. */
 export function formatDelayEntry(entry: DelayEntry): string {
   if (entry.delay_seconds !== null && entry.delay_seconds <= 0) return "";
+  const minutes = entry.delay_seconds === null ? 0 : Math.ceil(entry.delay_seconds / 60);
   const delay = entry.delay_seconds === null
     ? "Moved later; delay estimate unavailable"
-    : `+${Math.ceil(entry.delay_seconds / 60)} minutes estimated delay because of ${entry.moved_job_name} by ${entry.moved_job_owner_display_name}`;
-  return `${delay}. Moved by ${entry.actor_display_name}: ${entry.reason} (${formatTime(entry.created_at)})`;
+    : `+${minutes} minute${minutes === 1 ? "" : "s"} estimated delay`
+      + (entry.moved_itself ? "" : ` because of ${entry.moved_job_name} by ${entry.moved_job_owner_display_name}`);
+  const mover = entry.moved_itself ? "Moved later by" : "Moved by";
+  return `${delay}. ${mover} ${entry.actor_display_name}: ${entry.reason} (${formatTime(entry.created_at)})`;
 }
 
 function formatExpected(seconds: number): string {
