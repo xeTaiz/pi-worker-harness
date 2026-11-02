@@ -40,8 +40,8 @@ The extension uses HTTP endpoints (not CLI subprocesses).
   API calls, bridge registration/events/command polling/acknowledgements, and log
   streams all use this same normalized base URL.
 - Ordinary authentication: `WH_API_KEY`, else a UTF-8 bearer file named by
-  `WH_API_KEY_FILE`, else `api-key` beside the saved config
-  (`~/.omp/worker-harness/api-key` or `~/.pi/worker-harness/api-key`, mode 600).
+  `WH_API_KEY_FILE`, else
+  `~/.config/worker-harness/api-key` (mode 600; outside the sandboxed `~/.omp`).
   Obtain a personal key from the web UI. Keep credentials outside agent-readable
   roots; missing credentials fail closed.
 - Internal roles (`WH_SESSION_ROLE=orchestrator|pm|task`) require

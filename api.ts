@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { getWorkerHarnessConfigPath } from "./config.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   AddTunnelRequest,
   ApiErrorBody,
@@ -31,6 +31,10 @@ import type {
   WorkersPruneResult,
   WorkersSummary,
 } from "./types.ts";
+
+export function defaultApiKeyPath(): string {
+  return join(process.env.HOME ?? homedir(), ".config", "worker-harness", "api-key");
+}
 
 export class ApiError extends Error {
   constructor(
@@ -86,8 +90,8 @@ function getCredential(): string {
   if (isInternalSession()) return process.env.WH_SESSION_TOKEN!.trim();
   const key = process.env.WH_API_KEY?.trim();
   if (key) return key;
-  // Default: an `api-key` file beside the saved extension config.
-  const keyFile = process.env.WH_API_KEY_FILE?.trim() || join(dirname(getWorkerHarnessConfigPath()), "api-key");
+  // Default lives outside ~/.omp and ~/.pi, which fleet agent sandboxes mount.
+  const keyFile = process.env.WH_API_KEY_FILE?.trim() || defaultApiKeyPath();
   let fileKey = "";
   try {
     fileKey = readFileSync(keyFile, "utf8").trim();

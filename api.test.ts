@@ -2,7 +2,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { getWorkerHarnessConfigPath } from "./config.ts";
 import {
   addTunnel,
   createMarimo,
@@ -16,6 +15,7 @@ import {
   dispatchTask,
   enqueueJob,
   getOrchestratorUrl,
+  defaultApiKeyPath,
   getAuthorizationHeaders,
   getCredentialIdentity,
   getJob,
@@ -376,13 +376,14 @@ test("missing and empty ordinary credentials fail before any HTTP request", asyn
   }
 });
 
-test("the api-key file beside the saved config is the default credential", async () => {
+test("~/.config/worker-harness/api-key is the default credential", async () => {
   const directory = await mkdtemp(join(tmpdir(), "wh-default-key-"));
   const originalHome = process.env.HOME;
   process.env.HOME = directory;
   try {
     delete process.env.WH_API_KEY;
-    const keyFile = join(dirname(getWorkerHarnessConfigPath()), "api-key");
+    const keyFile = defaultApiKeyPath();
+    expect(keyFile).toBe(join(directory, ".config", "worker-harness", "api-key"));
     await mkdir(dirname(keyFile), { recursive: true });
     await writeFile(keyFile, "whk_default\n");
     expect(new Headers(await getAuthorizationHeaders()).get("Authorization")).toBe("Bearer whk_default");
