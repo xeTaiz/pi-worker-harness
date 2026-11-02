@@ -57,6 +57,8 @@ export interface DelayEntry {
   created_at: number;
   delay_seconds: number | null;
   moved_job_id: string;
+  /** The delayed job is itself the one someone else moved later. */
+  moved_itself: boolean;
   moved_job_name: string;
   moved_job_owner_display_name: string;
   actor_user_id: string;

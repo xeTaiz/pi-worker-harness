@@ -37,7 +37,7 @@ function queueJob(patch: Partial<QueueJob> = {}): QueueJob {
 function delay(patch: Partial<DelayEntry> = {}): DelayEntry {
   return {
     event_id: "event-1", created_at: 100, delay_seconds: 1,
-    moved_job_id: "moved", moved_job_name: "urgent training",
+    moved_job_id: "moved", moved_itself: false, moved_job_name: "urgent training",
     moved_job_owner_display_name: "Bob", actor_user_id: "actor-1",
     actor_display_name: "Carol", reason: "Agreed experiment window", ...patch,
   };
