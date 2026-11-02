@@ -190,6 +190,21 @@ Prompt/progress order:
    stdout, staging payloads or credential objects into the screen or saved blockers.
    A rejected review edit leaves the last verified draft unchanged in the editable,
    resumable review phase, without saving a new blocked phase or changed mappings.
+   Transport `max_bytes` bounds stdout only (default 2 MiB, identity probe
+   1024 bytes); stderr has a separate fixed 8192-byte diagnostic budget.
+   Probe stdout must still exactly equal the random token, never stderr or a
+   concatenation. Banners within the stderr budget do not invalidate a valid
+   token, and nonzero exits retain bounded stderr as `SSH_COMMAND_FAILED`.
+   Exceeding either budget kills SSH and rejects `SSH_OUTPUT_LIMIT`, naming the
+   stream and applicable byte bound and retaining a bounded stderr tail that
+   includes the overflowing chunk. Textual errors never embed general stdout
+   or structured transport/staging/credential payloads.
+   Error text renders only the final 4096 stderr bytes, preserving terminal
+   causes plus code/stream/bound metadata within setup's 8192-character evidence
+   limit; this text budget is distinct from the 8192-byte stderr stream cap.
+   The latest IBEX output-limit report alone establishes neither the offending
+   stream nor the remote SSH/Python/filesystem cause; that cause awaits a retry
+   with these diagnostics, not an assumed mount or Python failure.
 5. Bounded read-only SSH discovery inspects Slurm inventory/partition limits,
    account/default/QoS evidence, runtime/version and static SIF capability.
    No allocations, recursive filesystem scans or login-node container execution.
@@ -398,7 +413,7 @@ trust still means onboarding has not completed.
 The historical native suite passed **361 tests, zero failures**, 2,764
 expectations/14 files (2.19 seconds); actual **OMP 18.14.2 shared-SSH/migration
 smoke passed in 32.39 seconds**. These predate discovery/resume/additional-root
-changes; current evidence below includes 467 Bun tests, 339 isolated root tests,
+changes; current evidence below includes 474 Bun tests, 339 isolated root tests,
 local Python 3.9 compatibility and prior OMP/runtime proofs. Publication,
 deployment and real login/charged acceptance remain separate gates.
 
@@ -654,10 +669,24 @@ Widget should gracefully handle:
 
 ## Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test`: 467 passed, zero failures**, **3,651 assertions
-across 16 files, 6.43 seconds**, executed by the parent in the extension checkout.
+Current extension **`bun test`: 474 passed, zero failures**, **3,710 assertions
+across 16 files, 7.06 seconds**, executed by the parent in the extension checkout.
 The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
 minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
+
+For the SSH channel-budget change, the parent ran a separate **ten-case
+process-boundary smoke: all passed**, using actual `sshTransport` and production
+`verifySharedMappings` with a private local fake-SSH executable. A real >1 KiB
+Python traceback retained its terminal cause as `SSH_COMMAND_FAILED`; full
+8 KiB stderr failures retained code/context within the UI evidence bound.
+Exact independent 1024-byte stdout/8192-byte stderr budgets passed. The verifier
+accepted the exact token with a >1 KiB stderr banner, rejected traceback,
+stdout-noise and token-mismatch cases, and cleaned every probe. Huge-chunk and
+fragmented stderr overflow plus stdout overflow killed the process and preserved
+bounded diagnostics without textual stdout leakage. This is actual local
+process/consumer evidence, not real SSH network, live IBEX, cluster-job,
+native-OMP or visual-GUI acceptance; the reported IBEX cause awaits a diagnostic
+retry.
 
 The parent ran **`WH_TEST_PYTHON=<python3.9> bun test slurm/client.test.ts`:
 29 passed, zero failures, 209 assertions, 1.264 seconds**, using a SHA256-verified

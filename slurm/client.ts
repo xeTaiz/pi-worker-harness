@@ -27,7 +27,12 @@ export interface ClusterEnqueueInput {
   candidate_job_id?: string;
 }
 export interface SshConnection { ssh_host: string; ssh_config_file?: string }
-export interface TransportOptions { timeout_ms?: number; max_bytes?: number; signal?: AbortSignal }
+export interface TransportOptions {
+  timeout_ms?: number;
+  /** Maximum stdout bytes (default 2 MiB); stderr has an independent 8 KiB diagnostic bound. */
+  max_bytes?: number;
+  signal?: AbortSignal;
+}
 export type SlurmTransport = (profile: ClusterProfile, script: string, stdin?: string, options?: TransportOptions) => Promise<string>;
 export type ClientApi = Pick<typeof api, "getOrchestratorUrl" | "getAuthorizationHeaders" | "reserveWorker" | "observeSlurmWorker" | "enqueueJob" | "getJob" | "getWorker" | "listJobs" | "listQueue" | "listDataPaths" | "startJob" | "getJobLogs" | "stopJob">;
 interface SchedulerRecord { id: string; name: string; comment: string; user: string; state: string; reason: string }
@@ -80,6 +85,9 @@ const terminalState = (state: string) => /^(COMPLETED|CANCELLED|FAILED|TIMEOUT|P
 const terminalJob = (job: Job) => job.status === "done" || job.status === "failed";
 const safeId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/.test(value);
 const py = (source: string, args: string[] = []) => `python3 -c ${shellQuote(source)} ${args.map(shellQuote).join(" ")}`;
+const SSH_STDERR_MAX_BYTES = 8 * 1024;
+// Leave room for error context inside the setup UI's 8192-character evidence bound.
+const SSH_DIAGNOSTIC_TAIL_BYTES = 4 * 1024;
 
 /** No shell joining locally: user SSH aliases retain normal ProxyJump/ControlMaster configuration. */
 export const sshTransport = (profile: SshConnection, script: string, stdin = "", options: TransportOptions = {}): Promise<string> => {
@@ -91,23 +99,41 @@ export const sshTransport = (profile: SshConnection, script: string, stdin = "",
   )) return Promise.reject(new SlurmClientError("INVALID_SSH_CONFIG_FILE", "expected an absolute POSIX SSH configuration path without traversal, control characters or filesystem root"));
   const { promise, resolve, reject } = Promise.withResolvers<string>();
   const child = spawn("ssh", [...(configFile === undefined ? [] : ["-F", configFile]), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "--", profile.ssh_host, `bash -c ${shellQuote(script)}`], { stdio: ["pipe", "pipe", "pipe"], signal: options.signal });
-  const chunks: Buffer[] = [], errors: Buffer[] = [];
-  let size = 0, failed = false;
+  const chunks: Buffer[] = [];
+  const stdoutLimit = options.max_bytes ?? 2 * 1024 * 1024;
+  let stdoutSize = 0, stderrSize = 0, stderr: Buffer | undefined, failed = false;
+  const stderrText = () => stderr?.toString("utf8", Math.max(0, stderrSize - SSH_DIAGNOSTIC_TAIL_BYTES), stderrSize) ?? "";
   const fail = (error: Error) => { if (!failed) { failed = true; child.kill("SIGKILL"); reject(error); } };
+  const outputLimit = (stream: "stdout" | "stderr", bound: number) => fail(new SlurmClientError("SSH_OUTPUT_LIMIT", `SSH ${stream} exceeded its ${bound}-byte bound${stderrSize ? `; stderr tail:\n${stderrText()}` : ""}`));
   const timer = setTimeout(() => fail(new SlurmClientError("SSH_TIMEOUT", "local SSH timed out; submission may be uncertain")), options.timeout_ms ?? 60_000);
-  const collect = (list: Buffer[], data: Buffer) => {
-    size += data.length;
-    if (size > (options.max_bytes ?? 2 * 1024 * 1024)) fail(new SlurmClientError("SSH_OUTPUT_LIMIT", "SSH output exceeded its bound"));
-    else list.push(data);
-  };
-  child.stdout.on("data", (chunk: Buffer) => collect(chunks, chunk));
-  child.stderr.on("data", (chunk: Buffer) => collect(errors, chunk));
+  child.stdout.on("data", (chunk: Buffer) => {
+    if (failed) return;
+    stdoutSize += chunk.length;
+    if (stdoutSize > stdoutLimit) outputLimit("stdout", stdoutLimit);
+    else chunks.push(chunk);
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (failed) return;
+    stderr ??= Buffer.allocUnsafe(SSH_STDERR_MAX_BYTES);
+    const total = stderrSize + chunk.length;
+    // Include the overflowing chunk's tail without retaining an unbounded chunk or concatenation.
+    if (chunk.length >= SSH_STDERR_MAX_BYTES) {
+      chunk.copy(stderr, 0, chunk.length - SSH_STDERR_MAX_BYTES);
+      stderrSize = SSH_STDERR_MAX_BYTES;
+    } else {
+      const keep = Math.min(stderrSize, SSH_STDERR_MAX_BYTES - chunk.length);
+      if (keep !== stderrSize) stderr.copyWithin(0, stderrSize - keep, stderrSize);
+      chunk.copy(stderr, keep);
+      stderrSize = keep + chunk.length;
+    }
+    if (total > SSH_STDERR_MAX_BYTES) outputLimit("stderr", SSH_STDERR_MAX_BYTES);
+  });
   child.on("error", fail);
   child.stdin.on("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") fail(error); });
   child.on("close", (code) => {
     clearTimeout(timer);
     if (failed) return;
-    if (code !== 0) reject(new SlurmClientError("SSH_COMMAND_FAILED", `SSH exited ${code}: ${Buffer.concat(errors).toString("utf8").slice(-8192)}`, undefined, { stdout: Buffer.concat(chunks).toString("utf8"), exit_code: code }));
+    if (code !== 0) reject(new SlurmClientError("SSH_COMMAND_FAILED", `SSH exited ${code}; stderr tail:\n${stderrText()}`, undefined, { stdout: Buffer.concat(chunks).toString("utf8"), exit_code: code }));
     else resolve(Buffer.concat(chunks).toString("utf8"));
   });
   child.stdin.end(stdin);
