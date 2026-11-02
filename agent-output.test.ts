@@ -82,25 +82,29 @@ test("renders QueueBoard revisions, CPU jobs, ownership, metadata and server ETA
     queueJob({ id: "later", position: 2, expected_seconds: 0, estimate_status: "unknown",
       estimated_start_at: null, estimated_finish_at: null, estimate_explanation: "Active duration unknown" }),
   ], [queueJob({ id: "cpu", status: "running", position: 0, gpu_count: 0 })]));
-  expect(output).toContain("worker-1 | worker-a | revision 7");
+  expect(output).toContain("worker-a (worker-1) | queue revision 7");
   expect(output).toContain("execution_state=stopping");
   expect(output).toContain("owner Alice | priority time_critical");
   expect(output).toContain("Priority note: Deadline tonight");
-  expect(output).toContain("Deadline: 1970-01-01T00:05:00.000Z");
-  expect(output).toContain("ETA start 1970-01-01T00:02:00.000Z");
-  expect(output).toContain("known: FIFO resource estimate");
-  expect(output).toContain("ETA start unavailable | finish unavailable | unknown: Active duration unknown");
+  expect(output).toContain("Deadline: 1970-01-01 00:05:00Z");
+  expect(output).toContain("ETA start 1970-01-01 00:02:00Z, finish 1970-01-01 00:03:00Z");
+  expect(output).toContain("— FIFO resource estimate");
+  expect(output).toContain("ETA unknown — Active duration unknown");
   expect(output).toContain("expected unknown");
   expect(output).not.toContain("expected 0s");
-  expect(output).toContain("CPU/setup jobs:");
-  expect(output).toContain("cpu | experiment | GPUs 0");
+  expect(output).toContain("CPU/setup jobs (never wait for GPUs):");
+  expect(output).toContain("cpu | experiment | 0 GPUs");
+  // Pending rows have no elapsed time and default supervision states are omitted.
+  expect(output).not.toMatch(/pending #\d[^\n]*elapsed/);
+  expect(output).not.toContain("execution_state=active");
+  expect(output).not.toContain("termination_reason=none");
   expect(output.indexOf("pending #1 | head")).toBeLessThan(output.indexOf("pending #2 | later"));
   expect(output).not.toContain("command");
 });
 
 test("renders positive delay with ceil minutes, actor, owner, reason and time", () => {
   expect(formatDelayEntry(delay())).toBe(
-    "+1 minutes estimated delay because of urgent training by Bob. Moved by Carol: Agreed experiment window (1970-01-01T00:01:40.000Z)",
+    "+1 minutes estimated delay because of urgent training by Bob. Moved by Carol: Agreed experiment window (1970-01-01 00:01:40Z)",
   );
   expect(formatDelayEntry(delay({ delay_seconds: 61 }))).toContain("+2 minutes");
   expect(formatDelayEntry(delay({ delay_seconds: null }))).toContain("Moved later; delay estimate unavailable");
@@ -112,7 +116,7 @@ test("renders positive delay with ceil minutes, actor, owner, reason and time", 
 test("renders empty boards and CPU-only workers", () => {
   expect(formatQueueOverview({ workers: [], as_of: 100 })).toBe("No workers or active queued jobs.");
   expect(formatQueueOverview(board([]))).toContain("(GPU queue empty)");
-  expect(formatQueueOverview(board([], [queueJob({ gpu_count: 0 })]))).toContain("CPU/setup jobs:");
+  expect(formatQueueOverview(board([], [queueJob({ gpu_count: 0 })]))).toContain("CPU/setup jobs (never wait for GPUs):");
 });
 
 test("owned job output retains execution state and termination reason", () => {

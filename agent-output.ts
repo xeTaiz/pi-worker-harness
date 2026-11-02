@@ -35,7 +35,7 @@ export function formatDelayEntry(entry: DelayEntry): string {
   const delay = entry.delay_seconds === null
     ? "Moved later; delay estimate unavailable"
     : `+${Math.ceil(entry.delay_seconds / 60)} minutes estimated delay because of ${entry.moved_job_name} by ${entry.moved_job_owner_display_name}`;
-  return `${delay}. Moved by ${entry.actor_display_name}: ${entry.reason} (${new Date(entry.created_at * 1000).toISOString()})`;
+  return `${delay}. Moved by ${entry.actor_display_name}: ${entry.reason} (${formatTime(entry.created_at)})`;
 }
 
 function formatExpected(seconds: number): string {
@@ -51,20 +51,33 @@ export function formatOwnedJob(job: OwnedJob): string {
     + ` | expected ${formatExpected(job.expected_seconds)}`;
 }
 
+function formatTime(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+
 function formatQueueJob(job: QueueJob, nowSeconds: number): string[] {
   const state = job.status === "pending" ? `pending #${job.position}` : job.status;
-  const elapsed = job.started_at === null ? "" : ` | elapsed ${Math.max(0, nowSeconds - job.started_at)}s`;
-  const start = job.estimated_start_at === null ? "unavailable" : new Date(job.estimated_start_at * 1000).toISOString();
-  const finish = job.estimated_finish_at === null ? "unavailable" : new Date(job.estimated_finish_at * 1000).toISOString();
+  // Only non-default supervision states are worth a column.
+  const extras = [
+    job.execution_state !== "active" ? `execution_state=${job.execution_state}` : "",
+    job.termination_reason ? `termination_reason=${job.termination_reason}` : "",
+    job.started_at ? `elapsed ${Math.max(0, nowSeconds - job.started_at)}s` : "",
+  ].filter(Boolean);
   const lines = [
-    `  ${state} | ${job.id} | ${job.name} | GPUs ${job.gpu_count}`
+    `  ${state} | ${job.id} | ${job.name} | ${job.gpu_count} GPU${job.gpu_count === 1 ? "" : "s"}`
       + ` | owner ${job.owner_display_name} | priority ${job.priority}`
-      + ` | execution_state=${job.execution_state} | termination_reason=${job.termination_reason ?? "none"}`
-      + ` | expected ${formatExpected(job.expected_seconds)}${elapsed}`,
-    `    ETA start ${start} | finish ${finish} | ${job.estimate_status}: ${job.estimate_explanation}`,
+      + ` | expected ${formatExpected(job.expected_seconds)}${extras.map((extra) => ` | ${extra}`).join("")}`,
   ];
+  if (job.gpu_count > 0) {
+    const window = job.estimated_start_at === null
+      ? "ETA unknown"
+      : job.status === "pending"
+        ? `ETA start ${formatTime(job.estimated_start_at)}, finish ${job.estimated_finish_at === null ? "unknown" : formatTime(job.estimated_finish_at)}`
+        : `ETA finish ${job.estimated_finish_at === null ? "unknown" : formatTime(job.estimated_finish_at)}`;
+    lines.push(`    ${window} — ${job.estimate_explanation}`);
+  }
   if (job.priority_note) lines.push(`    Priority note: ${job.priority_note}`);
-  if (job.deadline_at !== null) lines.push(`    Deadline: ${new Date(job.deadline_at * 1000).toISOString()}`);
+  if (job.deadline_at !== null) lines.push(`    Deadline: ${formatTime(job.deadline_at)}`);
   for (const entry of job.delay_history) {
     const text = formatDelayEntry(entry);
     if (text) lines.push(`    ${text}`);
@@ -76,11 +89,11 @@ export function formatQueueOverview(board: QueueBoard): string {
   if (board.workers.length === 0) return "No workers or active queued jobs.";
   const lines: string[] = [];
   for (const worker of board.workers) {
-    lines.push(`${worker.worker_id} | ${worker.worker_name} | revision ${worker.revision}`);
+    lines.push(`${worker.worker_name} (${worker.worker_id}) | queue revision ${worker.revision}`);
     if (worker.jobs.length === 0) lines.push("  (GPU queue empty)");
     for (const job of worker.jobs) lines.push(...formatQueueJob(job, board.as_of));
     if (worker.cpu_jobs.length) {
-      lines.push("  CPU/setup jobs:");
+      lines.push("  CPU/setup jobs (never wait for GPUs):");
       for (const job of worker.cpu_jobs) lines.push(...formatQueueJob(job, board.as_of));
     }
   }
