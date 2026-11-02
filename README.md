@@ -217,8 +217,10 @@ submits an allocation, deploys a server, or installs software remotely.
    **“Add another filesystem mapping?”** loop repeats those same two fields.
    The first mapping stays primary. Every mapping requires a temporary
    random backing-identity probe against a participating WH worker and cleanup.
-   A blocked identity check includes bounded textual verifier evidence (for
-   example, the remote Python exception), not raw transport or credential payloads.
+   Initial failures save a blocked draft with bounded textual verifier evidence
+   (for example, the remote Python exception), not raw transport or credential
+   payloads. Failed mapping changes in **Edit review** show the same evidence
+   while retaining the old verified mappings and editable, resumable review.
 5. Bounded read-only discovery inspects Slurm inventory/limits, account/default/
    QoS evidence, runtime/version and compatible SIF labels. No allocation,
    recursive scan or login-node container execution occurs.
@@ -430,7 +432,7 @@ trust yet; that is not setup completion.
 The historical native suite passed **361 tests, zero failures**, 2,764
 expectations/14 files (2.19 seconds); actual **OMP 18.14.2 shared-SSH
 onboarding/migration smoke passed** in 32.39 seconds. These are historical,
-not the latest proof. Current evidence below includes 464 Bun tests,
+not the latest proof. Current evidence below includes 467 Bun tests,
 339 isolated root tests, local Python 3.9 compatibility and prior OMP/runtime proofs.
 Publication, deployment and real login/cluster/charged acceptance remain separate.
 
@@ -524,8 +526,8 @@ Key bindings:
 
 ### Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test` passed: 464 tests, zero failures**, **3,564
-assertions/16 files, 6.30 seconds**, run by the parent in the extension checkout.
+Current extension **`bun test` passed: 467 tests, zero failures**, **3,651
+assertions/16 files, 6.43 seconds**, run by the parent in the extension checkout.
 The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
 minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
 
@@ -544,6 +546,13 @@ read against a nonexistent root. Published blocked text and the persisted draft
 both retained the underlying `FileNotFoundError`; the worker probe was cleaned,
 and discovery/readiness/registration were not reached. This exercises setup API
 terminal output, not a new native-OMP or visual-GUI proof.
+
+A separate parent review-consumer smoke passed through actual `runClusterAdd`
+twice with private local key/draft creation and an injected failing review verifier.
+Actual `ui.notify` output showed `FileNotFoundError: missing review mapping`;
+the rejected mapping and description were not applied, the original verified
+review remained resumable, and no profile or secret was published. This proves
+the setup API consumer path, not native-OMP or visual-GUI behavior.
 
 The parent's **actual OMP 18.14.2/native-PTY plus private local OpenSSH bootstrap
 proof passed in 14.29 seconds**, using normal linked-plugin discovery and the

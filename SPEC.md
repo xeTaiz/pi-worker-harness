@@ -184,9 +184,12 @@ Prompt/progress order:
    a participating WH worker and exact cluster path with a temporary random
    identity probe and cleanup; unavailable worker/catalog permissions or probe/
    cleanup failures block readiness, never produce “verified” evidence.
-   Blocked setup diagnostics retain the generic failure and bounded textual
-   `SlurmClientError.evidence` cause; never serialize raw transport stdout,
-   staging payloads or credential objects into the screen or saved blockers.
+   Initial blocked setup diagnostics and rejected review mapping edits retain
+   the generic failure and bounded textual `SlurmClientError.evidence` cause
+   (last 8192 characters after control filtering); never serialize raw transport
+   stdout, staging payloads or credential objects into the screen or saved blockers.
+   A rejected review edit leaves the last verified draft unchanged in the editable,
+   resumable review phase, without saving a new blocked phase or changed mappings.
 5. Bounded read-only SSH discovery inspects Slurm inventory/partition limits,
    account/default/QoS evidence, runtime/version and static SIF capability.
    No allocations, recursive filesystem scans or login-node container execution.
@@ -395,7 +398,7 @@ trust still means onboarding has not completed.
 The historical native suite passed **361 tests, zero failures**, 2,764
 expectations/14 files (2.19 seconds); actual **OMP 18.14.2 shared-SSH/migration
 smoke passed in 32.39 seconds**. These predate discovery/resume/additional-root
-changes; current evidence below includes 464 Bun tests, 339 isolated root tests,
+changes; current evidence below includes 467 Bun tests, 339 isolated root tests,
 local Python 3.9 compatibility and prior OMP/runtime proofs. Publication,
 deployment and real login/charged acceptance remain separate gates.
 
@@ -651,8 +654,8 @@ Widget should gracefully handle:
 
 ## Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test`: 464 passed, zero failures**, **3,564 assertions
-across 16 files, 6.30 seconds**, executed by the parent in the extension checkout.
+Current extension **`bun test`: 467 passed, zero failures**, **3,651 assertions
+across 16 files, 6.43 seconds**, executed by the parent in the extension checkout.
 The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
 minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
 
@@ -672,6 +675,13 @@ Published blocked text and persisted blockers retained the `FileNotFoundError`
 cause; the worker probe was cleaned and discovery/readiness/registration were
 not reached. This validates setup API terminal output, not a new native-OMP
 session or visual GUI.
+
+A separate parent review-consumer smoke passed using actual `runClusterAdd`
+twice with private local key/draft creation and an injected review-verifier failure.
+Actual `ui.notify` output contained `FileNotFoundError: missing review mapping`;
+the rejected mapping and description were not applied, the old verified review
+remained resumable, and no profile or secret was published. This is setup API
+consumer proof, not a new native-OMP session or visual-GUI proof.
 
 The parent executed **actual OMP 18.14.2/native PTY and private local OpenSSH
 bootstrap proof: passed in 14.29 seconds**, with normal plugin linking and the

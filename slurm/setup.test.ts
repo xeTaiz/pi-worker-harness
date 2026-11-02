@@ -1088,6 +1088,75 @@ test("review editing registers only the selected discovered target and corrected
   expect(ui.matching("Review cluster")[1]?.title).toContain("Selected GPU research target");
 });
 
+const reviewVerifierCause = "SSH_COMMAND_FAILED: FileNotFoundError: missing review mapping";
+for (const fixture of [
+  { name: "text", evidence: reviewVerifierCause, expected: reviewVerifierCause },
+  {
+    name: "bounded-text",
+    evidence: `discarded-prefix${"x".repeat(8192)}\u0000\u001b\n${reviewVerifierCause}`,
+    expected: `${"x".repeat(8192 - 1 - reviewVerifierCause.length)}\n${reviewVerifierCause}`,
+  },
+  { name: "structured", evidence: { stdout: enrollmentSecret, stdin: "private staged payload", registration_token: enrollmentSecret }, expected: undefined },
+]) {
+  test(`failed review mapping edit preserves the verified draft and exposes only bounded textual evidence (${fixture.name})`, async () => {
+    const id = `review-evidence-${fixture.name}`;
+    const mappings = [{ storage_id: "research-storage", shared_root: "/cluster/research group" }];
+    const rejectedMappings = [...mappings, { storage_id: "unverified", shared_root: "/cluster/unverified" }];
+    const selected = discoveredTargetId(id, target());
+    const verified: SetupDraft["mappings"][] = [];
+    let discoveries = 0;
+    const setup: SetupOptions = {
+      verifyMappings: async (_connection, value) => {
+        verified.push(value);
+        if (value.length > mappings.length) {
+          expect(value).toEqual(rejectedMappings);
+          throw new SlurmClientError("SHARED_STORAGE_NOT_VERIFIED", "no participating worker proved shared storage", undefined, fixture.evidence);
+        }
+        expect(value).toEqual(mappings);
+      },
+      discover: async () => { discoveries++; return discovery(); },
+    };
+    const ui = new WizardUI(id, {
+      replies: {
+        "Review cluster": ["Edit review", "Save and exit"],
+        "Edit cluster review": JSON.stringify({ description: "Rejected description", mappings: rejectedMappings, selected_targets: [selected] }),
+      },
+      setup,
+    });
+    expect(await ui.pauseAndResume()).toBeUndefined();
+    ui.expectScriptUsed();
+    expect(verified).toEqual([mappings, rejectedMappings]);
+    expect(discoveries).toBe(1);
+    const rejection = ui.notices.filter(({ message }) => message.startsWith("Review edit not applied:"));
+    expect(rejection).toEqual([{
+      message: `Review edit not applied: SHARED_STORAGE_NOT_VERIFIED: no participating worker proved shared storage. Correct the review or save and exit.${fixture.expected ? `\nVerifier evidence: ${fixture.expected}` : ""}`,
+      type: "error",
+    }]);
+    const saved = (await drafts())[0]!;
+    expect(saved).toMatchObject({
+      phase: "review", mappings, selected_targets: [selected], blockers: [],
+      description: "Research cluster; site utilization limits apply",
+    });
+    expect(ui.matching("Review cluster")).toHaveLength(2);
+    expect(ui.matching("Review cluster")[1]?.title).toContain("/cluster/research group");
+    expect(ui.matching("Review cluster")[1]?.title).not.toContain("/cluster/unverified");
+    expect(await loadClusterProfiles(env)).toEqual([]);
+    const output = JSON.stringify({ notices: ui.notices, published: ui.published, saved });
+    expect(output).not.toContain(enrollmentSecret);
+    expect(output).not.toContain("private staged payload");
+    expect(output).not.toContain("discarded-prefix");
+    const resumed = new WizardUI(id, { setup });
+    const profile = await resumed.run();
+    expect(profile).toMatchObject({ id: selected, storage_id: "research-storage", shared_root: "/cluster/research group" });
+    expect(profile?.additional_shared_roots).toBeUndefined();
+    resumed.expectScriptUsed();
+    expect(verified).toEqual([mappings, rejectedMappings, mappings]);
+    expect(discoveries).toBe(2);
+    expect((await document()).clusters).toHaveLength(1);
+    expect(JSON.stringify((await document()).clusters)).not.toContain("/cluster/unverified");
+  });
+}
+
 test("simultaneous commits of one reviewed draft register exactly one complete target set", async () => {
   const paused = new WizardUI("simultaneous-commit", {
     replies: { "Review cluster": "Save and exit" },

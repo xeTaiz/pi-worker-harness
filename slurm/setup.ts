@@ -33,6 +33,13 @@ function validPublicKey(text: string | undefined): text is string {
   return blob.length === 51 && blob.readUInt32BE(0) === 11 && blob.subarray(4, 15).toString() === "ssh-ed25519" && blob.readUInt32BE(15) === 32;
 }
 
+/** The verifier carries a textual cause, not transport stdout or staged payloads. */
+function verifierEvidence(error: unknown): string | undefined {
+  if (!(error instanceof SlurmClientError) || typeof error.evidence !== "string") return undefined;
+  const evidence = error.evidence.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").slice(-8192);
+  return evidence ? `Verifier evidence: ${evidence}` : undefined;
+}
+
 async function exists(path: string): Promise<boolean> {
   try { await lstat(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
 }
@@ -599,11 +606,8 @@ export async function runClusterAdd(ui: SetupUI, publish: (content: string) => v
       if (signal?.aborted) throw error;
       draft.phase = "blocked";
       draft.blockers = [`Filesystem identity verification failed: ${error instanceof Error ? error.message : "participating worker or SSH probe unavailable"}`];
-      // The verifier carries a textual cause, not transport stdout or staged payloads.
-      if (error instanceof SlurmClientError && typeof error.evidence === "string") {
-        const evidence = error.evidence.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").slice(-8192);
-        if (evidence) draft.blockers.push(`Verifier evidence: ${evidence}`);
-      }
+      const evidence = verifierEvidence(error);
+      if (evidence) draft.blockers.push(evidence);
       await saveDraft(draft, env);
       await publish(`Setup ${draft.id} blocked and saved for resume:\n${draft.blockers.join("\n")}\nNo mapping was assumed verified; no target registered. Correct the WH/cluster filesystem mapping, then /cluster-add ${draft.id}.`);
       return undefined;
@@ -762,7 +766,8 @@ export async function runClusterAdd(ui: SetupUI, publish: (content: string) => v
         await saveDraft(draft, env);
       } catch (error) {
         if (error instanceof Cancelled || signal?.aborted) throw error;
-        ui.notify(`Review edit not applied: ${error instanceof Error ? error.message : "invalid value"}. Correct the review or save and exit.`, "error");
+        const evidence = verifierEvidence(error);
+        ui.notify(`Review edit not applied: ${error instanceof Error ? error.message : "invalid value"}. Correct the review or save and exit.${evidence ? `\n${evidence}` : ""}`, "error");
       }
     }
     if (!await ui.confirm("Register discovered cluster targets?", "Atomically register the reviewed targets? No allocation, deployment, key installation or enrollment will be performed.")) throw new Cancelled();
