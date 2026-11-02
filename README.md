@@ -39,14 +39,16 @@ The extension uses HTTP endpoints (not CLI subprocesses).
 - `WH_ORCHESTRATOR_URL` overrides the persisted default and runtime URL command.
   API calls, bridge registration/events/command polling/acknowledgements, and log
   streams all use this same normalized base URL.
-- Ordinary authentication: `WH_API_KEY`, or a UTF-8 bearer file named by
-  `WH_API_KEY_FILE` (environment key wins). Obtain a personal key from the web UI.
-  Keep credentials outside agent-readable roots; missing credentials fail closed.
+- Ordinary authentication: `WH_API_KEY`, else a UTF-8 bearer file named by
+  `WH_API_KEY_FILE`, else `api-key` beside the saved config
+  (`~/.omp/worker-harness/api-key` or `~/.pi/worker-harness/api-key`, mode 600).
+  Obtain a personal key from the web UI. Keep credentials outside agent-readable
+  roots; missing credentials fail closed.
 - Internal roles (`WH_SESSION_ROLE=orchestrator|pm|task`) require
   `WH_SESSION_TOKEN` and never fall back to a human key. Only these sessions
   register the Pi bridge/relay; ordinary keys never publish Pi discovery.
-- Private caches are cleared on credential changes. Credentials are not persisted
-  in extension configuration.
+- Private caches are cleared on credential changes. Credentials are never written
+  into `config.json`.
 - Persisted config file:
   - Pi: `~/.pi/worker-harness/config.json`
   - OMP: `~/.omp/worker-harness/config.json`

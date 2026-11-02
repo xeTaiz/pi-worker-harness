@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { getWorkerHarnessConfigPath } from "./config.ts";
 import type {
   AddTunnelRequest,
   ApiErrorBody,
@@ -84,10 +86,16 @@ function getCredential(): string {
   if (isInternalSession()) return process.env.WH_SESSION_TOKEN!.trim();
   const key = process.env.WH_API_KEY?.trim();
   if (key) return key;
-  const keyFile = process.env.WH_API_KEY_FILE?.trim();
-  const fileKey = keyFile ? readFileSync(keyFile, "utf8").trim() : "";
+  // Default: an `api-key` file beside the saved extension config.
+  const keyFile = process.env.WH_API_KEY_FILE?.trim() || join(dirname(getWorkerHarnessConfigPath()), "api-key");
+  let fileKey = "";
+  try {
+    fileKey = readFileSync(keyFile, "utf8").trim();
+  } catch (err) {
+    if (!(err && typeof err === "object" && "code" in err && err.code === "ENOENT")) throw err;
+  }
   if (!fileKey) {
-    throw new Error("WH_API_KEY or a nonempty WH_API_KEY_FILE is required for Worker Harness requests.");
+    throw new Error(`WH_API_KEY, a nonempty WH_API_KEY_FILE, or ${keyFile} is required for Worker Harness requests.`);
   }
   return fileKey;
 }

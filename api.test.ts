@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { getWorkerHarnessConfigPath } from "./config.ts";
 import {
   addTunnel,
   createMarimo,
@@ -357,6 +358,8 @@ test("owned tunnel and managed Marimo methods use owner-scoped routes", async ()
 
 test("missing and empty ordinary credentials fail before any HTTP request", async () => {
   const directory = await mkdtemp(join(tmpdir(), "wh-empty-key-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = directory;
   try {
     delete process.env.WH_API_KEY;
     await expect(getAuthorizationHeaders()).rejects.toThrow("WH_API_KEY");
@@ -368,6 +371,23 @@ test("missing and empty ordinary credentials fail before any HTTP request", asyn
     await expect(listQueue()).rejects.toThrow("nonempty WH_API_KEY_FILE");
     expect(requests).toHaveLength(0);
   } finally {
+    process.env.HOME = originalHome;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the api-key file beside the saved config is the default credential", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "wh-default-key-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = directory;
+  try {
+    delete process.env.WH_API_KEY;
+    const keyFile = join(dirname(getWorkerHarnessConfigPath()), "api-key");
+    await mkdir(dirname(keyFile), { recursive: true });
+    await writeFile(keyFile, "whk_default\n");
+    expect(new Headers(await getAuthorizationHeaders()).get("Authorization")).toBe("Bearer whk_default");
+  } finally {
+    process.env.HOME = originalHome;
     await rm(directory, { recursive: true, force: true });
   }
 });
