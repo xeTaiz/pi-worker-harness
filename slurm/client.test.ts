@@ -516,6 +516,13 @@ async function withFakeSsh(root: string, source: string, run: () => Promise<void
 
 const executeSshCommand = "import os,sys\nos.execv('/bin/bash', ['bash', '-c', sys.argv[-1]])\n";
 
+function verboseStderr(mode: "huge-chunk" | "fragmented") {
+  const output = mode === "huge-chunk"
+    ? "sys.stderr.buffer.write(b'b' * (3 * 1024 * 1024))\nsys.stderr.buffer.flush()\n"
+    : "for _ in range(12):\n sys.stderr.buffer.write(b'b' * 3072)\n sys.stderr.buffer.flush()\n time.sleep(0.005)\n";
+  return "import sys,time\nsys.stderr.write('discarded-stderr-prefix\\n')\nsys.stderr.flush()\n" + output;
+}
+
 async function expectSshStopped(pidFile: string) {
   // Linux pidfd readiness waits for the actual exit, not a guessed sleep after SIGKILL.
   const waiter = Bun.spawn(["python3", "-c", String.raw`
@@ -554,12 +561,13 @@ test("SSH probe stdout budget does not hide a larger real Python traceback or ex
   });
 });
 
-for (const mode of ["banner", "traceback", "stdout-noise"] as const) {
+for (const mode of ["banner", "fragmented-banner", "traceback", "stdout-noise", "stdout-prefix"] as const) {
   test(`shared mapping verifier uses production SSH with ${mode} and always cleans the actual probe`, async () => {
     const f = await fixture();
     await mkdir(f.profile.shared_root);
-    const prelude = "import sys\nsys.stderr.write('site-login-banner\\n' * 100)\nsys.stderr.flush()\n" +
-      (mode === "stdout-noise" ? "sys.stdout.write('private-stdout-noise' * 100)\nsys.stdout.flush()\n" : "");
+    const prelude = verboseStderr(mode === "fragmented-banner" ? "fragmented" : "huge-chunk") +
+      (mode === "stdout-noise" ? "sys.stdout.write('private-stdout-noise' * 100)\nsys.stdout.flush()\n" :
+        mode === "stdout-prefix" ? "sys.stdout.write('unexpected-prefix')\nsys.stdout.flush()\n" : "");
     let cleanups = 0;
     await withFakeSsh(f.root, prelude + executeSshCommand, async () => {
       const verification = verifySharedMappings(f.profile, sharedRoots(f.profile), {
@@ -574,13 +582,15 @@ for (const mode of ["banner", "traceback", "stdout-noise"] as const) {
           },
         },
       });
-      if (mode === "banner") await verification;
+      if (mode === "banner" || mode === "fragmented-banner") await verification;
       else {
         const error = await verification.catch((error) => error);
         expect(error.code).toBe("SHARED_STORAGE_NOT_VERIFIED");
-        expect(error.evidence).toContain(mode === "traceback" ? "SSH_COMMAND_FAILED" : "SSH_OUTPUT_LIMIT");
-        expect(error.evidence).toContain(mode === "traceback" ? "FileNotFoundError" : "stdout");
+        expect(error.evidence).toContain(mode === "traceback" ? "SSH_COMMAND_FAILED" : mode === "stdout-noise" ? "SSH_OUTPUT_LIMIT" : "shared storage identity mismatch");
+        if (mode === "traceback") expect(error.evidence).toContain("FileNotFoundError");
+        if (mode === "stdout-noise") expect(error.evidence).toContain("stdout");
         expect(error.evidence).not.toContain("private-stdout-noise");
+        expect(error.evidence).not.toContain("unexpected-prefix");
       }
       expect(cleanups).toBe(1);
       expect(await readdir(f.profile.shared_root)).toEqual([]);
@@ -589,44 +599,49 @@ for (const mode of ["banner", "traceback", "stdout-noise"] as const) {
 }
 
 for (const mode of ["huge-chunk", "fragmented"] as const) {
-  test(`SSH ${mode} stderr overflow kills the process and retains only a bounded diagnostic tail`, async () => {
-    const f = await fixture(), pidFile = join(f.root, "ssh.pid");
-    const output = mode === "huge-chunk"
-      ? "os.write(2, b'overflow-chunk-cause\\n' * 32768)\n"
-      : "os.write(2, b'old-prefix\\n' + b'a' * (8192 - 11))\nos.write(2, b'fragment-terminal-cause')\n";
-    const source = `import os,signal\nfrom pathlib import Path\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))\nos.write(1, b'private-stdout-payload')\n${output}signal.pause()\n`;
+  test(`SSH ${mode} verbose nonzero stderr retains the final cause without exposing private stdout`, async () => {
+    const f = await fixture();
+    const source = verboseStderr(mode) +
+      "sys.stdout.write('private-stdout-payload')\nsys.stdout.flush()\nraise RuntimeError('terminal-verbose-python-cause')\n";
     await withFakeSsh(f.root, source, async () => {
       const error = await sshTransport(f.profile, "unused", "private-stdin", { max_bytes: 1024, timeout_ms: 2000 }).catch((error) => error);
-      expect(error.code).toBe("SSH_OUTPUT_LIMIT");
-      expect(error.message).toContain("stderr");
-      expect(error.message).toContain("8192-byte bound");
+      expect(error).toBeInstanceOf(SlurmClientError);
+      expect(error.code).toBe("SSH_COMMAND_FAILED");
+      expect(error.message).toContain("SSH exited 1; stderr tail:");
       const tail = error.message.split("; stderr tail:\n")[1];
       expect(tail).toBeDefined();
-      expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(4096);
-      expect(tail).toContain(mode === "huge-chunk" ? "overflow-chunk-cause" : "fragment-terminal-cause");
-      if (mode === "fragmented") expect(tail).not.toContain("old-prefix");
+      expect(Buffer.byteLength(tail)).toBe(4096);
+      expect(tail).toContain("RuntimeError: terminal-verbose-python-cause");
+      expect(tail).not.toContain("discarded-stderr-prefix");
       expect(error.message).not.toContain("private-stdout-payload");
       expect(error.message).not.toContain("private-stdin");
+      expect(error.evidence).toEqual({ stdout: "private-stdout-payload", exit_code: 1 });
+      expect(String(error).length).toBeLessThan(8192);
+    });
+  });
+}
+
+for (const max_bytes of [1024, undefined]) {
+  test(`SSH stdout overflow still kills at ${max_bytes ?? "default 2 MiB"} and retains bounded stderr without stdout payload`, async () => {
+    const f = await fixture(), pidFile = join(f.root, "ssh.pid");
+    const source = `import os,signal,sys,time\nfrom pathlib import Path\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))\nsys.stderr.write('discarded-stderr-prefix' + 'b' * 65536 + 'stdout-overflow-stderr-cause')\nsys.stderr.flush()\ntime.sleep(0.02)\nsys.stdout.write('private-stdout-payload' * 150000)\nsys.stdout.flush()\nsignal.pause()\n`;
+    await withFakeSsh(f.root, source, async () => {
+      const error = await sshTransport(f.profile, "unused", undefined, { max_bytes, timeout_ms: 2000 }).catch((error) => error);
+      expect(error.code).toBe("SSH_OUTPUT_LIMIT");
+      expect(error.message).toContain("stdout");
+      expect(error.message).toContain(`${max_bytes ?? 2 * 1024 * 1024}-byte bound`);
+      const tail = error.message.split("; stderr tail:\n")[1];
+      expect(tail).toBeDefined();
+      expect(Buffer.byteLength(tail)).toBe(4096);
+      expect(tail).toContain("stdout-overflow-stderr-cause");
+      expect(tail).not.toContain("discarded-stderr-prefix");
+      expect(error.message).not.toContain("private-stdout-payload");
       expect(error.evidence).toBeUndefined();
       expect(String(error).length).toBeLessThan(8192);
       await expectSshStopped(pidFile);
     });
   });
 }
-
-test("SSH stdout overflow still rejects, identifies its bound and does not expose stdout payload", async () => {
-  const f = await fixture(), pidFile = join(f.root, "ssh.pid");
-  const source = `import os,signal\nfrom pathlib import Path\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))\nos.write(1, b'private-stdout-payload' * 100)\nsignal.pause()\n`;
-  await withFakeSsh(f.root, source, async () => {
-    const error = await sshTransport(f.profile, "unused", undefined, { max_bytes: 1024, timeout_ms: 2000 }).catch((error) => error);
-    expect(error.code).toBe("SSH_OUTPUT_LIMIT");
-    expect(error.message).toContain("stdout");
-    expect(error.message).toContain("1024-byte bound");
-    expect(error.message).not.toContain("private-stdout-payload");
-    expect(error.evidence).toBeUndefined();
-    await expectSshStopped(pidFile);
-  });
-});
 
 test("poll cancellation reaches active scheduler transport and prevents later observations", async () => {
   const f = await fixture();

@@ -29,7 +29,7 @@ export interface ClusterEnqueueInput {
 export interface SshConnection { ssh_host: string; ssh_config_file?: string }
 export interface TransportOptions {
   timeout_ms?: number;
-  /** Maximum stdout bytes (default 2 MiB); stderr has an independent 8 KiB diagnostic bound. */
+  /** Maximum stdout bytes (default 2 MiB); stderr retains only its most recent 8 KiB. */
   max_bytes?: number;
   signal?: AbortSignal;
 }
@@ -85,7 +85,7 @@ const terminalState = (state: string) => /^(COMPLETED|CANCELLED|FAILED|TIMEOUT|P
 const terminalJob = (job: Job) => job.status === "done" || job.status === "failed";
 const safeId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/.test(value);
 const py = (source: string, args: string[] = []) => `python3 -c ${shellQuote(source)} ${args.map(shellQuote).join(" ")}`;
-const SSH_STDERR_MAX_BYTES = 8 * 1024;
+const SSH_STDERR_RETAIN_BYTES = 8 * 1024;
 // Leave room for error context inside the setup UI's 8192-character evidence bound.
 const SSH_DIAGNOSTIC_TAIL_BYTES = 4 * 1024;
 
@@ -104,29 +104,26 @@ export const sshTransport = (profile: SshConnection, script: string, stdin = "",
   let stdoutSize = 0, stderrSize = 0, stderr: Buffer | undefined, failed = false;
   const stderrText = () => stderr?.toString("utf8", Math.max(0, stderrSize - SSH_DIAGNOSTIC_TAIL_BYTES), stderrSize) ?? "";
   const fail = (error: Error) => { if (!failed) { failed = true; child.kill("SIGKILL"); reject(error); } };
-  const outputLimit = (stream: "stdout" | "stderr", bound: number) => fail(new SlurmClientError("SSH_OUTPUT_LIMIT", `SSH ${stream} exceeded its ${bound}-byte bound${stderrSize ? `; stderr tail:\n${stderrText()}` : ""}`));
   const timer = setTimeout(() => fail(new SlurmClientError("SSH_TIMEOUT", "local SSH timed out; submission may be uncertain")), options.timeout_ms ?? 60_000);
   child.stdout.on("data", (chunk: Buffer) => {
     if (failed) return;
     stdoutSize += chunk.length;
-    if (stdoutSize > stdoutLimit) outputLimit("stdout", stdoutLimit);
+    if (stdoutSize > stdoutLimit) fail(new SlurmClientError("SSH_OUTPUT_LIMIT", `SSH stdout exceeded its ${stdoutLimit}-byte bound${stderrSize ? `; stderr tail:\n${stderrText()}` : ""}`));
     else chunks.push(chunk);
   });
   child.stderr.on("data", (chunk: Buffer) => {
     if (failed) return;
-    stderr ??= Buffer.allocUnsafe(SSH_STDERR_MAX_BYTES);
-    const total = stderrSize + chunk.length;
-    // Include the overflowing chunk's tail without retaining an unbounded chunk or concatenation.
-    if (chunk.length >= SSH_STDERR_MAX_BYTES) {
-      chunk.copy(stderr, 0, chunk.length - SSH_STDERR_MAX_BYTES);
-      stderrSize = SSH_STDERR_MAX_BYTES;
+    stderr ??= Buffer.allocUnsafe(SSH_STDERR_RETAIN_BYTES);
+    // Keep a fixed-size rolling tail, even when a single chunk exceeds the retention size.
+    if (chunk.length >= SSH_STDERR_RETAIN_BYTES) {
+      chunk.copy(stderr, 0, chunk.length - SSH_STDERR_RETAIN_BYTES);
+      stderrSize = SSH_STDERR_RETAIN_BYTES;
     } else {
-      const keep = Math.min(stderrSize, SSH_STDERR_MAX_BYTES - chunk.length);
+      const keep = Math.min(stderrSize, SSH_STDERR_RETAIN_BYTES - chunk.length);
       if (keep !== stderrSize) stderr.copyWithin(0, stderrSize - keep, stderrSize);
       chunk.copy(stderr, keep);
       stderrSize = keep + chunk.length;
     }
-    if (total > SSH_STDERR_MAX_BYTES) outputLimit("stderr", SSH_STDERR_MAX_BYTES);
   });
   child.on("error", fail);
   child.stdin.on("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") fail(error); });
