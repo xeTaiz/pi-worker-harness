@@ -217,6 +217,15 @@ submits an allocation, deploys a server, or installs software remotely.
    **“Add another filesystem mapping?”** loop repeats those same two fields.
    The first mapping stays primary. Every mapping requires a temporary
    random backing-identity probe against a participating WH worker and cleanup.
+   The verifier validates the existing root once and reads visible probes
+   immediately. Only an absent probe directory entry (`os.lstat` raising
+   `FileNotFoundError`) is polled every 250 ms for up to 30 monotonic seconds,
+   allowing writeback-cache visibility delay. It then strictly resolves the
+   probe, checks containment and compares the exact token. Missing roots,
+   dangling/cyclic or escaping symlinks, permission/read errors, mismatches and
+   SSH failures do not enter that retry loop. Expiry explicitly reports that the
+   probe is not visible and possible writeback caching. Only this SSH call gets
+   a 45-second timeout; cleanup remains in `finally`, including cancellation.
    Initial failures save a blocked draft with bounded textual verifier evidence
    (for example, the remote Python exception), not raw transport or credential
    payloads. Failed mapping changes in **Edit review** show the same evidence
@@ -231,9 +240,9 @@ submits an allocation, deploys a server, or installs software remotely.
    bound and including any bounded stderr tail. Stdout payloads are never added
    to textual error diagnostics. Error text uses at most the final 4 KiB of
    stderr, leaving room for the code and context inside setup's 8192-character
-   verifier evidence limit. Timeout, cancellation and SSH failures are unchanged.
-   The latest reported IBEX `SSH_OUTPUT_LIMIT` does not identify its underlying
-   SSH/Python/filesystem cause; that remains unknown until a diagnostic retry.
+   verifier evidence limit. Cancellation and SSH failure handling are unchanged.
+   An earlier IBEX `SSH_OUTPUT_LIMIT` alone did not identify its underlying
+   cause; the subsequent user-controlled visibility observation is recorded below.
 5. Bounded read-only discovery inspects Slurm inventory/limits, account/default/
    QoS evidence, runtime/version and compatible SIF labels. No allocation,
    recursive scan or login-node container execution occurs.
@@ -445,7 +454,7 @@ trust yet; that is not setup completion.
 The historical native suite passed **361 tests, zero failures**, 2,764
 expectations/14 files (2.19 seconds); actual **OMP 18.14.2 shared-SSH
 onboarding/migration smoke passed** in 32.39 seconds. These are historical,
-not the latest proof. Current evidence below includes 474 Bun tests,
+not the latest proof. Current evidence below includes 485 Bun tests,
 339 isolated root tests, local Python 3.9 compatibility and prior OMP/runtime proofs.
 Publication, deployment and real login/cluster/charged acceptance remain separate.
 
@@ -539,8 +548,8 @@ Key bindings:
 
 ### Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test` passed: 477 tests, zero failures**, **3,734
-assertions/16 files, 7.54 seconds**, run by the parent in the extension checkout.
+Current extension **`bun test` passed: 485 tests, zero failures**, **3,805
+assertions/16 files, 8.09 seconds**, run by the parent in the extension checkout.
 The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
 minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
 
@@ -555,17 +564,31 @@ textual errors. Unexpected stdout remained rejected, with probe cleanup.
 The prior ten-case channel-budget smoke is historical; its stderr-overflow
 kill expectations are **superseded** by rolling 8 KiB retention.
 These are local process/consumer proofs, not real SSH network, live IBEX,
-cluster-job, native-OMP or visual-GUI acceptance; the underlying reported IBEX
-cause remains unknown pending a diagnostic retry.
+cluster-job, native-OMP or visual-GUI acceptance.
 
-For the Python 3.9 fix, the parent ran **`WH_TEST_PYTHON=<python3.9> bun test
-slurm/client.test.ts`: 29 passed, zero failures, 209 assertions, 1.264 seconds**
+For the visibility fix, the parent ran **`WH_TEST_PYTHON=<python3.9> bun test
+slurm/client.test.ts`: 47 passed, zero failures, 363 assertions, 2.52 seconds**
 with a SHA256-verified temporary portable **Python 3.9.23** interpreter. These
 tests execute emitted filesystem probe, path-preflight and staging scripts.
-A separate actual-verifier local smoke passed **all eight cases**: valid root,
-root symlink alias, missing root, broken probe symlink, cyclic probe symlink,
-escaping probe symlink, content mismatch and permission denied; probe cleanup
-was checked in every case. No live SSH, cluster operation or allocation was used.
+A separate actual-verifier/emitted-Python-3.9 local smoke passed **11 cases**.
+A real five-second delayed local file publication was accepted after **5,093 ms**,
+with **20 polls, one exact-token read, one cleanup and zero stranded probes**.
+The immediate case took **24 ms with zero polls**. Deadline expiry used an
+injected virtual Python clock (**120 polls**, explicit visibility/cache cause);
+stat/read permission failures and SSH failure were injected boundaries, while
+missing-root, broken/cyclic/escaping symlink and mismatch cases used local files.
+Every case checked cleanup. Cancellation cleanup is covered by the client suite.
+The earlier eight-case Python compatibility smoke remains historical.
+
+Separately, the user's controlled IBEX observation recorded a worker write closed
+at **2026-11-02T08:18:58.401795+00:00** and the watcher first reading it at
+**08:19:03.576499+00:00**, a **5.174704-second** visibility gap. This is consistent
+with rclone's default five-second writeback delay and the repository's full-cache
+service without a writeback override; it does not establish the precise cause of
+every earlier failure. The confirmed mapping remains `/data/shared/ibex` →
+`/ibex/user/engeld`; mount source `Ibex:weka_user/engeld` is not a replacement host
+path. No new live SSH, cluster operation, allocation, mount change or deployed-fix
+verification was performed for this fix; the existing user markers were retained.
 
 An additional parent smoke invoked actual `runClusterAdd` twice with private
 local key/draft creation, actual `verifySharedMappings` and a Python 3.9 emitted

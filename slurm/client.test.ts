@@ -10,13 +10,54 @@ const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 /** Run the actual emitted scripts locally; point WH_TEST_PYTHON at Python 3.9 for compatibility coverage. */
-async function runRemoteScript(script: string, stdin = "") {
+async function runRemoteScript(script: string, stdin = "", env?: NodeJS.ProcessEnv) {
   const python = process.env.WH_TEST_PYTHON;
   const command = python ? script.replace(/\bpython3 -c /g, `${shellQuote(python)} -c `) : script;
-  const child = Bun.spawn(["bash", "-c", command], { stdin: new Blob([stdin]), stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(["bash", "-c", command], { stdin: new Blob([stdin]), stdout: "pipe", stderr: "pipe", env });
   const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   if (code) throw new Error(stderr);
   return stdout;
+}
+
+/** Instrument Python's OS/clock boundaries, not the generated program or its output. */
+async function probePythonShim(root: string, mode: "clock" | "immediate" | "permission" | "stat-permission" | "publish" | "observe", workerRoot?: string) {
+  const directory = join(root, "python-shim");
+  const events = join(directory, "events");
+  await mkdir(directory);
+  await writeFile(join(directory, "sitecustomize.py"), String.raw`
+import builtins,os,sys,time
+original_open=builtins.open
+original_sleep=time.sleep
+original_lstat=os.lstat
+elapsed=0.0
+def record(event):
+ with original_open(${JSON.stringify(events)},'a') as handle: handle.write(event+'\n')
+def sleep(seconds):
+ global elapsed
+ record('sleep:'+str(seconds))
+ if ${JSON.stringify(mode)}=='observe':
+  sys.stderr.write('waiting-for-probe\n'); sys.stderr.flush()
+  return original_sleep(seconds)
+ if ${JSON.stringify(mode)} not in ('clock','publish'): raise AssertionError('nontransient probe failure must not sleep')
+ elapsed+=seconds
+ if ${JSON.stringify(mode)}=='publish':
+  with original_open(os.path.join(${JSON.stringify(workerRoot ?? "")},os.path.basename(sys.argv[2])),'rb') as source, original_open(sys.argv[2],'wb') as dest: dest.write(source.read())
+  record('published')
+time.sleep=sleep
+if ${JSON.stringify(mode)}!='observe': time.monotonic=lambda: elapsed
+def lstat_probe(path,*args,**kwargs):
+ if ${JSON.stringify(mode)}=='stat-permission' and os.path.basename(str(path)).startswith('.wh-probe-'): raise PermissionError('probe stat denied by filesystem')
+ return original_lstat(path,*args,**kwargs)
+os.lstat=lstat_probe
+def open_probe(path,*args,**kwargs):
+ if os.path.basename(str(path)).startswith('.wh-probe-'):
+  record('read')
+  if ${JSON.stringify(mode)}=='permission': raise PermissionError('probe read denied by filesystem')
+ return original_open(path,*args,**kwargs)
+builtins.open=open_probe
+record('started')
+`);
+  return { events, env: { ...process.env, PYTHONPATH: directory + (process.env.PYTHONPATH ? ":" + process.env.PYTHONPATH : "") } };
 }
 
 async function fixture(kind: "gpu" | "cpu" = "gpu") {
@@ -364,10 +405,12 @@ test("real mapped project/environment preflight, all identity probes and staging
   expect(f.reservations).toHaveLength(previous);
 });
 
-for (const unsafe of ["missing", "broken", "cyclic", "escape"] as const) {
+for (const unsafe of ["missing", "missing-root", "broken", "cyclic", "escape", "permission", "stat-permission", "mismatch"] as const) {
   test(`actual shared identity probe rejects ${unsafe} paths and cleans the worker probe`, async () => {
     const f = await fixture();
-    await mkdir(f.profile.shared_root, { recursive: true });
+    if (unsafe !== "missing-root") await mkdir(f.profile.shared_root, { recursive: true });
+    const shim = await probePythonShim(f.root, unsafe === "missing" ? "clock" : unsafe === "permission" || unsafe === "stat-permission" ? unsafe : "immediate");
+    let transports = 0;
     const cleaned: string[] = [];
     await expect(verifySharedMappings(f.profile, sharedRoots(f.profile), {
       api: {
@@ -382,19 +425,137 @@ for (const unsafe of ["missing", "broken", "cyclic", "escape"] as const) {
           else if (unsafe === "escape") {
             await writeFile(join(f.root, "outside-probe"), f.state.probe);
             await symlink(join(f.root, "outside-probe"), probe);
+          } else if (unsafe === "permission" || unsafe === "stat-permission" || unsafe === "mismatch") {
+            await writeFile(probe, unsafe === "mismatch" ? "not-the-worker-token" : f.state.probe);
           }
           return result;
         },
       },
-      transport: async (_connection, script, stdin) => runRemoteScript(script, stdin),
+      transport: async (_connection, script, stdin, options) => {
+        transports++;
+        expect(options).toMatchObject({ timeout_ms: 45_000, max_bytes: 1024 });
+        return runRemoteScript(script, stdin, shim.env);
+      },
     })).rejects.toMatchObject({
       code: "SHARED_STORAGE_NOT_VERIFIED",
-      evidence: expect.stringMatching(unsafe === "escape" ? /resolved probe escapes shared storage/ : /FileNotFoundError|RuntimeError|OSError/),
+      evidence: expect.stringMatching(unsafe === "missing" ? /shared probe not visible after 30 seconds; possible writeback cache delay/ :
+        unsafe === "escape" ? /resolved probe escapes shared storage/ :
+        unsafe === "permission" ? /PermissionError: probe read denied by filesystem/ :
+        unsafe === "stat-permission" ? /PermissionError: probe stat denied by filesystem/ :
+        unsafe === "mismatch" ? /shared storage identity mismatch/ : /FileNotFoundError|RuntimeError|OSError/),
     });
     expect(cleaned).toHaveLength(1);
-    expect((await readdir(f.profile.shared_root)).some((entry) => entry.startsWith(".wh-probe-"))).toBe(false);
+    expect(transports).toBe(1);
+    const events = (await readFile(shim.events, "utf8")).trim().split("\n");
+    const sleeps = events.filter((event) => event.startsWith("sleep:"));
+    expect(sleeps).toHaveLength(unsafe === "missing" ? 120 : 0);
+    if (unsafe === "missing") expect(sleeps.every((event) => event === "sleep:0.25")).toBe(true);
+    expect(events.filter((event) => event === "read")).toHaveLength(unsafe === "permission" || unsafe === "mismatch" ? 1 : 0);
+    if (unsafe !== "missing-root") expect((await readdir(f.profile.shared_root)).some((entry) => entry.startsWith(".wh-probe-"))).toBe(false);
   });
 }
+
+for (const delayed of [false, true]) {
+  test(`actual shared probe ${delayed ? "waits for delayed visibility" : "reads immediately without sleeping"} before worker cleanup`, async () => {
+    const f = await fixture(), workerRoot = join(f.root, "ordinary-worker");
+    await mkdir(workerRoot);
+    await mkdir(f.profile.shared_root);
+    const shim = await probePythonShim(f.root, delayed ? "publish" : "immediate", workerRoot);
+    const events: string[] = [];
+    let token = "";
+    await verifySharedMappings(f.profile, sharedRoots(f.profile), {
+      api: {
+        listDataPaths: f.fakeApi.listDataPaths!,
+        startJob: async (input) => {
+          const name = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
+          const workerProbe = join(workerRoot, name), clusterProbe = join(f.profile.shared_root, name);
+          if (input.name?.includes("cleanup")) {
+            expect(events).toEqual(["written", "read"]);
+            expect(await readFile(workerProbe, "utf8")).toBe(token);
+            events.push("cleanup");
+            await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
+            await rm(clusterProbe);
+          } else {
+            await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
+            token = await readFile(workerProbe, "utf8");
+            expect(token).toMatch(/^[a-f0-9]{64}$/);
+            events.push("written");
+            if (!delayed) await writeFile(clusterProbe, token);
+          }
+          return { id: "local-probe", worker_id: input.worker_id, status: "done", exit_code: 0 } as Job;
+        },
+      },
+      transport: async (_connection, script, stdin, options) => {
+        expect(options).toMatchObject({ timeout_ms: 45_000, max_bytes: 1024 });
+        const remote = await runRemoteScript(script, stdin, shim.env);
+        expect(remote).toBe(token);
+        events.push("read");
+        return remote;
+      },
+    });
+    const pythonEvents = (await readFile(shim.events, "utf8")).trim().split("\n");
+    expect(pythonEvents).toEqual(delayed ? ["started", "sleep:0.25", "published", "read"] : ["started", "read"]);
+    expect(events).toEqual(["written", "read", "cleanup"]);
+    expect(await readdir(workerRoot)).toEqual([]);
+    expect(await readdir(f.profile.shared_root)).toEqual([]);
+  });
+}
+
+test("cancelling the actual Python visibility wait still cleans the ordinary worker probe", async () => {
+  const f = await fixture(), controller = new AbortController();
+  const workerRoot = join(f.root, "ordinary-worker");
+  await mkdir(workerRoot);
+  await mkdir(f.profile.shared_root);
+  const shim = await probePythonShim(f.root, "observe");
+  const reason = new Error("operator cancelled visibility wait");
+  let cleanups = 0;
+  await expect(verifySharedMappings(f.profile, sharedRoots(f.profile), {
+    signal: controller.signal,
+    api: {
+      listDataPaths: f.fakeApi.listDataPaths!,
+      startJob: async (input) => {
+        await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
+        if (input.name?.includes("cleanup")) cleanups++;
+        return { id: "local-probe", worker_id: input.worker_id, status: "done", exit_code: 0 } as Job;
+      },
+    },
+    transport: async (_connection, script, _stdin, options) => {
+      expect(options?.signal).toBe(controller.signal);
+      const python = process.env.WH_TEST_PYTHON ?? "python3";
+      // exec makes the locally simulated SSH child the actual Python waiter.
+      const command = script.replace(/\bpython3 -c /, `exec ${shellQuote(python)} -c `);
+      const child = Bun.spawn(["bash", "-c", command], { env: shim.env, stdout: "pipe", stderr: "pipe" });
+      const abort = () => child.kill();
+      options!.signal!.addEventListener("abort", abort, { once: true });
+      try {
+        const reader = child.stderr.getReader();
+        const waiting = await reader.read();
+        expect(new TextDecoder().decode(waiting.value)).toBe("waiting-for-probe\n");
+        controller.abort(reason);
+        await child.exited;
+        options!.signal!.throwIfAborted();
+        throw new Error("cancelled transport unexpectedly continued");
+      } finally {
+        options!.signal!.removeEventListener("abort", abort);
+        child.kill();
+      }
+    },
+  })).rejects.toBe(reason);
+  expect(cleanups).toBe(1);
+  expect(await readdir(workerRoot)).toEqual([]);
+  expect(await readdir(f.profile.shared_root)).toEqual([]);
+});
+
+test("shared probe SSH failure is not retried and still cleans the worker probe", async () => {
+  const f = await fixture();
+  let transports = 0;
+  await expect(verifySharedMappings(f.profile, sharedRoots(f.profile), {
+    api: f.fakeApi as Pick<ClientApi, "listDataPaths" | "startJob">,
+    transport: async () => { transports++; throw new Error("SSH disconnected"); },
+  })).rejects.toMatchObject({ code: "SHARED_STORAGE_NOT_VERIFIED", evidence: expect.stringContaining("SSH disconnected") });
+  expect(transports).toBe(1);
+  expect(f.calls.filter((call) => call === "probe-cleanup")).toHaveLength(1);
+});
 
 for (const unsafe of ["missing", "broken", "cyclic"] as const) {
   test(`actual staging refuses a ${unsafe} shared root before creating run assets`, async () => {
@@ -565,11 +726,13 @@ for (const mode of ["banner", "fragmented-banner", "traceback", "stdout-noise", 
   test(`shared mapping verifier uses production SSH with ${mode} and always cleans the actual probe`, async () => {
     const f = await fixture();
     await mkdir(f.profile.shared_root);
+    const shim = mode === "traceback" ? await probePythonShim(f.root, "clock") : undefined;
     const prelude = verboseStderr(mode === "fragmented-banner" ? "fragmented" : "huge-chunk") +
       (mode === "stdout-noise" ? "sys.stdout.write('private-stdout-noise' * 100)\nsys.stdout.flush()\n" :
         mode === "stdout-prefix" ? "sys.stdout.write('unexpected-prefix')\nsys.stdout.flush()\n" : "");
     let cleanups = 0;
-    await withFakeSsh(f.root, prelude + executeSshCommand, async () => {
+    const environment = shim ? `import os\nos.environ['PYTHONPATH']=${JSON.stringify(shim.env.PYTHONPATH)}\n` : "";
+    await withFakeSsh(f.root, prelude + environment + executeSshCommand, async () => {
       const verification = verifySharedMappings(f.profile, sharedRoots(f.profile), {
         api: {
           listDataPaths: f.fakeApi.listDataPaths!,
@@ -587,7 +750,7 @@ for (const mode of ["banner", "fragmented-banner", "traceback", "stdout-noise", 
         const error = await verification.catch((error) => error);
         expect(error.code).toBe("SHARED_STORAGE_NOT_VERIFIED");
         expect(error.evidence).toContain(mode === "traceback" ? "SSH_COMMAND_FAILED" : mode === "stdout-noise" ? "SSH_OUTPUT_LIMIT" : "shared storage identity mismatch");
-        if (mode === "traceback") expect(error.evidence).toContain("FileNotFoundError");
+        if (mode === "traceback") expect(error.evidence).toContain("shared probe not visible after 30 seconds; possible writeback cache delay");
         if (mode === "stdout-noise") expect(error.evidence).toContain("stdout");
         expect(error.evidence).not.toContain("private-stdout-noise");
         expect(error.evidence).not.toContain("unexpected-prefix");

@@ -168,14 +168,24 @@ export async function verifySharedMappings(connection: SshConnection, mappings: 
         const written = await workerApi.startJob({ worker_id, command: `umask 077; printf '%s' ${shellQuote(contents)} > ${shellQuote(path)}`, name: "WH shared-storage identity probe", sync: true, sync_timeout: 30, no_pty: true });
         if (written.status !== "done" || written.exit_code !== 0) throw new Error("ordinary probe job did not complete successfully");
         const remote = await transport(connection, "# wh:shared-probe\n" + py(String.raw`
-import os,sys
+import os,sys,time
 from pathlib import Path
 root=str(Path(sys.argv[1]).resolve(strict=True))
 if root=='/' or not os.path.isdir(root) or any(c in ':;,' or ord(c)<32 or ord(c)==127 for c in root): raise ValueError('invalid resolved shared root')
+# A completed worker write can still be waiting in a writeback cache.
+# Retry only absence of this directory entry, never resolution/read failures.
+deadline=time.monotonic()+30
+while True:
+ try: os.lstat(sys.argv[2])
+ except FileNotFoundError:
+  remaining=deadline-time.monotonic()
+  if remaining<=0: raise TimeoutError('shared probe not visible after 30 seconds; possible writeback cache delay')
+  time.sleep(min(0.25,remaining))
+ else: break
 probe=str(Path(sys.argv[2]).resolve(strict=True))
 if os.path.commonpath([root,probe])!=root: raise ValueError('resolved probe escapes shared storage')
 with open(probe) as handle: sys.stdout.write(handle.read(1024))
-`, [mapping.shared_root, mapping.shared_root + "/" + probe]), undefined, { max_bytes: 1024, signal: options.signal });
+`, [mapping.shared_root, mapping.shared_root + "/" + probe]), undefined, { timeout_ms: 45_000, max_bytes: 1024, signal: options.signal });
         if (remote !== contents) throw new Error("shared storage identity mismatch");
         verified = true;
       } catch (error) { lastError = error; }

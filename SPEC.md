@@ -141,7 +141,8 @@ Cluster-host Python scripts support Python 3.9+. Resolve existing roots/probes,
 project/environment paths and staging roots with `pathlib.Path.resolve(strict=True)`;
 do not use the Python-3.10+ `os.path.realpath` strict keyword or non-strict fallback.
 Missing paths, broken/cyclic symlinks and permission errors must fail closed;
-retain selected-root containment checks after canonical resolution.
+retain selected-root containment checks after canonical resolution. The identity
+probe alone allows a bounded wait for its directory entry to become visible.
 
 Ordinary worker IDs keep existing execution behavior. Cluster IDs are rejected
 for exec/file/tunnel/Marimo operations with `CLUSTER_REQUIRES_ENQUEUE`.
@@ -184,6 +185,17 @@ Prompt/progress order:
    a participating WH worker and exact cluster path with a temporary random
    identity probe and cleanup; unavailable worker/catalog permissions or probe/
    cleanup failures block readiness, never produce “verified” evidence.
+   Resolve and validate the existing root once, then read an already-visible
+   probe immediately. Only `FileNotFoundError` from the probe's `os.lstat`
+   existence check is transient: poll that same probe every 250 ms against a
+   monotonic 30-second deadline before strict resolution, containment validation,
+   open and exact token comparison. Missing roots, dangling/cyclic or escaping
+   symlinks, permission/read errors, mismatched contents and SSH failures are not
+   visibility retries. Expiry reports that the probe is not visible and a possible
+   writeback cache delay; it does not infer an incorrect mapping or translate
+   mount-source paths. This SSH call alone has a 45-second timeout, leaving room
+   for connection establishment and the visibility wait. Worker cleanup stays in
+   `finally`, after the read or failure, including cancellation.
    Initial blocked setup diagnostics and rejected review mapping edits retain
    the generic failure and bounded textual `SlurmClientError.evidence` cause
    (last 8192 characters after control filtering); never serialize raw transport
@@ -202,10 +214,10 @@ Prompt/progress order:
    embed general stdout or structured transport/staging/credential payloads.
    Error text renders only the final 4096 stderr bytes, preserving terminal
    causes plus code/context within setup's 8192-character evidence limit.
-   Timeout, cancellation and SSH failure handling remain unchanged.
-   The latest IBEX output-limit report alone establishes neither the offending
-   stream nor the remote SSH/Python/filesystem cause; that cause awaits a retry
-   with these diagnostics, not an assumed mount or Python failure.
+   Cancellation and SSH failure handling remain unchanged.
+   The earlier IBEX output-limit report alone established neither the offending
+   stream nor the remote cause; the later user-controlled visibility observation
+   is recorded under current evidence, without assuming every failure shares it.
 5. Bounded read-only SSH discovery inspects Slurm inventory/partition limits,
    account/default/QoS evidence, runtime/version and static SIF capability.
    No allocations, recursive filesystem scans or login-node container execution.
@@ -414,7 +426,7 @@ trust still means onboarding has not completed.
 The historical native suite passed **361 tests, zero failures**, 2,764
 expectations/14 files (2.19 seconds); actual **OMP 18.14.2 shared-SSH/migration
 smoke passed in 32.39 seconds**. These predate discovery/resume/additional-root
-changes; current evidence below includes 474 Bun tests, 339 isolated root tests,
+changes; current evidence below includes 485 Bun tests, 339 isolated root tests,
 local Python 3.9 compatibility and prior OMP/runtime proofs. Publication,
 deployment and real login/charged acceptance remain separate gates.
 
@@ -670,8 +682,8 @@ Widget should gracefully handle:
 
 ## Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test`: 477 passed, zero failures**, **3,734 assertions
-across 16 files, 7.54 seconds**, executed by the parent in the extension checkout.
+Current extension **`bun test`: 485 passed, zero failures**, **3,805 assertions
+across 16 files, 8.09 seconds**, executed by the parent in the extension checkout.
 The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
 minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
 
@@ -685,17 +697,32 @@ retained bounded stderr and leaked no stdout into textual errors. Unexpected
 stdout remained rejected, with probe cleanup. The prior ten-case channel-budget
 smoke is historical; its stderr-overflow kill expectations are **superseded**
 by rolling 8192-byte retention. This is local process/consumer evidence, not
-real SSH network, live IBEX, cluster-job, native-OMP or visual-GUI acceptance;
-the reported IBEX cause awaits a diagnostic retry.
+real SSH network, live IBEX, cluster-job, native-OMP or visual-GUI acceptance.
 
-The parent ran **`WH_TEST_PYTHON=<python3.9> bun test slurm/client.test.ts`:
-29 passed, zero failures, 209 assertions, 1.264 seconds**, using a SHA256-verified
-temporary portable **Python 3.9.23** interpreter and actual emitted filesystem
-probe, path-preflight and staging scripts. A separate actual-verifier local smoke
-passed **eight cases**: valid root, root symlink alias, missing root, broken probe
-symlink, cyclic probe symlink, escaping probe symlink, content mismatch and
-permission denied. Every case checked probe cleanup. This is local compatibility
-and safety evidence, not live SSH, cluster-operation or allocation acceptance.
+For the visibility fix, the parent ran **`WH_TEST_PYTHON=<python3.9> bun test
+slurm/client.test.ts`: 47 passed, zero failures, 363 assertions, 2.52 seconds**,
+using a SHA256-verified temporary portable **Python 3.9.23** interpreter and
+actual emitted filesystem probe, path-preflight and staging scripts.
+An actual-verifier/emitted-Python-3.9 local smoke passed **11 cases**: a real
+five-second delayed file publication, immediate visibility, virtual-clock deadline,
+missing root, broken/cyclic/escaping symlinks, injected stat/read permission
+failures, mismatch and injected SSH failure. Delayed visibility succeeded after
+**5,093 ms**, **20 polls**, one exact-token read and one cleanup; the immediate
+case took **24 ms with zero polls**. Deadline expiry used an injected virtual
+Python clock and **120 polls**, retaining the explicit not-visible/cache cause.
+All cases checked cleanup and zero stranded probes. Cancellation cleanup is
+covered by the client suite. The earlier eight-case compatibility smoke remains
+historical; no live SSH, cluster operation or allocation ran for this fix.
+
+The user's separate controlled IBEX observation recorded the worker write closed
+at **2026-11-02T08:18:58.401795+00:00** and watcher first read at
+**08:19:03.576499+00:00**, a **5.174704-second** gap. This is consistent with
+rclone's default five-second writeback delay: the repository service uses full
+cache without a writeback override. The confirmed mapping stays
+`/data/shared/ibex` → `/ibex/user/engeld`; mount source `Ibex:weka_user/engeld`
+must not be translated into a different host path. This observation is not new
+live verification of the fix or proof of every earlier failure's cause.
+The existing user markers were retained; no mounts or deployment were changed.
 
 A further parent smoke called actual `runClusterAdd` twice, creating private
 local keys/drafts and using actual `verifySharedMappings` with local ordinary
