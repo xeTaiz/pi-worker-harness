@@ -182,9 +182,11 @@ Prompt/progress order:
    `/data/shared/<storage_id>`, then the exact existing cluster-host root.
    Explicit **“Add another filesystem mapping?”** repeats the two mapping
    fields until No. First mapping remains primary. Verify every mapping against
-   a participating WH worker and exact cluster path with a temporary random
-   identity probe and cleanup; unavailable worker/catalog permissions or probe/
-   cleanup failures block readiness, never produce “verified” evidence.
+   a participating WH worker and exact cluster path with a random identity probe;
+   unavailable worker/catalog permissions or probe failures block readiness,
+   never produce “verified” evidence. Verification leaves `.wh-probe-<uuid>`
+   files and their written payloads for inspection after success, failure and
+   cancellation. Cleanup is manual only; there is no automatic cleanup.
    Resolve and validate the existing root once, then read an already-visible
    probe immediately. Only `FileNotFoundError` from the probe's `os.lstat`
    existence check is transient: poll that same probe every 250 ms against a
@@ -194,8 +196,8 @@ Prompt/progress order:
    visibility retries. Expiry reports that the probe is not visible and a possible
    writeback cache delay; it does not infer an incorrect mapping or translate
    mount-source paths. This SSH call alone has a 45-second timeout, leaving room
-   for connection establishment and the visibility wait. Worker cleanup stays in
-   `finally`, after the read or failure, including cancellation.
+   for connection establishment and the visibility wait. Abort propagation and
+   candidate fallback remain unchanged.
    Initial blocked setup diagnostics and rejected review mapping edits retain
    the generic failure and bounded textual `SlurmClientError.evidence` cause
    (last 8192 characters after control filtering); never serialize raw transport
@@ -682,10 +684,20 @@ Widget should gracefully handle:
 
 ## Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test`: 485 passed, zero failures**, **3,805 assertions
-across 16 files, 8.09 seconds**, executed by the parent in the extension checkout.
-The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
-minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
+For the probe-retention change, the parent ran the full extension **`bun test`:
+485 passed, zero failures, 3,820 assertions across 16 files, 7.78 seconds**.
+A separate **six-case actual-verifier retention smoke passed**, executing physical
+ordinary-worker writes and real local Python reads: valid (two fresh UUID files),
+mismatch, missing root, a real 30-second visibility deadline (**30,119 ms**), SSH
+failure and cancellation. Expected written payloads remained intact in every case;
+**zero automatic cleanup jobs** ran. The driver removed only its private fixtures.
+No live SSH, cluster operation, allocation or existing-user-probe deletion ran.
+
+The proof results below are **historical**, predating persistent verification
+probes. Their cleanup observations are superseded by the manual-only contract.
+The prior Python 3.9 visibility proof was not rerun; emitted Python is unchanged.
+Earlier bootstrap (455 passed, 3,510 assertions, 4.98 seconds) and minimal-workflow
+(439 passed, 2,938 assertions, 3.93 seconds) suites are historical too.
 
 For rolling stderr retention compatibility, the parent ran a separate
 **seven-case process-boundary smoke: all passed**, using actual `sshTransport`
@@ -710,9 +722,9 @@ failures, mismatch and injected SSH failure. Delayed visibility succeeded after
 **5,093 ms**, **20 polls**, one exact-token read and one cleanup; the immediate
 case took **24 ms with zero polls**. Deadline expiry used an injected virtual
 Python clock and **120 polls**, retaining the explicit not-visible/cache cause.
-All cases checked cleanup and zero stranded probes. Cancellation cleanup is
-covered by the client suite. The earlier eight-case compatibility smoke remains
-historical; no live SSH, cluster operation or allocation ran for this fix.
+All cases then checked cleanup and zero stranded probes; cancellation cleanup was
+then covered by the client suite. The earlier eight-case compatibility smoke
+remains historical; no live SSH, cluster operation or allocation ran for that fix.
 
 The user's separate controlled IBEX observation recorded the worker write closed
 at **2026-11-02T08:18:58.401795+00:00** and watcher first read at
@@ -766,7 +778,7 @@ without altering production authorization. Slurm runtime assets were
 regenerated. Local integration proofs passed as recorded here; publication,
 deployment and real-cluster acceptance remain separate.
 
-The actual **multiple-filesystem smoke passed in 1.70 seconds**, exercising
+The historical **multiple-filesystem smoke passed in 1.70 seconds**, exercising
 real SlurmClient preflight/three identity probes and cleanup/staging through
 actual `wh-allocation.sh` → `start-wh.sh` → bwrap workload. Three binds/full
 manifest were observed; primary runtime staging stayed primary. Real Python

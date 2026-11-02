@@ -143,7 +143,7 @@ export interface SharedMappingVerificationOptions {
   signal?: AbortSignal;
 }
 
-/** Prove every mapping against an existing ordinary worker, without an allocation. */
+/** Prove every mapping without an allocation; retain probe files for manual inspection/cleanup. */
 export async function verifySharedMappings(connection: SshConnection, mappings: SharedRoot[], options: SharedMappingVerificationOptions = {}): Promise<void> {
   const workerApi = options.api ?? api, transport = options.transport ?? sshTransport;
   const ids = new Set<string>();
@@ -189,13 +189,6 @@ with open(probe) as handle: sys.stdout.write(handle.read(1024))
         if (remote !== contents) throw new Error("shared storage identity mismatch");
         verified = true;
       } catch (error) { lastError = error; }
-      finally {
-        // Cancellation must not strand a successfully written probe.
-        let removed: Job;
-        try { removed = await workerApi.startJob({ worker_id, command: `rm -f -- ${shellQuote(path)}`, name: "WH shared-storage probe cleanup", sync: true, sync_timeout: 30, no_pty: true }); }
-        catch (error) { throw new SlurmClientError("SHARED_PROBE_CLEANUP_FAILED", `ordinary worker could not remove shared probe for ${mapping.storage_id}`, undefined, String(error)); }
-        if (removed.status !== "done" || removed.exit_code !== 0) throw new SlurmClientError("SHARED_PROBE_CLEANUP_FAILED", `ordinary worker could not remove shared probe for ${mapping.storage_id}`);
-      }
       options.signal?.throwIfAborted();
       if (verified) break;
     }

@@ -88,7 +88,7 @@ async function fixture(kind: "gpu" | "cpu" = "gpu") {
     getAuthorizationHeaders: async () => ({ Authorization: "Bearer operator-test" }),
     listDataPaths: async () => ({ "/data/shared/shared": [{ worker_id: "ordinary-worker", worker_name: "ordinary" }] }),
     startJob: async (input) => {
-      calls.push(input.name?.includes("cleanup") ? "probe-cleanup" : "probe");
+      calls.push("probe");
       const match = input.command.match(/printf '%s' '([a-f0-9]+)'/);
       if (match) state.probe = match[1]!;
       return { id: "probe-job", worker_id: input.worker_id, status: "done", exit_code: 0 } as Job;
@@ -174,7 +174,6 @@ describe("finite local Slurm client", () => {
     expect(f.calls.indexOf("queue")).toBeGreaterThan(f.calls.indexOf("reserve"));
     expect(f.calls.indexOf("stage")).toBeGreaterThan(f.calls.indexOf("queue"));
     expect(f.calls.indexOf("submit")).toBeGreaterThan(f.calls.indexOf("stage"));
-    expect(f.calls).toContain("probe-cleanup");
     const flags = f.submissions[0]!.args;
     expect(flags).toContain("--nodes=1"); expect(flags).toContain("--ntasks=1");
     expect(flags).toContain("--cpus-per-task=8"); expect(flags).toContain("--mem=65536M");
@@ -392,8 +391,12 @@ test("real mapped project/environment preflight, all identity probes and staging
   expect(settings.shared_root).toBe(f.profile.shared_root);
   expect(settings.host_run_path).toBe(join(f.profile.shared_root, ".wh-slurm", f.workerId));
   expect(executed.filter((command) => command.startsWith("umask"))).toHaveLength(3);
-  expect(executed.filter((command) => command.startsWith("rm"))).toHaveLength(3);
-  for (const mapping of mappings) expect((await readdir(mapping.shared_root)).some((entry) => entry.startsWith(".wh-probe-"))).toBe(false);
+  expect(executed.filter((command) => command.startsWith("rm"))).toHaveLength(0);
+  for (const mapping of mappings) {
+    const probes = (await readdir(mapping.shared_root)).filter((entry) => entry.startsWith(".wh-probe-"));
+    expect(probes).toHaveLength(1);
+    expect(await readFile(join(mapping.shared_root, probes[0]!), "utf8")).toMatch(/^[a-f0-9]{64}$/);
+  }
   await symlink(f.profile.shared_root, join(f.root, "projects-store", "escape"));
   const previous = f.reservations.length;
   await expect(client.enqueueCluster(f.profile, { ...input, submission_key: "extra-project-escape", slurm: { ...input.slurm, project_path: "/data/shared/projects/escape" } }, f.context)).rejects.toThrow("resolved path escapes shared storage");
@@ -406,21 +409,24 @@ test("real mapped project/environment preflight, all identity probes and staging
 });
 
 for (const unsafe of ["missing", "missing-root", "broken", "cyclic", "escape", "permission", "stat-permission", "mismatch"] as const) {
-  test(`actual shared identity probe rejects ${unsafe} paths and cleans the worker probe`, async () => {
+  test(`actual shared identity probe rejects ${unsafe} paths and retains the worker payload`, async () => {
     const f = await fixture();
+    const workerRoot = join(f.root, "ordinary-worker");
+    await mkdir(workerRoot);
     if (unsafe !== "missing-root") await mkdir(f.profile.shared_root, { recursive: true });
     const shim = await probePythonShim(f.root, unsafe === "missing" ? "clock" : unsafe === "permission" || unsafe === "stat-permission" ? unsafe : "immediate");
     let transports = 0;
-    const cleaned: string[] = [];
+    let workerProbe = "";
     await expect(verifySharedMappings(f.profile, sharedRoots(f.profile), {
       api: {
         listDataPaths: f.fakeApi.listDataPaths!,
         startJob: async (input) => {
           const result = await f.fakeApi.startJob!(input);
           const name = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
+          workerProbe = join(workerRoot, name);
+          await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
           const probe = join(f.profile.shared_root, name);
-          if (input.name?.includes("cleanup")) { cleaned.push(probe); await rm(probe, { force: true }); }
-          else if (unsafe === "broken") await symlink(join(f.root, "missing-target"), probe);
+          if (unsafe === "broken") await symlink(join(f.root, "missing-target"), probe);
           else if (unsafe === "cyclic") await symlink(name, probe);
           else if (unsafe === "escape") {
             await writeFile(join(f.root, "outside-probe"), f.state.probe);
@@ -444,44 +450,36 @@ for (const unsafe of ["missing", "missing-root", "broken", "cyclic", "escape", "
         unsafe === "stat-permission" ? /PermissionError: probe stat denied by filesystem/ :
         unsafe === "mismatch" ? /shared storage identity mismatch/ : /FileNotFoundError|RuntimeError|OSError/),
     });
-    expect(cleaned).toHaveLength(1);
+    expect(await readFile(workerProbe, "utf8")).toBe(f.state.probe);
+    expect(f.calls).toEqual(["probe"]);
     expect(transports).toBe(1);
     const events = (await readFile(shim.events, "utf8")).trim().split("\n");
     const sleeps = events.filter((event) => event.startsWith("sleep:"));
     expect(sleeps).toHaveLength(unsafe === "missing" ? 120 : 0);
     if (unsafe === "missing") expect(sleeps.every((event) => event === "sleep:0.25")).toBe(true);
     expect(events.filter((event) => event === "read")).toHaveLength(unsafe === "permission" || unsafe === "mismatch" ? 1 : 0);
-    if (unsafe !== "missing-root") expect((await readdir(f.profile.shared_root)).some((entry) => entry.startsWith(".wh-probe-"))).toBe(false);
   });
 }
 
 for (const delayed of [false, true]) {
-  test(`actual shared probe ${delayed ? "waits for delayed visibility" : "reads immediately without sleeping"} before worker cleanup`, async () => {
+  test(`actual shared probe ${delayed ? "waits for delayed visibility" : "reads immediately without sleeping"} and retains both copies`, async () => {
     const f = await fixture(), workerRoot = join(f.root, "ordinary-worker");
     await mkdir(workerRoot);
     await mkdir(f.profile.shared_root);
     const shim = await probePythonShim(f.root, delayed ? "publish" : "immediate", workerRoot);
     const events: string[] = [];
-    let token = "";
+    let token = "", probeName = "";
     await verifySharedMappings(f.profile, sharedRoots(f.profile), {
       api: {
         listDataPaths: f.fakeApi.listDataPaths!,
         startJob: async (input) => {
-          const name = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
-          const workerProbe = join(workerRoot, name), clusterProbe = join(f.profile.shared_root, name);
-          if (input.name?.includes("cleanup")) {
-            expect(events).toEqual(["written", "read"]);
-            expect(await readFile(workerProbe, "utf8")).toBe(token);
-            events.push("cleanup");
-            await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
-            await rm(clusterProbe);
-          } else {
-            await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
-            token = await readFile(workerProbe, "utf8");
-            expect(token).toMatch(/^[a-f0-9]{64}$/);
-            events.push("written");
-            if (!delayed) await writeFile(clusterProbe, token);
-          }
+          probeName = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
+          const workerProbe = join(workerRoot, probeName), clusterProbe = join(f.profile.shared_root, probeName);
+          await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
+          token = await readFile(workerProbe, "utf8");
+          expect(token).toMatch(/^[a-f0-9]{64}$/);
+          events.push("written");
+          if (!delayed) await writeFile(clusterProbe, token);
           return { id: "local-probe", worker_id: input.worker_id, status: "done", exit_code: 0 } as Job;
         },
       },
@@ -495,27 +493,30 @@ for (const delayed of [false, true]) {
     });
     const pythonEvents = (await readFile(shim.events, "utf8")).trim().split("\n");
     expect(pythonEvents).toEqual(delayed ? ["started", "sleep:0.25", "published", "read"] : ["started", "read"]);
-    expect(events).toEqual(["written", "read", "cleanup"]);
-    expect(await readdir(workerRoot)).toEqual([]);
-    expect(await readdir(f.profile.shared_root)).toEqual([]);
+    expect(events).toEqual(["written", "read"]);
+    expect(await readdir(workerRoot)).toEqual([probeName]);
+    expect(await readdir(f.profile.shared_root)).toEqual([probeName]);
+    expect(await readFile(join(workerRoot, probeName), "utf8")).toBe(token);
+    expect(await readFile(join(f.profile.shared_root, probeName), "utf8")).toBe(token);
   });
 }
 
-test("cancelling the actual Python visibility wait still cleans the ordinary worker probe", async () => {
+test("cancelling the actual Python visibility wait retains the ordinary worker payload", async () => {
   const f = await fixture(), controller = new AbortController();
   const workerRoot = join(f.root, "ordinary-worker");
   await mkdir(workerRoot);
   await mkdir(f.profile.shared_root);
   const shim = await probePythonShim(f.root, "observe");
   const reason = new Error("operator cancelled visibility wait");
-  let cleanups = 0;
+  let probeName = "", token = "";
   await expect(verifySharedMappings(f.profile, sharedRoots(f.profile), {
     signal: controller.signal,
     api: {
       listDataPaths: f.fakeApi.listDataPaths!,
       startJob: async (input) => {
+        probeName = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
         await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
-        if (input.name?.includes("cleanup")) cleanups++;
+        token = await readFile(join(workerRoot, probeName), "utf8");
         return { id: "local-probe", worker_id: input.worker_id, status: "done", exit_code: 0 } as Job;
       },
     },
@@ -541,20 +542,34 @@ test("cancelling the actual Python visibility wait still cleans the ordinary wor
       }
     },
   })).rejects.toBe(reason);
-  expect(cleanups).toBe(1);
-  expect(await readdir(workerRoot)).toEqual([]);
+  expect(token).toMatch(/^[a-f0-9]{64}$/);
+  expect(await readdir(workerRoot)).toEqual([probeName]);
+  expect(await readFile(join(workerRoot, probeName), "utf8")).toBe(token);
   expect(await readdir(f.profile.shared_root)).toEqual([]);
 });
 
-test("shared probe SSH failure is not retried and still cleans the worker probe", async () => {
+test("shared probe SSH failure is not retried and retains the ordinary worker payload", async () => {
   const f = await fixture();
+  const workerRoot = join(f.root, "ordinary-worker");
+  await mkdir(workerRoot);
+  let probeName = "";
   let transports = 0;
   await expect(verifySharedMappings(f.profile, sharedRoots(f.profile), {
-    api: f.fakeApi as Pick<ClientApi, "listDataPaths" | "startJob">,
+    api: {
+      listDataPaths: f.fakeApi.listDataPaths!,
+      startJob: async (input) => {
+        const result = await f.fakeApi.startJob!(input);
+        probeName = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
+        await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
+        return result;
+      },
+    },
     transport: async () => { transports++; throw new Error("SSH disconnected"); },
   })).rejects.toMatchObject({ code: "SHARED_STORAGE_NOT_VERIFIED", evidence: expect.stringContaining("SSH disconnected") });
   expect(transports).toBe(1);
-  expect(f.calls.filter((call) => call === "probe-cleanup")).toHaveLength(1);
+  expect(f.calls).toEqual(["probe"]);
+  expect(await readdir(workerRoot)).toEqual([probeName]);
+  expect(await readFile(join(workerRoot, probeName), "utf8")).toBe(f.state.probe);
 });
 
 for (const unsafe of ["missing", "broken", "cyclic"] as const) {
@@ -572,23 +587,20 @@ for (const unsafe of ["missing", "broken", "cyclic"] as const) {
   });
 }
 
-test("additional mapping identity mismatch is not verified and its worker probe is cleaned before refusal", async () => {
+test("additional mapping identity mismatch prevents reservation and submission", async () => {
   const f = await fixture();
   f.profile.additional_shared_roots = [{ storage_id: "archive", shared_root: "/different/archive" }];
-  const commands: string[] = [];
   const client = new SlurmClient({ api: {
     ...f.fakeApi,
     listDataPaths: async () => ({
       "/data/shared/shared": [{ worker_id: "ordinary-worker", worker_name: "ordinary" }],
       "/data/shared/archive": [{ worker_id: "archive-worker", worker_name: "archive" }],
     }),
-    startJob: async (input) => { commands.push(input.command); return f.fakeApi.startJob!(input); },
   }, env: f.env, transport: async (p, script, stdin, options) => {
     if (script.includes("# wh:shared-probe") && script.includes("/different/archive/")) return "different filesystem";
     return f.transport(p, script, stdin, options);
   } });
   await expect(client.enqueueCluster(f.profile, f.input, f.context)).rejects.toMatchObject({ code: "SHARED_STORAGE_NOT_VERIFIED" });
-  expect(commands.filter((command) => command.startsWith("rm") && command.includes("/data/shared/archive/"))).toHaveLength(1);
   expect(f.reservations).toHaveLength(0);
   expect(f.submissions).toHaveLength(0);
 });
@@ -723,14 +735,16 @@ test("SSH probe stdout budget does not hide a larger real Python traceback or ex
 });
 
 for (const mode of ["banner", "fragmented-banner", "traceback", "stdout-noise", "stdout-prefix"] as const) {
-  test(`shared mapping verifier uses production SSH with ${mode} and always cleans the actual probe`, async () => {
+  test(`shared mapping verifier uses production SSH with ${mode} and retains the actual worker payload`, async () => {
     const f = await fixture();
     await mkdir(f.profile.shared_root);
+    const workerRoot = join(f.root, "ordinary-worker");
+    await mkdir(workerRoot);
     const shim = mode === "traceback" ? await probePythonShim(f.root, "clock") : undefined;
     const prelude = verboseStderr(mode === "fragmented-banner" ? "fragmented" : "huge-chunk") +
       (mode === "stdout-noise" ? "sys.stdout.write('private-stdout-noise' * 100)\nsys.stdout.flush()\n" :
         mode === "stdout-prefix" ? "sys.stdout.write('unexpected-prefix')\nsys.stdout.flush()\n" : "");
-    let cleanups = 0;
+    let probeName = "";
     const environment = shim ? `import os\nos.environ['PYTHONPATH']=${JSON.stringify(shim.env.PYTHONPATH)}\n` : "";
     await withFakeSsh(f.root, prelude + environment + executeSshCommand, async () => {
       const verification = verifySharedMappings(f.profile, sharedRoots(f.profile), {
@@ -738,9 +752,9 @@ for (const mode of ["banner", "fragmented-banner", "traceback", "stdout-noise", 
           listDataPaths: f.fakeApi.listDataPaths!,
           startJob: async (input) => {
             const result = await f.fakeApi.startJob!(input);
-            const probe = join(f.profile.shared_root, input.command.match(/\.wh-probe-[a-f0-9-]+/)![0]);
-            if (input.name?.includes("cleanup")) { cleanups++; await rm(probe, { force: true }); }
-            else if (mode !== "traceback") await writeFile(probe, f.state.probe);
+            probeName = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
+            await runRemoteScript(input.command.replaceAll("/data/shared/shared", workerRoot));
+            if (mode !== "traceback") await writeFile(join(f.profile.shared_root, probeName), f.state.probe);
             return result;
           },
         },
@@ -755,8 +769,10 @@ for (const mode of ["banner", "fragmented-banner", "traceback", "stdout-noise", 
         expect(error.evidence).not.toContain("private-stdout-noise");
         expect(error.evidence).not.toContain("unexpected-prefix");
       }
-      expect(cleanups).toBe(1);
-      expect(await readdir(f.profile.shared_root)).toEqual([]);
+      expect(f.calls).toEqual(["probe"]);
+      expect(await readdir(workerRoot)).toEqual([probeName]);
+      expect(await readFile(join(workerRoot, probeName), "utf8")).toBe(f.state.probe);
+      expect(await readdir(f.profile.shared_root)).toEqual(mode === "traceback" ? [] : [probeName]);
     });
   });
 }

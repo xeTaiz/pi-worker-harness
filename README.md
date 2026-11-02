@@ -215,8 +215,10 @@ submits an allocation, deploys a server, or installs software remotely.
 4. After SSH works, select a WH shared path from `list_data` or type
    `/data/shared/<storage_id>`, then its existing cluster-host root. The explicit
    **“Add another filesystem mapping?”** loop repeats those same two fields.
-   The first mapping stays primary. Every mapping requires a temporary
-   random backing-identity probe against a participating WH worker and cleanup.
+   The first mapping stays primary. Every mapping requires a random
+   backing-identity probe against a participating WH worker. Verification leaves
+   `.wh-probe-<uuid>` files and their written payloads for inspection after success,
+   failure or cancellation. Cleanup is manual only; no automatic cleanup runs.
    The verifier validates the existing root once and reads visible probes
    immediately. Only an absent probe directory entry (`os.lstat` raising
    `FileNotFoundError`) is polled every 250 ms for up to 30 monotonic seconds,
@@ -225,7 +227,7 @@ submits an allocation, deploys a server, or installs software remotely.
    dangling/cyclic or escaping symlinks, permission/read errors, mismatches and
    SSH failures do not enter that retry loop. Expiry explicitly reports that the
    probe is not visible and possible writeback caching. Only this SSH call gets
-   a 45-second timeout; cleanup remains in `finally`, including cancellation.
+   a 45-second timeout; abort propagation and candidate fallback are unchanged.
    Initial failures save a blocked draft with bounded textual verifier evidence
    (for example, the remote Python exception), not raw transport or credential
    payloads. Failed mapping changes in **Edit review** show the same evidence
@@ -298,7 +300,7 @@ Missing runtime/image/credentials or deployed control routes save a blocked
 resumable draft, **not a fake ready profile**. The live production OpenAPI is
 reachable (HTTP 200) but currently lacks reservation, Slurm-update and
 job-events routes: deploy the matching server before enqueue.
-Unavailable WH worker/catalog permissions or any mapping probe/cleanup failure
+Unavailable WH worker/catalog permissions or any mapping probe failure
 also block the retained draft; none may be reported as verified storage.
 
 All onboarded clusters share **one** managed login identity:
@@ -548,12 +550,23 @@ Key bindings:
 
 ### Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test` passed: 485 tests, zero failures**, **3,805
-assertions/16 files, 8.09 seconds**, run by the parent in the extension checkout.
-The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
-minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
+For the probe-retention change, the parent ran the full extension **`bun test`:
+485 passed, zero failures, 3,820 assertions across 16 files, 7.78 seconds**.
+A separate **six-case actual-verifier retention smoke passed** with physical
+ordinary-worker writes and real local Python reads: valid (two fresh UUID files),
+mismatch, missing root, a real 30-second visibility deadline (**30,119 ms**), SSH
+failure and cancellation. Written payloads remained intact in every case, with
+**zero automatic cleanup jobs**. The driver removed only its private fixtures.
+No live SSH, cluster operation, allocation or existing-user-probe deletion ran.
 
-For rolling stderr retention compatibility, a separate parent-run
+The proof results below are **historical**, predating persistent verification
+probes. Their cleanup observations are superseded by the current manual-only
+cleanup contract. The prior Python 3.9 visibility proof was not rerun; its emitted
+Python code is unchanged. Earlier bootstrap (455 passed, 3,510 assertions,
+4.98 seconds) and minimal-workflow (439 passed, 2,938 assertions, 3.93 seconds)
+suites are historical too.
+
+For rolling stderr retention compatibility, a separate historical parent-run
 **seven-case process-boundary smoke passed all cases**, using actual
 `sshTransport` and production `verifySharedMappings` with a private local
 fake-SSH executable. Huge-chunk and fragmented >8 KiB stderr both accepted the
@@ -577,7 +590,7 @@ The immediate case took **24 ms with zero polls**. Deadline expiry used an
 injected virtual Python clock (**120 polls**, explicit visibility/cache cause);
 stat/read permission failures and SSH failure were injected boundaries, while
 missing-root, broken/cyclic/escaping symlink and mismatch cases used local files.
-Every case checked cleanup. Cancellation cleanup is covered by the client suite.
+Every case then checked cleanup; cancellation cleanup was then covered by the suite.
 The earlier eight-case Python compatibility smoke remains historical.
 
 Separately, the user's controlled IBEX observation recorded a worker write closed
@@ -632,7 +645,7 @@ without weakening production authorization. Packaged Slurm runtime assets
 were regenerated. Local integration proofs passed as recorded here;
 publication/deployment and real-cluster acceptance remain separate.
 
-The actual **multiple-filesystem smoke passed in 1.70 seconds**: real
+The historical **multiple-filesystem smoke passed in 1.70 seconds**: real
 SlurmClient preflight/three identity probes with cleanup/staging and actual
 `wh-allocation.sh` → `start-wh.sh` → bwrap workload. All three binds/manifest
 entries worked; staging stayed primary. Real Python project/import/input ran

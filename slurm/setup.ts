@@ -599,7 +599,7 @@ export async function runClusterAdd(ui: SetupUI, publish: (content: string) => v
     }
     draft.phase = "mappings";
     await saveDraft(draft, env);
-    ui.notify("Verifying shared filesystem identities using temporary probes and cleanup; no Slurm allocation.", "info");
+    ui.notify("Verifying shared filesystem identities; probe files remain for inspection and manual cleanup only. No Slurm allocation.", "info");
     try {
       await (options.verifyMappings ?? verifySharedMappings)(draft.ssh, draft.mappings, { transport, signal });
     } catch (error) {
