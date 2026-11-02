@@ -2,12 +2,22 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SlurmClient, SlurmClientError, shellQuote, sshTransport, workloadCommand, type ClientApi, type ClusterEnqueueInput, type SlurmTransport } from "./client.ts";
+import { SlurmClient, SlurmClientError, shellQuote, sshTransport, verifySharedMappings, workloadCommand, type ClientApi, type ClusterEnqueueInput, type SlurmTransport } from "./client.ts";
 import { DEFAULT_ALLOCATION_WALLTIME_SECONDS, sharedRoots, type ClusterProfile } from "./profiles.ts";
 import type { Job, QueuedJob, SlurmObservation, SlurmReservationRequest, Worker, WorkerDetail } from "../types.ts";
 
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+
+/** Run the actual emitted scripts locally; point WH_TEST_PYTHON at Python 3.9 for compatibility coverage. */
+async function runRemoteScript(script: string, stdin = "") {
+  const python = process.env.WH_TEST_PYTHON;
+  const command = python ? script.replace(/\bpython3 -c /g, `${shellQuote(python)} -c `) : script;
+  const child = Bun.spawn(["bash", "-c", command], { stdin: new Blob([stdin]), stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  if (code) throw new Error(stderr);
+  return stdout;
+}
 
 async function fixture(kind: "gpu" | "cpu" = "gpu") {
   const root = await mkdtemp(join(tmpdir(), "wh-client-test-"));
@@ -279,10 +289,7 @@ test("shared path preflight resolves symlinks before persisting cwd and refuses 
   await symlink(join(f.profile.shared_root, "projects", "real"), join(f.profile.shared_root, "projects", "project"));
   const transport: SlurmTransport = async (p, script, stdin, opts) => {
     if (!script.includes("# wh:path-preflight")) return f.transport(p, script, stdin, opts);
-    const process = Bun.spawn(["bash", "-c", script], { stdin: new Blob([stdin ?? ""]), stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, code] = await Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited]);
-    if (code) throw new Error(stderr);
-    return stdout;
+    return runRemoteScript(script, stdin);
   };
   const client = new SlurmClient({ api: f.fakeApi, env: f.env, transport });
   const input = { ...f.input, slurm: { project_path: f.input.slurm.project_path, walltime_seconds: 600 } };
@@ -296,6 +303,12 @@ test("shared path preflight resolves symlinks before persisting cwd and refuses 
   await mkdir(join(f.profile.shared_root, "env"));
   await symlink(join(f.root, "outside"), join(f.profile.shared_root, "env", "bin"));
   await expect(client.enqueueCluster(f.profile, { ...input, submission_key: "env-escape", slurm: { ...input.slurm, environment_path: "/data/shared/shared/env" } }, f.context)).rejects.toThrow("resolved path escapes shared storage");
+  expect(f.reservations).toHaveLength(previous);
+  await symlink(join(f.profile.shared_root, "missing-target"), join(f.profile.shared_root, "projects", "broken"));
+  await symlink("cyclic", join(f.profile.shared_root, "projects", "cyclic"));
+  for (const name of ["missing", "broken", "cyclic"]) {
+    await expect(client.enqueueCluster(f.profile, { ...input, submission_key: name, slurm: { ...input.slurm, project_path: `/data/shared/shared/projects/${name}` } }, f.context)).rejects.toThrow(/FileNotFoundError|RuntimeError|OSError/);
+  }
   expect(f.reservations).toHaveLength(previous);
 });
 
@@ -313,12 +326,7 @@ test("real mapped project/environment preflight, all identity probes and staging
   await writeFile(f.profile.sif_path, "image");
   await writeFile(join(f.root, "projects-store", "real", "uv.lock"), "lock");
   const executed: string[] = [];
-  const run = async (script: string, stdin = "") => {
-    const process = Bun.spawn(["bash", "-c", script], { stdin: new Blob([stdin]), stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, code] = await Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited]);
-    if (code) throw new Error(stderr);
-    return stdout;
-  };
+  const run = runRemoteScript;
   const transport: SlurmTransport = async (p, script, stdin, options) => {
     if (["# wh:path-preflight", "# wh:shared-probe", "# wh:stage"].some((marker) => script.includes(marker))) return run(script, stdin);
     return f.transport(p, script, stdin, options);
@@ -355,6 +363,53 @@ test("real mapped project/environment preflight, all identity probes and staging
   await expect(client.enqueueCluster(f.profile, { ...input, submission_key: "extra-bin-escape" }, f.context)).rejects.toThrow("resolved path escapes shared storage");
   expect(f.reservations).toHaveLength(previous);
 });
+
+for (const unsafe of ["missing", "broken", "cyclic", "escape"] as const) {
+  test(`actual shared identity probe rejects ${unsafe} paths and cleans the worker probe`, async () => {
+    const f = await fixture();
+    await mkdir(f.profile.shared_root, { recursive: true });
+    const cleaned: string[] = [];
+    await expect(verifySharedMappings(f.profile, sharedRoots(f.profile), {
+      api: {
+        listDataPaths: f.fakeApi.listDataPaths!,
+        startJob: async (input) => {
+          const result = await f.fakeApi.startJob!(input);
+          const name = input.command.match(/\.wh-probe-[a-f0-9-]+/)![0];
+          const probe = join(f.profile.shared_root, name);
+          if (input.name?.includes("cleanup")) { cleaned.push(probe); await rm(probe, { force: true }); }
+          else if (unsafe === "broken") await symlink(join(f.root, "missing-target"), probe);
+          else if (unsafe === "cyclic") await symlink(name, probe);
+          else if (unsafe === "escape") {
+            await writeFile(join(f.root, "outside-probe"), f.state.probe);
+            await symlink(join(f.root, "outside-probe"), probe);
+          }
+          return result;
+        },
+      },
+      transport: async (_connection, script, stdin) => runRemoteScript(script, stdin),
+    })).rejects.toMatchObject({
+      code: "SHARED_STORAGE_NOT_VERIFIED",
+      evidence: expect.stringMatching(unsafe === "escape" ? /resolved probe escapes shared storage/ : /FileNotFoundError|RuntimeError|OSError/),
+    });
+    expect(cleaned).toHaveLength(1);
+    expect((await readdir(f.profile.shared_root)).some((entry) => entry.startsWith(".wh-probe-"))).toBe(false);
+  });
+}
+
+for (const unsafe of ["missing", "broken", "cyclic"] as const) {
+  test(`actual staging refuses a ${unsafe} shared root before creating run assets`, async () => {
+    const f = await fixture();
+    if (unsafe === "broken") await symlink(join(f.root, "missing-target"), f.profile.shared_root);
+    if (unsafe === "cyclic") await symlink("shared", f.profile.shared_root);
+    const client = new SlurmClient({ api: f.fakeApi, env: f.env, transport: async (p, script, stdin, options) => {
+      if (script.includes("# wh:stage")) return runRemoteScript(script, stdin);
+      return f.transport(p, script, stdin, options);
+    } });
+    await expect(client.enqueueCluster(f.profile, f.input, f.context)).rejects.toThrow(/FileNotFoundError|RuntimeError|OSError/);
+    expect(f.submissions).toHaveLength(0);
+    expect(await readdir(f.root)).not.toContain(".wh-slurm");
+  });
+}
 
 test("additional mapping identity mismatch is not verified and its worker probe is cleaned before refusal", async () => {
   const f = await fixture();

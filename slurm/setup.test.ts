@@ -6,6 +6,7 @@ import { loadClusterProfiles, type ClusterProfile, type Environment } from "./pr
 import { buildDiscoveredProfiles, commitSetupProfiles, discoveredTargetId, inspectSystemSshConfig, runClusterAdd, runClusterSshMigrate, type SetupDraft, type SetupOptions, type SetupUI } from "./setup.ts";
 import type { DiscoveryResult, DiscoveryTarget } from "./discovery.ts";
 import { defaultRegistrationHost } from "./setup-integration.ts";
+import { SlurmClientError } from "./client.ts";
 
 let root: string;
 let home: string;
@@ -845,6 +846,30 @@ test("failed mapping verification blocks before discovery/readiness with mapping
   expect(await loadClusterProfiles(env)).toEqual([]);
   expect((await drafts())[0]).toMatchObject({ phase: "blocked", mappings: [{ storage_id: "research-storage", shared_root: "/cluster/research group" }] });
 });
+
+for (const evidence of ["SSH_COMMAND_FAILED: TypeError: realpath() got an unexpected keyword argument 'strict'", { stdout: enrollmentSecret, stdin: "private staged payload", registration_token: enrollmentSecret }]) {
+  test(`mapping failure publishes only textual verifier evidence (${typeof evidence})`, async () => {
+    const ui = new WizardUI(`mapping-evidence-${typeof evidence}`, { setup: {
+      verifyMappings: async () => { throw new SlurmClientError("SHARED_STORAGE_NOT_VERIFIED", "no participating worker proved shared storage", undefined, evidence); },
+    } });
+    expect(await ui.pauseAndResume()).toBeUndefined();
+    ui.expectScriptUsed();
+    const published = ui.published.join("\n");
+    const saved = (await drafts())[0]!;
+    expect(published).toContain("Filesystem identity verification failed: SHARED_STORAGE_NOT_VERIFIED");
+    if (typeof evidence === "string") {
+      expect(published).toContain(`Verifier evidence: ${evidence}`);
+      expect(saved.blockers).toContain(`Verifier evidence: ${evidence}`);
+    } else {
+      expect(published).not.toContain("Verifier evidence:");
+      expect(JSON.stringify(saved)).not.toContain(enrollmentSecret);
+      expect(published).not.toContain("private staged payload");
+    }
+    expect(published).not.toContain(enrollmentSecret);
+    expect(saved.phase).toBe("blocked");
+    expect(await loadClusterProfiles(env)).toEqual([]);
+  });
+}
 
 for (const stage of ["mapping", "mapping-loop", "runtime-editor", "image-input", "review-escape", "review-save", "advanced", "edit-review", "final-confirm"] as const) {
   test(`cancellation at ${stage} retains honest resumable state with no targets`, async () => {

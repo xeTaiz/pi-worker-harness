@@ -166,6 +166,10 @@ escapes (including environment `bin`) are rejected. The actual queued command
 persists cwd/environment, not only the batch shell. Every mapping is identity
 checked against a participating WH worker and bound into the allocation; the
 first/primary mapping alone remains the `.wh-slurm` run/settings/batch root.
+Cluster-host filesystem probes, path preflight and staging support Python **3.9+**.
+They use `pathlib.Path.resolve(strict=True)` (not the Python-3.10+
+`os.path.realpath(..., strict=True)` keyword): missing paths, broken/cyclic
+symlinks and permission errors fail closed before containment checks.
 
 Prepare source/data and uv environments through ordinary transfer/exec or a CPU
 target's enqueue. Use the common SIF and shared storage, not copied virtualenvs or
@@ -213,6 +217,8 @@ submits an allocation, deploys a server, or installs software remotely.
    **“Add another filesystem mapping?”** loop repeats those same two fields.
    The first mapping stays primary. Every mapping requires a temporary
    random backing-identity probe against a participating WH worker and cleanup.
+   A blocked identity check includes bounded textual verifier evidence (for
+   example, the remote Python exception), not raw transport or credential payloads.
 5. Bounded read-only discovery inspects Slurm inventory/limits, account/default/
    QoS evidence, runtime/version and compatible SIF labels. No allocation,
    recursive scan or login-node container execution occurs.
@@ -424,8 +430,8 @@ trust yet; that is not setup completion.
 The historical native suite passed **361 tests, zero failures**, 2,764
 expectations/14 files (2.19 seconds); actual **OMP 18.14.2 shared-SSH
 onboarding/migration smoke passed** in 32.39 seconds. These are historical,
-not the new minimal-flow proof. Current proof below passed with 439 Bun tests,
-339 isolated root tests, actual OMP 32.13s and multiple-filesystem smoke 1.70s.
+not the latest proof. Current evidence below includes 464 Bun tests,
+339 isolated root tests, local Python 3.9 compatibility and prior OMP/runtime proofs.
 Publication, deployment and real login/cluster/charged acceptance remain separate.
 
 ## Tools
@@ -516,12 +522,28 @@ Key bindings:
 
 ## Notes from validation
 
-### Current integration evidence (2026-11-01)
+### Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test` passed: 455 tests, zero failures**, **3,510
-assertions/16 files, 4.98 seconds**, run by the parent in the extension checkout.
-The earlier minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds)
-is historical evidence, not the current bootstrap build.
+Current extension **`bun test` passed: 464 tests, zero failures**, **3,564
+assertions/16 files, 6.30 seconds**, run by the parent in the extension checkout.
+The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
+minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
+
+For the Python 3.9 fix, the parent ran **`WH_TEST_PYTHON=<python3.9> bun test
+slurm/client.test.ts`: 29 passed, zero failures, 209 assertions, 1.264 seconds**
+with a SHA256-verified temporary portable **Python 3.9.23** interpreter. These
+tests execute emitted filesystem probe, path-preflight and staging scripts.
+A separate actual-verifier local smoke passed **all eight cases**: valid root,
+root symlink alias, missing root, broken probe symlink, cyclic probe symlink,
+escaping probe symlink, content mismatch and permission denied; probe cleanup
+was checked in every case. No live SSH, cluster operation or allocation was used.
+
+An additional parent smoke invoked actual `runClusterAdd` twice with private
+local key/draft creation, actual `verifySharedMappings` and a Python 3.9 emitted
+read against a nonexistent root. Published blocked text and the persisted draft
+both retained the underlying `FileNotFoundError`; the worker probe was cleaned,
+and discovery/readiness/registration were not reached. This exercises setup API
+terminal output, not a new native-OMP or visual-GUI proof.
 
 The parent's **actual OMP 18.14.2/native-PTY plus private local OpenSSH bootstrap
 proof passed in 14.29 seconds**, using normal linked-plugin discovery and the

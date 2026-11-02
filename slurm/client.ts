@@ -146,9 +146,10 @@ export async function verifySharedMappings(connection: SshConnection, mappings: 
         if (written.status !== "done" || written.exit_code !== 0) throw new Error("ordinary probe job did not complete successfully");
         const remote = await transport(connection, "# wh:shared-probe\n" + py(String.raw`
 import os,sys
-root=os.path.realpath(sys.argv[1],strict=True)
+from pathlib import Path
+root=str(Path(sys.argv[1]).resolve(strict=True))
 if root=='/' or not os.path.isdir(root) or any(c in ':;,' or ord(c)<32 or ord(c)==127 for c in root): raise ValueError('invalid resolved shared root')
-probe=os.path.realpath(sys.argv[2],strict=True)
+probe=str(Path(sys.argv[2]).resolve(strict=True))
 if os.path.commonpath([root,probe])!=root: raise ValueError('resolved probe escapes shared storage')
 with open(probe) as handle: sys.stdout.write(handle.read(1024))
 `, [mapping.shared_root, mapping.shared_root + "/" + probe]), undefined, { max_bytes: 1024, signal: options.signal });
@@ -172,16 +173,17 @@ with open(probe) as handle: sys.stdout.write(handle.read(1024))
 const PATH_PREFLIGHT = String.raw`
 # wh:path-preflight
 import hashlib,json,os,sys
+from pathlib import Path
 p=json.load(sys.stdin)
 roots={}
 for mapping in p['mappings']:
- root=os.path.realpath(mapping['shared_root'],strict=True)
+ root=str(Path(mapping['shared_root']).resolve(strict=True))
  if not os.path.isdir(root) or root=='/' or any(c in ':;,' or ord(c)<32 or ord(c)==127 for c in root): raise ValueError('invalid resolved shared root')
  if mapping['storage_id'] in roots: raise ValueError('duplicate storage ID')
  roots[mapping['storage_id']]=root
 def inside(selection,path=None):
  root=roots[selection['storage_id']]
- r=os.path.realpath(path or selection['host_path'],strict=True)
+ r=str(Path(path or selection['host_path']).resolve(strict=True))
  if os.path.commonpath([root,r])!=root: raise ValueError('resolved path escapes shared storage')
  return r
 def container(selection,r):
@@ -201,7 +203,8 @@ print(json.dumps(dict(project_path=container(p['project'],project),environment_p
 const STAGE = String.raw`
 # wh:stage
 import json,os,sys
-p=json.load(sys.stdin); root=os.path.realpath(p['shared_root'],strict=True)
+from pathlib import Path
+p=json.load(sys.stdin); root=str(Path(p['shared_root']).resolve(strict=True))
 base=os.path.join(root,'.wh-slurm'); os.makedirs(base,mode=0o700,exist_ok=True)
 if os.path.islink(base): raise ValueError('symlink run root forbidden')
 os.chmod(base,0o700); run=os.path.join(base,p['worker_id'])

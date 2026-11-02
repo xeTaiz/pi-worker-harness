@@ -137,6 +137,11 @@ original command. Bind every mapping through `WH_SHARED_ROOTS_JSON`; keep
 run/settings/batch staging under the first/primary root's `.wh-slurm`.
 Reserve OFFLINE, queue the confirmed initial task, then finite sbatch:
 there is no idle submission, prepare/submit action, or self-chaining successor.
+Cluster-host Python scripts support Python 3.9+. Resolve existing roots/probes,
+project/environment paths and staging roots with `pathlib.Path.resolve(strict=True)`;
+do not use the Python-3.10+ `os.path.realpath` strict keyword or non-strict fallback.
+Missing paths, broken/cyclic symlinks and permission errors must fail closed;
+retain selected-root containment checks after canonical resolution.
 
 Ordinary worker IDs keep existing execution behavior. Cluster IDs are rejected
 for exec/file/tunnel/Marimo operations with `CLUSTER_REQUIRES_ENQUEUE`.
@@ -179,6 +184,9 @@ Prompt/progress order:
    a participating WH worker and exact cluster path with a temporary random
    identity probe and cleanup; unavailable worker/catalog permissions or probe/
    cleanup failures block readiness, never produce “verified” evidence.
+   Blocked setup diagnostics retain the generic failure and bounded textual
+   `SlurmClientError.evidence` cause; never serialize raw transport stdout,
+   staging payloads or credential objects into the screen or saved blockers.
 5. Bounded read-only SSH discovery inspects Slurm inventory/partition limits,
    account/default/QoS evidence, runtime/version and static SIF capability.
    No allocations, recursive filesystem scans or login-node container execution.
@@ -387,9 +395,9 @@ trust still means onboarding has not completed.
 The historical native suite passed **361 tests, zero failures**, 2,764
 expectations/14 files (2.19 seconds); actual **OMP 18.14.2 shared-SSH/migration
 smoke passed in 32.39 seconds**. These predate discovery/resume/additional-root
-changes; current proof below passed with 439 Bun tests, 339 isolated root tests,
-actual OMP 32.13s and multiple-filesystem smoke 1.70s. Publication, deployment and
-real login/charged acceptance remain separate gates.
+changes; current evidence below includes 464 Bun tests, 339 isolated root tests,
+local Python 3.9 compatibility and prior OMP/runtime proofs. Publication,
+deployment and real login/charged acceptance remain separate gates.
 
 ---
 
@@ -641,12 +649,29 @@ Widget should gracefully handle:
 
 ---
 
-## Current integration evidence (2026-11-01)
+## Current integration evidence (updated 2026-11-02)
 
-Current extension **`bun test`: 455 passed, zero failures**, **3,510 assertions
-across 16 files, 4.98 seconds**, executed by the parent in the extension checkout.
-The earlier minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds)
-predates the current bootstrap build.
+Current extension **`bun test`: 464 passed, zero failures**, **3,564 assertions
+across 16 files, 6.30 seconds**, executed by the parent in the extension checkout.
+The earlier bootstrap suite (455 passed, 3,510 assertions, 4.98 seconds) and
+minimal-workflow suite (439 passed, 2,938 assertions, 3.93 seconds) are historical.
+
+The parent ran **`WH_TEST_PYTHON=<python3.9> bun test slurm/client.test.ts`:
+29 passed, zero failures, 209 assertions, 1.264 seconds**, using a SHA256-verified
+temporary portable **Python 3.9.23** interpreter and actual emitted filesystem
+probe, path-preflight and staging scripts. A separate actual-verifier local smoke
+passed **eight cases**: valid root, root symlink alias, missing root, broken probe
+symlink, cyclic probe symlink, escaping probe symlink, content mismatch and
+permission denied. Every case checked probe cleanup. This is local compatibility
+and safety evidence, not live SSH, cluster-operation or allocation acceptance.
+
+A further parent smoke called actual `runClusterAdd` twice, creating private
+local keys/drafts and using actual `verifySharedMappings` with local ordinary
+probe commands and the real Python 3.9 emitted read for a nonexistent root.
+Published blocked text and persisted blockers retained the `FileNotFoundError`
+cause; the worker probe was cleaned and discovery/readiness/registration were
+not reached. This validates setup API terminal output, not a new native-OMP
+session or visual GUI.
 
 The parent executed **actual OMP 18.14.2/native PTY and private local OpenSSH
 bootstrap proof: passed in 14.29 seconds**, with normal plugin linking and the

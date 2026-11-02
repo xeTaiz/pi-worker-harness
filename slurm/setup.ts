@@ -6,7 +6,7 @@ import { dirname, join, posix } from "node:path";
 import { isIP } from "node:net";
 import { events } from "../events.ts";
 import { DEFAULT_ALLOCATION_WALLTIME_SECONDS, loadClusterProfiles, parseClusterProfiles, resolveClusterConfigPath, sharedRoots, type SharedRoot, type ClusterProfile, type Environment } from "./profiles.ts";
-import { sshTransport, verifySharedMappings, type SshConnection } from "./client.ts";
+import { SlurmClientError, sshTransport, verifySharedMappings, type SshConnection } from "./client.ts";
 import { discoverCluster, normalizeRuntimeSetup, type DiscoveryResult, type DiscoveryTarget } from "./discovery.ts";
 import { controlReadiness, defaultRegistrationHost, sharedFilesystemChoices, type IntegrationSettings } from "./setup-integration.ts";
 
@@ -599,6 +599,11 @@ export async function runClusterAdd(ui: SetupUI, publish: (content: string) => v
       if (signal?.aborted) throw error;
       draft.phase = "blocked";
       draft.blockers = [`Filesystem identity verification failed: ${error instanceof Error ? error.message : "participating worker or SSH probe unavailable"}`];
+      // The verifier carries a textual cause, not transport stdout or staged payloads.
+      if (error instanceof SlurmClientError && typeof error.evidence === "string") {
+        const evidence = error.evidence.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").slice(-8192);
+        if (evidence) draft.blockers.push(`Verifier evidence: ${evidence}`);
+      }
       await saveDraft(draft, env);
       await publish(`Setup ${draft.id} blocked and saved for resume:\n${draft.blockers.join("\n")}\nNo mapping was assumed verified; no target registered. Correct the WH/cluster filesystem mapping, then /cluster-add ${draft.id}.`);
       return undefined;
