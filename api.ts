@@ -64,7 +64,7 @@ export function setOrchestratorUrl(url: string): void {
 }
 
 /** Used only when neither operator variable is set; absence means no credential. */
-export const DEFAULT_OPERATOR_TOKEN_FILE = join(homedir(), ".config", "worker-harness", "operator.token");
+export const defaultOperatorTokenFile = (): string => join(process.env.HOME || homedir(), ".config", "worker-harness", "operator.token");
 
 /** Fleet sessions must never fall back to the operator's broader authority. */
 export async function getAuthorizationHeaders(): Promise<Record<string, string>> {
@@ -74,7 +74,7 @@ export async function getAuthorizationHeaders(): Promise<Record<string, string>>
     const tokenFile = process.env.WH_OPERATOR_TOKEN_FILE?.trim();
     if (!token && tokenFile) token = (await readFile(tokenFile, "utf8")).trim();
     else if (!token) {
-      try { token = (await readFile(DEFAULT_OPERATOR_TOKEN_FILE, "utf8")).trim(); }
+      try { token = (await readFile(defaultOperatorTokenFile(), "utf8")).trim(); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
   }

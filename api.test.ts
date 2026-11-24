@@ -28,7 +28,7 @@ import {
 
 const originalFetch = globalThis.fetch;
 const originalUrl = getOrchestratorUrl();
-const environmentKeys = ["WH_SESSION_TOKEN", "WH_SESSION_ROLE", "WH_OPERATOR_TOKEN", "WH_OPERATOR_TOKEN_FILE", "WH_ORCHESTRATOR_URL"] as const;
+const environmentKeys = ["WH_SESSION_TOKEN", "WH_SESSION_ROLE", "WH_OPERATOR_TOKEN", "WH_OPERATOR_TOKEN_FILE", "WH_ORCHESTRATOR_URL", "HOME"] as const;
 const originalEnvironment = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
 let requests: Array<{ url: string; init?: RequestInit }>;
 let responseBody: unknown;
@@ -36,6 +36,7 @@ let responseStatus: number;
 
 beforeEach(() => {
   for (const key of environmentKeys) delete process.env[key];
+  process.env.HOME = "/nonexistent-wh-test-home";
   requests = [];
   responseBody = [];
   responseStatus = 200;
