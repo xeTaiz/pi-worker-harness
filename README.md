@@ -76,7 +76,8 @@ Configured cluster targets additionally use the submitting client's local SSH.
   API calls, bridge registration/events/command polling/acknowledgements, and log
   streams all use this same normalized base URL.
 - Ordinary operator authentication: `WH_OPERATOR_TOKEN`, or a UTF-8 bearer file
-  named by `WH_OPERATOR_TOKEN_FILE`. Keep the file outside agent-readable roots.
+  named by `WH_OPERATOR_TOKEN_FILE`. If neither is set,
+  `~/.config/worker-harness/operator.token` is read when it exists.
   Fleet roles use `WH_SESSION_TOKEN` and never fall back to operator credentials.
   Unauthenticated ordinary sessions only work against an explicitly unconfigured
   development server; a configured fleet requires an operator credential.

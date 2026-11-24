@@ -440,7 +440,9 @@ Base URL is configured in `api.ts` (`getOrchestratorUrl` / `setOrchestratorUrl`)
 `WH_ORCHESTRATOR_URL` wins over both persisted defaults and runtime URL changes.
 All control-plane calls, bridge traffic, and log streams use that same base URL.
 Bearer selection is `WH_SESSION_TOKEN` first; only unscoped operator sessions
-may fall back to `WH_OPERATOR_TOKEN`, then the file at `WH_OPERATOR_TOKEN_FILE`.
+may fall back to `WH_OPERATOR_TOKEN`, then the file at `WH_OPERATOR_TOKEN_FILE`,
+then, only if neither variable is set, `~/.config/worker-harness/operator.token`
+when present.
 Configured but unreadable token files fail closed. Fleet launchers must scrub
 both operator variables and keep the credential file outside sandbox paths.
 Bridge registration reports `resume_path` from the agent's session manager;

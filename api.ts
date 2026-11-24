@@ -1,4 +1,6 @@
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   AddTunnelRequest,
   ApiErrorBody,
@@ -61,6 +63,9 @@ export function setOrchestratorUrl(url: string): void {
   orchestratorUrl = url.trim().replace(/\/+$/, "");
 }
 
+/** Used only when neither operator variable is set; absence means no credential. */
+export const DEFAULT_OPERATOR_TOKEN_FILE = join(homedir(), ".config", "worker-harness", "operator.token");
+
 /** Fleet sessions must never fall back to the operator's broader authority. */
 export async function getAuthorizationHeaders(): Promise<Record<string, string>> {
   let token = process.env.WH_SESSION_TOKEN?.trim();
@@ -68,6 +73,10 @@ export async function getAuthorizationHeaders(): Promise<Record<string, string>>
     token = process.env.WH_OPERATOR_TOKEN?.trim();
     const tokenFile = process.env.WH_OPERATOR_TOKEN_FILE?.trim();
     if (!token && tokenFile) token = (await readFile(tokenFile, "utf8")).trim();
+    else if (!token) {
+      try { token = (await readFile(DEFAULT_OPERATOR_TOKEN_FILE, "utf8")).trim(); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
   }
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
